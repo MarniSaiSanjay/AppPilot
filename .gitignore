@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+.env.*
+*.key
+
+# Office temporary lock files
+~$*
+
+# Regression workbook contains local test credentials; keep it out of git
+testcases/regressions/*.xlsx
