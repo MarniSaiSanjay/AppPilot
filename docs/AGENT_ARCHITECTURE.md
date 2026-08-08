@@ -46,7 +46,9 @@ The loop ends when:
 
 - the goal is reached &rarr; **PASS**;
 - the model cannot safely propose a next action &rarr; **FAIL** (controlled);
-- a configurable action/step limit is reached &rarr; **FAIL**.
+- the meaningful UI state does not change for too many consecutive actions
+  &rarr; **FAIL** (controlled, stuck detection — see below);
+- a configurable absolute action/step limit is reached &rarr; **FAIL**.
 
 The agent must handle **unexpected intermediate UI**. For example, if a login
 unexpectedly shows a "Save password to Google Password Manager" dialog with
@@ -107,6 +109,36 @@ when it:
 
 An invalid or unsafe proposal is **not executed**; the agent returns a
 controlled failure (or may re-ask the model) instead.
+
+## Progress / stuck detection
+
+Two independent limits protect a run:
+
+- **Absolute bound** — `--max-actions` / `APPPILOT_MAX_ACTIONS` (default `30`)
+  caps total actions per run.
+- **Stuck bound** — `--max-stuck-actions` / `APPPILOT_MAX_STUCK_ACTIONS`
+  (default `5`) stops the run early when it is making no meaningful progress.
+
+After each action the agent re-observes and computes a **meaningful
+fingerprint** of the screen: a stable, non-secret signature built from each
+element's resource id, redacted label, and clickable/input/enabled state, and
+restricted to elements that are interactive or carry a resource id. Purely
+decorative, id-less, non-interactive text (clocks, animation captions) is
+excluded, so volatile noise does not look like a change. Credential values are
+already redacted by the observer, so a secret can never enter the fingerprint.
+
+A **consecutive-stuck counter** advances whenever an action leaves the
+meaningful fingerprint unchanged, and **resets** on any meaningful change. Only
+transitions *after* an action are counted, and the generous default (`5`) leaves
+room for legitimate multi-action work on a single screen (keyboard/input or
+internal-state changes that do not immediately alter the hierarchy). Reaching
+the threshold produces a controlled **FAIL** ("agent appears stuck"). The
+detector is a safety/reliability mechanism only — it never decides *which*
+action to take; the model remains the sole decision-maker.
+
+Configuration precedence for the stuck bound is
+`--max-stuck-actions` &rarr; `APPPILOT_MAX_STUCK_ACTIONS` &rarr; `5`, with
+invalid environment values falling back safely to the default.
 
 ## Goal evaluation
 

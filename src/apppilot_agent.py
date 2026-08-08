@@ -20,6 +20,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # loop. Configurable via --max-actions or the APPPILOT_MAX_ACTIONS env var; this
 # is only the fallback default.
 DEFAULT_MAX_ACTIONS = 30
+# Stop with a controlled FAIL after this many actions without a meaningful UI
+# change. Configurable via --max-stuck-actions or APPPILOT_MAX_STUCK_ACTIONS.
+DEFAULT_MAX_STUCK_ACTIONS = 5
 # The agent reasons over the observed UI and drives Maestro action-by-action;
 # it does not execute any prewritten Maestro flow.
 PROTOTYPE_GOAL = (
@@ -1025,6 +1028,7 @@ class AppPilotAgent:
         executor: MaestroExecutor,
         max_actions: int,
         runtime_context: RuntimeContext,
+        max_stuck_actions: int = DEFAULT_MAX_STUCK_ACTIONS,
     ) -> None:
         self._observer = observer
         self._goal_evaluator = goal_evaluator
@@ -1033,18 +1037,23 @@ class AppPilotAgent:
         self._executor = executor
         self._max_actions = max_actions
         self._runtime_context = runtime_context
+        self._max_stuck_actions = max_stuck_actions
 
     def run(self, goal: str, guidance: str | None = None) -> bool:
         print(f"GOAL:\n{goal}\n")
         if guidance:
             print(f"GUIDANCE:\n{guidance}\n")
         print(f"MAX ACTIONS:\n{self._max_actions}\n")
+        print(f"MAX STUCK ACTIONS:\n{self._max_stuck_actions}\n")
 
         history: list[str] = []
         # Track the last credential we entered and the screen it was entered on,
         # to avoid re-entering the same credential when the UI has not changed.
         last_credential_key: tuple[str, str] | None = None
         last_credential_fingerprint: tuple | None = None
+        # Track consecutive actions that leave the meaningful UI unchanged.
+        last_acted_fingerprint: tuple | None = None
+        consecutive_stuck = 0
         for step in range(self._max_actions + 1):
             observation = self._observer.observe()
             print(f"OBSERVE:\n{observation.describe()}\n")
@@ -1054,6 +1063,23 @@ class AppPilotAgent:
             if reached:
                 print("RESULT:\nPASS")
                 return True
+
+            # Advance the stuck counter when the last action left the meaningful
+            # UI unchanged; a meaningful change resets it. Only counts once an
+            # action has been taken (last_acted_fingerprint is set).
+            meaningful_fingerprint = self._meaningful_fingerprint(observation)
+            if last_acted_fingerprint is not None:
+                if meaningful_fingerprint == last_acted_fingerprint:
+                    consecutive_stuck += 1
+                else:
+                    consecutive_stuck = 0
+            print(f"PROGRESS:\nstuck {consecutive_stuck}/{self._max_stuck_actions}\n")
+            if consecutive_stuck >= self._max_stuck_actions:
+                print(
+                    "RESULT:\nFAIL - agent appears stuck: no meaningful UI change "
+                    f"for {consecutive_stuck} consecutive actions"
+                )
+                return False
 
             if step == self._max_actions:
                 print(f"RESULT:\nFAIL - action/step limit reached ({self._max_actions})")
@@ -1143,6 +1169,8 @@ class AppPilotAgent:
             print(f"ACTION:\n{action.describe(observation)}\n")
             self._executor.execute(action, observation, secret=secret)
             history.append(action.describe(observation))
+            # Remember the state we just acted on, to detect progress next step.
+            last_acted_fingerprint = meaningful_fingerprint
 
         raise AssertionError("Agent loop exited unexpectedly")
 
@@ -1165,6 +1193,27 @@ class AppPilotAgent:
             for element in observation.elements
         )
 
+    @staticmethod
+    def _meaningful_fingerprint(observation: UIObservation) -> tuple:
+        """A stable signature of the meaningful UI state, for stuck detection.
+
+        Non-secret, like ``_observation_fingerprint``, but limited to elements
+        with a resource id or that are interactive (clickable/input). Decorative,
+        id-less, non-interactive text (volatile clocks/animation) is excluded, so
+        such noise does not reset the stuck counter.
+        """
+        return tuple(
+            (
+                element.resource_id,
+                element.label,
+                element.clickable,
+                element.is_input,
+                element.enabled,
+            )
+            for element in observation.elements
+            if element.resource_id or element.clickable or element.is_input
+        )
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1177,6 +1226,14 @@ def _parse_args() -> argparse.Namespace:
         default=_default_max_actions(),
         help="Safety bound on actions per run (default: env APPPILOT_MAX_ACTIONS "
         f"or {DEFAULT_MAX_ACTIONS}).",
+    )
+    parser.add_argument(
+        "--max-stuck-actions",
+        type=int,
+        default=_default_max_stuck_actions(),
+        help="Consecutive actions with no meaningful UI change before the run is "
+        "stopped early (default: env APPPILOT_MAX_STUCK_ACTIONS or "
+        f"{DEFAULT_MAX_STUCK_ACTIONS}).",
     )
     parser.add_argument("--guidance", default=DEFAULT_GUIDANCE)
     return parser.parse_args()
@@ -1191,6 +1248,21 @@ def _default_max_actions() -> int:
         except ValueError:
             pass
     return DEFAULT_MAX_ACTIONS
+
+
+def _default_max_stuck_actions() -> int:
+    """Resolve the stuck bound from the environment, else the constant.
+
+    Precedence: --max-stuck-actions -> APPPILOT_MAX_STUCK_ACTIONS -> constant;
+    invalid environment values fall back safely.
+    """
+    raw = os.environ.get("APPPILOT_MAX_STUCK_ACTIONS")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return DEFAULT_MAX_STUCK_ACTIONS
 
 
 def _load_dotenv(path: Path | None = None) -> None:
@@ -1228,6 +1300,9 @@ def main() -> int:
     if args.max_actions < 1:
         print("ERROR: --max-actions must be at least 1", file=sys.stderr)
         return 2
+    if args.max_stuck_actions < 1:
+        print("ERROR: --max-stuck-actions must be at least 1", file=sys.stderr)
+        return 2
 
     provider: ModelDecisionProvider | None = LLMModelDecisionProvider.from_env()
     if provider is None:
@@ -1244,6 +1319,7 @@ def main() -> int:
         executor=MaestroExecutor(APP_ID, args.device),
         max_actions=args.max_actions,
         runtime_context=RuntimeContext.from_env(),
+        max_stuck_actions=args.max_stuck_actions,
     )
     try:
         return 0 if agent.run(PROTOTYPE_GOAL, args.guidance) else 1

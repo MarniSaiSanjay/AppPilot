@@ -69,7 +69,8 @@ committed).
 | `APPPILOT_MODEL_BASE_URL` | no | OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint). |
 | `APPPILOT_USERNAME` | for login goals | Sign-in username/email, resolved locally and injected straight into Maestro — never sent to the model. |
 | `APPPILOT_PASSWORD` | for login goals | Sign-in password, handled the same secure way. |
-| `APPPILOT_MAX_ACTIONS` | no | Safety bound on actions per run (default `30`). |
+| `APPPILOT_MAX_ACTIONS` | no | Absolute upper bound on actions per run (default `30`). |
+| `APPPILOT_MAX_STUCK_ACTIONS` | no | Consecutive actions with no meaningful UI change before the run stops early with a controlled FAIL (default `5`). |
 
 \* If no model is configured, the agent does **not** guess — it honestly reports
 that it cannot proceed and how to configure one.
@@ -100,7 +101,8 @@ python3 src/apppilot_agent.py --device emulator-5554
 Options:
 
 - `--device` — ADB device id (default `emulator-5554`).
-- `--max-actions` — override the per-run action bound.
+- `--max-actions` — override the absolute per-run action bound.
+- `--max-stuck-actions` — override the early-termination stuck bound.
 - `--guidance` — override the default high-level guidance given to the model.
 
 The run prints the loop explicitly, for example:
