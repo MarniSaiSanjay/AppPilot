@@ -935,6 +935,31 @@ class MaestroExecutor:
         secret: str | None = None,
     ) -> None:
         commands = self._commands_for(action, observation, secret is not None)
+        self._run_flow(commands, secret=secret)
+
+    def open_link(self, deep_link: str) -> None:
+        """Launch an exact deep link deterministically via Maestro ``openLink``.
+
+        The link is executed verbatim as supplied by the test case; nothing about
+        it is inferred, modified, or chosen by a model.
+        """
+        commands = f"- openLink: {json.dumps(deep_link)}\n"
+        self._run_flow(commands)
+
+    def launch_app(self) -> None:
+        """Launch the app (used e.g. by first-install warm-up)."""
+        self._run_flow(f"- launchApp: {json.dumps(self._app_id)}\n")
+
+    def stop_app(self) -> None:
+        """Force-stop (kill) the app."""
+        self._run_flow(f"- stopApp: {json.dumps(self._app_id)}\n")
+
+    def _run_flow(
+        self,
+        commands: str,
+        secret: str | None = None,
+        timeout: float = 60,
+    ) -> None:
         flow = f"appId: {self._app_id}\n---\n{commands}"
         # For credential inputs the secret is never written to the flow file; it
         # is passed to Maestro through a MAESTRO_-prefixed environment variable
@@ -965,7 +990,7 @@ class MaestroExecutor:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=timeout,
                 env=run_env,
             )
             if result.returncode != 0:

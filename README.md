@@ -121,3 +121,37 @@ RESULT
 The current prototype goal is to *complete authentication and onboarding and
 reach a usable signed-in Microsoft 365 Copilot experience, without executing an
 unintended suggested prompt.*
+
+## Deeplink test suite
+
+A data-driven runner (`src/deeplink_runner.py`) executes a suite of deeplink
+test cases from an Excel workbook. It reuses the same Maestro executor, Maestro
+UI observer, and model configuration as the agent — it is **not** a second
+framework.
+
+The Excel is intentionally simple, with four positional columns and one row per
+test: **Test ID**, **Deep Link**, **User Type**, **Expected Result** (a header
+row, if present, is skipped). A bundled copy lives at
+`testcases/deeplinks/deeplink_tests.xlsx`.
+
+For each test case:
+
+1. A one-time first-install **warm-up** runs once before the suite (skippable
+   with `--no-warm-up`); it is never repeated for retries.
+2. The **exact** deeplink is launched deterministically via Maestro `openLink`.
+3. The resulting Android UI is observed.
+4. The **AI judges** whether the observed UI *semantically* satisfies the
+   natural-language Expected Result — including expected error/failure states,
+   which count as PASS when correctly observed. The model never invents or
+   modifies a deeplink and never drives UI actions here.
+5. On a mismatch the runner **kills the app, waits 2 s, and re-launches the same
+   deeplink**, up to **3 attempts**. Any matching attempt is a PASS; three
+   mismatches is a FAIL. The suite then continues with the next case.
+
+```bash
+python3 src/deeplink_runner.py --device emulator-5554
+```
+
+Options: `--excel` (workbook path), `--device`, `--max-attempts` (default `3`),
+`--no-warm-up`. At the end it prints a concise per-test report plus totals
+(Total / Passed / Failed).

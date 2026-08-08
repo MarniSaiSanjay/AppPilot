@@ -153,6 +153,45 @@ state — it must be dismissed via its close control rather than sent, and a
 visible/pre-populated prompt is never submitted just because it is present. The
 model must never be the authority that declares PASS.
 
+## Deeplink test suite (data-driven runner)
+
+`src/deeplink_runner.py` layers a **data-driven deeplink runner** on top of the
+same components — the Maestro executor, the Maestro observer, and the same
+OpenAI-compatible model configuration — rather than forking a second framework.
+It keeps the core boundaries: deterministic execution, AI reasoning, and
+deterministic evaluation of PASS.
+
+Its per-case shape is deliberately narrow (a single launch + observe + judge,
+not the action loop):
+
+```
+Excel test case  ->  launch EXACT deeplink (Maestro openLink, deterministic)
+                 ->  observe resulting UI (Maestro, deterministic)
+                 ->  AI judges observed-vs-Expected-Result (semantic)
+                 ->  PASS, or kill + wait 2s + relaunch (deterministic retry)
+```
+
+Boundaries:
+
+- **The test case decides which deeplink to run**; it is executed verbatim. The
+  model never invents, modifies, or chooses a deeplink.
+- **The AI only judges** whether the observed UI *semantically* satisfies the
+  natural-language Expected Result (e.g. "Chat screen", "Chat screen with
+  prompt", "Researcher screen with prompt", or an expected error/failure). No
+  hardcoded selectors or app-specific success rules; an expected error that is
+  correctly observed is a PASS, because the result is *observed vs expected*,
+  not *did the deeplink succeed*.
+- **Retry and reporting are deterministic.** Up to 3 attempts per case; on
+  mismatch the app is killed, the runner waits 2 s, and the same deeplink is
+  re-launched. Any matching attempt is a PASS; three mismatches is a FAIL; the
+  suite continues with the next case and prints a per-test report plus totals.
+- **First-install warm-up runs once** for the whole suite (skippable) and is
+  never repeated for retries.
+
+The Excel remains intentionally simple: four positional columns (Test ID, Deep
+Link, User Type, Expected Result), one row per test, parsed with the standard
+library only.
+
 ## Maestro as the execution layer
 
 Maestro is used purely as the UI **execution layer**: the agent observes the UI,
@@ -206,9 +245,12 @@ boundary from pretending to be intelligent.
 
 ## Intentionally out of scope for the agent core
 
-Proving the core smart agent comes first. The following are deferred and must
-not be added while establishing the core: Excel/test-case and user workbook
-loading, credential management, login/deep-link automation as fixed scripts,
-report generation, scheduling, many test cases or users, parallel or cloud
-execution, a web UI, historical reporting, self-healing across runs, and
-automatic APK installation.
+Proving the core smart agent came first, and the **agent core itself**
+(`AppPilotAgent`, observer, goal evaluator, decision provider, safety validator)
+remains free of test-data, reporting, and fixed-script concerns. Such
+capabilities are only ever added as **separate layers on top** of the core — as
+the deeplink runner does for Excel test-case loading and report generation,
+while reusing (not modifying) the core boundaries. Still deferred: user
+credential workbooks, login/deeplink automation as fixed A→B→C scripts,
+scheduling, parallel or cloud execution, a web UI, historical reporting,
+self-healing across runs, and automatic APK installation.
