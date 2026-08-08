@@ -406,5 +406,300 @@ class JudgeTests(unittest.TestCase):
         self.assertNotIn(secret, rendered)
 
 
+# --------------------------------------------------------------------------- #
+# Installed vs uninstalled orchestration (incremental feature)
+# --------------------------------------------------------------------------- #
+def _icase(test_id="TC001", expected="Chat screen"):
+    """An INSTALLED=True deeplink case."""
+    return d.DeeplinkTestCase(
+        test_id=test_id,
+        deep_link="myapp://open/chat",
+        user_type="Premium",
+        expected_result=expected,
+        installed=True,
+    )
+
+
+def _ucase(test_id="TC900", expected="Chat screen"):
+    """An INSTALLED=False (first-open-after-install) deeplink case."""
+    return d.DeeplinkTestCase(
+        test_id=test_id,
+        deep_link="myapp://open/chat",
+        user_type="Premium",
+        expected_result=expected,
+        installed=False,
+    )
+
+
+class _FakeLogin:
+    """Records how many times the shared login capability was invoked."""
+
+    def __init__(self):
+        self.ready_calls = 0
+
+    def ensure_ready(self):
+        self.ready_calls += 1
+
+
+class _FakeInstaller:
+    """Records the fresh-install lifecycle for the uninstalled scenario."""
+
+    def __init__(self):
+        self.absent_calls = 0
+        self.install_calls = 0
+
+    def ensure_absent(self):
+        self.absent_calls += 1
+
+    def install_and_open(self):
+        self.install_calls += 1
+
+
+class _CountingWarmUp:
+    def __init__(self):
+        self.n = 0
+
+    def __call__(self):
+        self.n += 1
+
+
+class InstalledOrchestrationTests(unittest.TestCase):
+    def test_installed_batch_warms_up_once_for_all_cases(self):
+        judge = _ScriptedJudge([(True, "ok")] * 3)
+        warm = _CountingWarmUp()
+        login = _FakeLogin()
+        runner, _, _ = _make_runner(
+            judge, warm_up=warm, login_flow=login
+        )
+        report = runner.run([_icase("T1"), _icase("T2"), _icase("T3")])
+        self.assertEqual(warm.n, 1)  # once for the whole batch, not per case
+        self.assertEqual(login.ready_calls, 1)
+        self.assertEqual(report.passed, 3)
+
+    def test_warm_up_and_login_happen_before_first_installed_case(self):
+        order = []
+        judge = _ScriptedJudge([(True, "ok")])
+
+        class _OrderLogin:
+            def ensure_ready(self_inner):
+                order.append("login")
+
+        def warm_up():
+            order.append("warm_up")
+
+        executor = _RecordingExecutor()
+        original_open = executor.open_link
+
+        def open_link(deep_link):
+            order.append("open_link")
+            original_open(deep_link)
+
+        executor.open_link = open_link
+        runner, _, _ = _make_runner(
+            judge, executor=executor, warm_up=warm_up, login_flow=_OrderLogin()
+        )
+        runner.run([_icase()])
+        self.assertEqual(order, ["login", "warm_up", "open_link"])
+
+    def test_installed_retry_does_not_repeat_warm_up(self):
+        judge = _ScriptedJudge([(False, "no"), (False, "no"), (False, "no")])
+        warm = _CountingWarmUp()
+        runner, executor, _ = _make_runner(judge, warm_up=warm)
+        report = runner.run([_icase()])
+        self.assertEqual(warm.n, 1)  # not repeated across the 3 attempts
+        self.assertFalse(report.results[0].passed)
+        # Installed retry recipe is still kill -> wait -> reopen.
+        self.assertEqual(
+            [c[0] for c in executor.calls],
+            ["open_link", "stop_app", "open_link", "stop_app", "open_link"],
+        )
+
+
+class UninstalledOrchestrationTests(unittest.TestCase):
+    def test_uninstalled_case_does_not_run_warm_up(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        warm = _CountingWarmUp()
+        installer = _FakeInstaller()
+        login = _FakeLogin()
+        runner, _, _ = _make_runner(
+            judge, warm_up=warm, installer=installer, login_flow=login
+        )
+        runner.run([_ucase()])
+        self.assertEqual(warm.n, 0)  # never warmed up for a fresh-install case
+        self.assertEqual(installer.absent_calls, 1)
+        self.assertEqual(installer.install_calls, 1)
+        self.assertEqual(login.ready_calls, 1)
+
+    def test_uninstalled_reestablishes_fresh_state_each_attempt(self):
+        judge = _ScriptedJudge([(False, "no"), (False, "no"), (False, "no")])
+        installer = _FakeInstaller()
+        runner, executor, _ = _make_runner(judge, installer=installer)
+        report = runner.run([_ucase()])
+        self.assertFalse(report.results[0].passed)
+        self.assertEqual(len(report.results[0].attempts), 3)
+        # Every attempt genuinely uninstalls + installs (no kill/wait recipe that
+        # would leave the app installed and degrade a retry into installed).
+        self.assertEqual(installer.absent_calls, 3)
+        self.assertEqual(installer.install_calls, 3)
+        self.assertEqual([c[0] for c in executor.calls], ["open_link"] * 3)
+        self.assertNotIn("stop_app", [c[0] for c in executor.calls])
+
+    def test_uninstalled_opens_exact_deeplink(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        installer = _FakeInstaller()
+        runner, executor, _ = _make_runner(judge, installer=installer)
+        runner.run([_ucase()])
+        self.assertEqual(executor.calls, [("open_link", "myapp://open/chat")])
+
+
+class MixedBatchTests(unittest.TestCase):
+    def test_mixed_installed_and_uninstalled(self):
+        # Installed case is judged first (batch), then the uninstalled case.
+        judge = _ScriptedJudge([(True, "installed ok"), (True, "fresh ok")])
+        warm = _CountingWarmUp()
+        installer = _FakeInstaller()
+        login = _FakeLogin()
+        runner, _, _ = _make_runner(
+            judge, warm_up=warm, installer=installer, login_flow=login
+        )
+        report = runner.run([_icase("T1"), _ucase("T2")])
+        self.assertEqual([r.case.test_id for r in report.results], ["T1", "T2"])
+        self.assertTrue(all(r.passed for r in report.results))
+        self.assertEqual(warm.n, 1)  # only for the installed batch
+        self.assertEqual(installer.absent_calls, 1)  # only for the uninstalled case
+        # Shared login used by both scenarios: once for the batch + once for the
+        # single uninstalled attempt.
+        self.assertEqual(login.ready_calls, 2)
+
+
+class InstalledColumnLoadingTests(unittest.TestCase):
+    def _tmp(self):
+        import tempfile
+        return tempfile.mkdtemp()
+
+    def _row5(self, a_val, b_val, c_val, d_val, e_val):
+        return {
+            "A": ("inlineStr", a_val),
+            "B": ("inlineStr", b_val),
+            "C": ("inlineStr", c_val),
+            "D": ("inlineStr", d_val),
+            "E": ("inlineStr", e_val),
+        }
+
+    def test_app_store_deeplink_is_uninstalled_by_default(self):
+        rows = [
+            _inline_row(
+                "TC1",
+                "https://m365.cloud.microsoft/?openAppStoreOnLoad=true",
+                "Premium",
+                "Chat screen",
+            )
+        ]
+        cases = d.load_deeplink_cases(_write_xlsx(Path(self._tmp()), rows))
+        self.assertFalse(cases[0].installed)
+
+    def test_normal_deeplink_is_installed_by_default(self):
+        rows = [_inline_row("TC1", "app://open", "Premium", "Chat screen")]
+        cases = d.load_deeplink_cases(_write_xlsx(Path(self._tmp()), rows))
+        self.assertTrue(cases[0].installed)
+
+    def test_explicit_installed_column_overrides(self):
+        rows = [
+            self._row5("Test ID", "Deep Link", "License", "Expected", "Installed"),
+            self._row5(
+                "TC1",
+                "https://x/?openAppStoreOnLoad=true",
+                "Premium",
+                "Chat screen",
+                "yes",
+            ),
+            self._row5("TC2", "app://open", "Premium", "Chat screen", "no"),
+        ]
+        cases = d.load_deeplink_cases(_write_xlsx(Path(self._tmp()), rows))
+        # Explicit column wins over the deeplink-derived default in both rows.
+        self.assertTrue(cases[0].installed)
+        self.assertFalse(cases[1].installed)
+
+    def test_leading_title_row_is_skipped(self):
+        # Mirrors the real workbook: a merged title row above the header row.
+        rows = [
+            {"A": ("inlineStr", "Test Case Reference")},
+            _inline_row("Test Case ID", "Launch URL", "License", "Expected Screen"),
+            _inline_row("TC001", "https://m365/chat", "Premium", "Chat screen"),
+        ]
+        cases = d.load_deeplink_cases(_write_xlsx(Path(self._tmp()), rows))
+        self.assertEqual([c.test_id for c in cases], ["TC001"])
+        self.assertEqual(cases[0].user_type, "Premium")
+        self.assertEqual(cases[0].expected_result, "Chat screen")
+
+    def test_reordered_columns_mapped_by_header(self):
+        # Columns intentionally shuffled; header names drive the mapping.
+        rows = [
+            _inline_row("Expected Screen", "Test Case ID", "Launch URL", "License"),
+            _inline_row("Chat screen", "TC001", "app://go", "Premium"),
+        ]
+        cases = d.load_deeplink_cases(_write_xlsx(Path(self._tmp()), rows))
+        self.assertEqual(cases[0].test_id, "TC001")
+        self.assertEqual(cases[0].deep_link, "app://go")
+        self.assertEqual(cases[0].expected_result, "Chat screen")
+        self.assertEqual(cases[0].user_type, "Premium")
+
+
+class PlayStoreInstallerTests(unittest.TestCase):
+    class _FakeExec:
+        def __init__(self):
+            self.events = []
+
+        def ensure_uninstalled(self):
+            self.events.append("uninstall")
+
+        def tap_text(self, text, timeout=180):
+            self.events.append(("tap", text))
+
+    def test_ensure_absent_and_install_open_sequence(self):
+        exe = self._FakeExec()
+        installer = d.PlayStoreInstaller(
+            exe, sleep=lambda s: None, install_wait_seconds=0
+        )
+        installer.ensure_absent()
+        installer.install_and_open()
+        self.assertEqual(
+            exe.events, ["uninstall", ("tap", "Install"), ("tap", "Open")]
+        )
+
+
+class SuggestedPromptGuardTests(unittest.TestCase):
+    def _element(self, *, text="", resource_id="", is_input=False):
+        return a.UIElement(
+            element_id="e",
+            parent_id=None,
+            text=text,
+            accessibility_text="",
+            hint_text="",
+            resource_id=resource_id,
+            class_name="",
+            clickable=False,
+            enabled=True,
+            is_input=is_input,
+            label="",
+        )
+
+    def test_intro_suggested_prompt_is_not_the_goal(self):
+        evaluator = a.SignedInCopilotGoalEvaluator()
+        observation = a.UIObservation(
+            (self._element(text="Let's get started"),)
+        )
+        # Must NOT report PASS on the suggested-prompt intro (so the agent closes
+        # it via X instead of sending the suggested prompt).
+        self.assertFalse(evaluator.is_reached("goal", observation))
+
+    def test_signed_in_composer_is_the_goal(self):
+        evaluator = a.SignedInCopilotGoalEvaluator()
+        observation = a.UIObservation(
+            (self._element(text="Message Copilot"),)
+        )
+        self.assertTrue(evaluator.is_reached("goal", observation))
+
+
 if __name__ == "__main__":
     unittest.main()

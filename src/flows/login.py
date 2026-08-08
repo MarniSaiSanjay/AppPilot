@@ -207,6 +207,68 @@ class SignedInCopilotGoalEvaluator:
 
 
 
+def resolve_decision_provider(
+    provider: ModelDecisionProvider | None = None,
+) -> ModelDecisionProvider:
+    """Return the given provider, else the env-configured LLM provider, else the
+    honest Unconfigured placeholder. Centralized so the CLI and other flows
+    (e.g. the deeplink runner) share one provider-resolution policy."""
+    if provider is not None:
+        return provider
+    provider = LLMModelDecisionProvider.from_env()
+    if provider is None:
+        provider = UnconfiguredModelDecisionProvider(
+            "Set APPPILOT_MODEL and APPPILOT_MODEL_API_KEY (and optionally "
+            "APPPILOT_MODEL_BASE_URL) to connect a real decision model."
+        )
+    return provider
+
+
+def build_login_agent(
+    device: str = "emulator-5554",
+    *,
+    provider: ModelDecisionProvider | None = None,
+    observer: MaestroHierarchyObserver | None = None,
+    executor: MaestroExecutor | None = None,
+    max_actions: int | None = None,
+    max_stuck_actions: int | None = None,
+) -> AppPilotAgent:
+    """Build the single, shared login/onboarding agent (AppPilotAgent + Brain).
+
+    It hardcodes no UI steps: the model decides each action, and
+    SignedInCopilotGoalEvaluator reports success immediately (taking no action)
+    when the app is already signed in. Callers may pass an existing
+    observer/executor to reuse the same Android infrastructure (DRY).
+    """
+    return AppPilotAgent(
+        observer=observer or MaestroHierarchyObserver(device),
+        goal_evaluator=SignedInCopilotGoalEvaluator(),
+        decision_provider=resolve_decision_provider(provider),
+        safety_validator=SafetyValidator(),
+        executor=executor or MaestroExecutor(APP_ID, device),
+        max_actions=max_actions if max_actions is not None else _default_max_actions(),
+        runtime_context=RuntimeContext.from_env(),
+        max_stuck_actions=(
+            max_stuck_actions
+            if max_stuck_actions is not None
+            else _default_max_stuck_actions()
+        ),
+    )
+
+
+def run_login(
+    device: str = "emulator-5554",
+    guidance: str = DEFAULT_GUIDANCE,
+    *,
+    agent: AppPilotAgent | None = None,
+    **kwargs,
+) -> bool:
+    """Run the shared login flow toward a usable signed-in state. Returns True on
+    PASS (including the no-op case where the app is already signed in)."""
+    agent = agent or build_login_agent(device, **kwargs)
+    return agent.run(PROTOTYPE_GOAL, guidance)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the AppPilot goal-driven Android agent prototype."
@@ -245,21 +307,9 @@ def main() -> int:
         print("ERROR: --max-stuck-actions must be at least 1", file=sys.stderr)
         return 2
 
-    provider: ModelDecisionProvider | None = LLMModelDecisionProvider.from_env()
-    if provider is None:
-        provider = UnconfiguredModelDecisionProvider(
-            "Set APPPILOT_MODEL and APPPILOT_MODEL_API_KEY (and optionally "
-            "APPPILOT_MODEL_BASE_URL) to connect a real decision model."
-        )
-
-    agent = AppPilotAgent(
-        observer=MaestroHierarchyObserver(args.device),
-        goal_evaluator=SignedInCopilotGoalEvaluator(),
-        decision_provider=provider,
-        safety_validator=SafetyValidator(),
-        executor=MaestroExecutor(APP_ID, args.device),
+    agent = build_login_agent(
+        args.device,
         max_actions=args.max_actions,
-        runtime_context=RuntimeContext.from_env(),
         max_stuck_actions=args.max_stuck_actions,
     )
     try:

@@ -183,6 +183,43 @@ class MaestroExecutor:
         """Force-stop (kill) the app."""
         self._run_flow(f"- stopApp: {json.dumps(self._app_id)}\n")
 
+    def tap_text(self, text: str, timeout: float = 180) -> None:
+        """Deterministically tap a control by its visible text via Maestro.
+
+        Used for best-effort Play Store buttons (e.g. "Install"/"Open"). This is
+        a deterministic text selector - NOT a coordinate tap and NOT AI-driven.
+        """
+        self._run_flow(f"- tapOn:\n    text: {json.dumps(text)}\n", timeout=timeout)
+
+    def is_installed(self) -> bool:
+        """Return whether the app package is currently installed (via adb)."""
+        result = self._run_adb(["shell", "pm", "list", "packages", self._app_id])
+        return f"package:{self._app_id}" in (result.stdout or "")
+
+    def uninstall_app(self) -> None:
+        """Uninstall the app package via adb (best-effort; no-op if absent)."""
+        self._run_adb(["uninstall", self._app_id])
+
+    def ensure_uninstalled(self) -> None:
+        """Guarantee a genuinely fresh (uninstalled) app before a first-open test.
+
+        Clearing app data is not sufficient for a true first-install scenario, so
+        this removes the APK entirely when present.
+        """
+        if self.is_installed():
+            self.uninstall_app()
+
+    def _run_adb(
+        self, args: Sequence[str], timeout: float = 180
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["adb", "-s", self._device_id, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
     def _run_flow(
         self,
         commands: str,

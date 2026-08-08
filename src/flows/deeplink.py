@@ -1,8 +1,9 @@
 """Data-driven deeplink test runner for AppPilot.
 
 This reuses the existing AppPilot abstractions - the same Maestro executor,
-Maestro UI observer, and the same OpenAI-compatible model configuration - rather
-than introducing a second agent framework. Its shape is deliberately narrow:
+Maestro UI observer, the shared generic login flow, and the same
+OpenAI-compatible model configuration - rather than introducing a second agent
+framework. Its shape is deliberately narrow:
 
     load test cases (Excel)
         -> for each case: launch the EXACT deeplink (deterministic, Maestro)
@@ -14,6 +15,29 @@ than introducing a second agent framework. Its shape is deliberately narrow:
 The deeplink and the Expected Result both come from the Excel and are used
 verbatim. The model never invents, modifies, or chooses a deeplink; it only
 evaluates expected-vs-observed. Retry and reporting are fully deterministic.
+
+INSTALLED vs UNINSTALLED (deterministic, from the Excel INSTALLED column):
+
+  * INSTALLED=TRUE cases run as a batch: ensure the app is signed in via the
+    SHARED login flow (AI-driven; a no-op if already signed in), then run the
+    installed-environment warm-up exactly ONCE for the whole batch, then run
+    each case. Per-case retry is the standard kill -> wait 2s -> reopen recipe.
+    The warm-up is never repeated per case or per retry.
+
+  * INSTALLED=FALSE cases test the genuine FIRST OPEN AFTER INSTALL: the app is
+    uninstalled (clearing data is not enough), the exact deeplink is triggered
+    so Android routes to the Play Store, the app is installed and opened, then
+    the SAME shared login flow runs. No installed warm-up is performed. To keep
+    each retry a true first-install (never a warmed-up/installed scenario), the
+    fresh/uninstalled state is re-established on EVERY attempt instead of the
+    kill -> wait -> reopen recipe.
+
+LIMITATION - Play Store install/open is best-effort: it taps the Play Store's
+visible "Install"/"Open" buttons by text via Maestro (a deterministic selector,
+NOT coordinate taps and NOT AI-driven), so it depends on the Play Store's
+current button labels and cannot be guaranteed across store versions. It is
+injected behind an interface so it can be replaced; no LLM is ever used to
+decide how to install the app.
 """
 
 from __future__ import annotations
@@ -51,6 +75,11 @@ except ImportError:
     from apppilot.agent import _load_dotenv  # noqa: E402
     from apppilot.models import UIObservation  # noqa: E402
 
+# The SHARED login capability (same generic AppPilotAgent + Brain) - reused, not
+# duplicated. Sibling import works whether this module is loaded as
+# ``src.flows.deeplink`` or top-level ``flows.deeplink`` (via the compat shim).
+from .login import DEFAULT_GUIDANCE, PROTOTYPE_GOAL, build_login_agent  # noqa: E402
+
 # Absolute deterministic bounds for the deeplink suite. These are unrelated to
 # the agent's own action/stuck limits; a deeplink attempt is a single launch +
 # observe + evaluate, not an action loop.
@@ -59,6 +88,9 @@ DEFAULT_RETRY_WAIT_SECONDS = 2.0
 # Time to let the app settle after a deeplink launch before observing. Injected
 # via the same sleep hook so tests can make it a no-op.
 DEFAULT_SETTLE_SECONDS = 3.0
+# Time to allow a Play Store install to complete before tapping Open. Best-effort
+# and injectable so tests make it a no-op.
+DEFAULT_INSTALL_WAIT_SECONDS = 90.0
 
 
 # --------------------------------------------------------------------------- #
@@ -66,18 +98,80 @@ DEFAULT_SETTLE_SECONDS = 3.0
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class DeeplinkTestCase:
-    """One row of the Excel. Exactly the four provided columns, nothing more."""
+    """One row of the Excel: the four core columns plus the deterministic
+    INSTALLED scenario selector (optional, defaults to installed=True)."""
 
     test_id: str
     deep_link: str
     user_type: str
     expected_result: str
+    # Deterministic scenario selector from the Excel INSTALLED column. Absent or
+    # blank preserves the legacy contract (installed=True). The model NEVER
+    # decides this - it comes straight from the workbook.
+    installed: bool = True
 
 
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-# Column layout is positional (A..D), matching the intentionally simple Excel.
-_COLUMNS = {"A": "test_id", "B": "deep_link", "C": "user_type", "D": "expected_result"}
-_HEADER_TOKENS = {"test id", "testid", "test case", "test case id", "id", "tc"}
+# Positional fallback used only when no header row can be recognised. The parser
+# is not strict about exact layout: when a header row IS present, columns are
+# mapped by header name (see _map_header) so extra/renamed/reordered columns and
+# leading title rows are all handled generically.
+_COLUMNS = {
+    "A": "test_id",
+    "B": "deep_link",
+    "C": "user_type",
+    "D": "expected_result",
+    "E": "installed",
+}
+# Header-name synonyms per logical field (casefolded, whitespace-collapsed).
+# Matching is substring-based and tolerant so real-world headers like
+# "Launch URL", "Expected Screen" or "License" map without exact-string coupling.
+_FIELD_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "test_id": ("test case id", "test id", "testid", "test case", "testcase", "case id"),
+    "deep_link": ("launch url", "deep link", "deeplink", "launch link", "url", "link", "launch"),
+    "user_type": ("license", "licence", "account", "user type", "user", "persona", "plan", "subscription"),
+    "expected_result": ("expected screen", "expected result", "expected", "result", "screen"),
+    "installed": ("installed", "install state", "app installed", "fresh", "uninstalled"),
+}
+# Only explicit negatives mean a fresh/uninstalled first-open scenario; anything
+# else (including blank/unknown, "yes", "true") means the app is installed.
+_INSTALLED_FALSE = {"false", "f", "no", "n", "0", "uninstalled", "not installed", "fresh"}
+# Deterministic signal (not model-driven) that a deeplink targets the genuine
+# first-open-after-install experience: the URL asks the app store to open on
+# load, which only makes sense when the app is not yet installed.
+_APP_STORE_ON_LOAD = "openappstoreonload=true"
+
+
+def _parse_installed(raw: str) -> bool:
+    return (raw or "").strip().casefold() not in _INSTALLED_FALSE
+
+
+def _derive_installed(deep_link: str) -> bool:
+    """Deterministically infer the INSTALLED scenario from the deeplink when the
+    workbook has no explicit INSTALLED column. A deeplink that routes to the app
+    store on load is a first-open-after-install (uninstalled) case."""
+    return _APP_STORE_ON_LOAD not in (deep_link or "").casefold()
+
+
+def _normalize_label(text: str) -> str:
+    return " ".join((text or "").split()).casefold()
+
+
+def _match_field(label: str) -> str | None:
+    """Map a header cell label to a logical field, preferring the most specific
+    (longest) synonym match so e.g. 'Expected Screen' maps to expected_result
+    rather than the shorter 'screen'."""
+    norm = _normalize_label(label)
+    if not norm:
+        return None
+    best_field: str | None = None
+    best_len = 0
+    for field, synonyms in _FIELD_SYNONYMS.items():
+        for synonym in synonyms:
+            if synonym == norm or synonym in norm:
+                if len(synonym) > best_len:
+                    best_field, best_len = field, len(synonym)
+    return best_field
 
 
 def _column_letter(cell_ref: str) -> str:
@@ -113,46 +207,88 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> str:
     return text
 
 
-def _row_values(row: ET.Element, shared: list[str]) -> dict[str, str]:
-    values: dict[str, str] = {}
+def _row_cells(row: ET.Element, shared: list[str]) -> dict[str, str]:
+    """Read ALL populated cells of a row as {column_letter: stripped_value}."""
+    cells: dict[str, str] = {}
     for cell in row.findall(f"{_SHEET_NS}c"):
         letter = _column_letter(cell.get("r", ""))
-        if letter in _COLUMNS:
-            values[_COLUMNS[letter]] = _cell_value(cell, shared).strip()
-    return values
+        if letter:
+            cells[letter] = _cell_value(cell, shared).strip()
+    return cells
 
 
-def _looks_like_header(values: dict[str, str]) -> bool:
-    # The attached Excel has no header row; a header (if present) is detected by
-    # a non-deeplink "Deep Link" cell or a recognizable Test ID label.
-    test_id = values.get("test_id", "").casefold()
-    deep_link = values.get("deep_link", "")
-    if test_id in _HEADER_TOKENS:
-        return True
-    return bool(deep_link) and "://" not in deep_link
+def _looks_like_data(cells: dict[str, str]) -> bool:
+    # A data row carries an actual deeplink (has a URL scheme); header/title rows
+    # do not. This cleanly separates the first data row from any leading
+    # title/header rows without depending on exact positions.
+    return any("://" in value for value in cells.values())
+
+
+def _map_header(cells: dict[str, str]) -> dict[str, str]:
+    """Map header cells to logical fields: {column_letter: field}. Each field is
+    assigned at most once (first, most-specific match wins)."""
+    mapping: dict[str, str] = {}
+    assigned: set[str] = set()
+    # Resolve per-cell best field, then assign in column order avoiding clashes.
+    scored = [
+        (letter, _match_field(label)) for letter, label in cells.items()
+    ]
+    for letter, field in sorted(scored, key=lambda item: item[0]):
+        if field and field not in assigned:
+            mapping[letter] = field
+            assigned.add(field)
+    return mapping
+
+
+def _is_usable_header(mapping: dict[str, str]) -> bool:
+    fields = set(mapping.values())
+    return "deep_link" in fields and "expected_result" in fields
 
 
 def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
     """Load deeplink test cases from the Excel workbook (stdlib only).
 
-    Columns are positional: A=Test ID, B=Deep Link, C=User Type, D=Expected
-    Result. A leading header row, if present, is skipped. Every data row must
-    provide a Test ID, a Deep Link and an Expected Result.
+    The parser is intentionally tolerant of layout. It recognises a header row by
+    name (e.g. "Launch URL", "Expected Screen", "License") and maps columns
+    accordingly, so leading title rows, renamed/reordered columns and optional
+    extra columns are all handled. When no header is present it falls back to the
+    positional layout A=Test ID, B=Deep Link, C=User Type, D=Expected Result.
+
+    Every data row must provide a Test ID, a Deep Link and an Expected Result.
+    The INSTALLED scenario is taken from an explicit INSTALLED column when
+    present, otherwise derived deterministically from the deeplink.
     """
     path = Path(path)
     with zipfile.ZipFile(path) as archive:
         shared = _read_shared_strings(archive)
         sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
 
+    rows = [
+        cells
+        for cells in (_row_cells(row, shared) for row in sheet.iter(f"{_SHEET_NS}row"))
+        if any(cells.values())
+    ]
+
+    # Recognise a header among the leading non-data rows (title rows are simply
+    # ignored: they map too few fields to be a usable header).
+    column_map = _COLUMNS
+    data_start = 0
+    for index, cells in enumerate(rows):
+        if _looks_like_data(cells):
+            data_start = index
+            break
+        candidate = _map_header(cells)
+        if _is_usable_header(candidate):
+            column_map = candidate
+    else:
+        # No data row found (only title/header rows, or empty sheet).
+        data_start = len(rows)
+
     cases: list[DeeplinkTestCase] = []
-    header_skipped = False
-    for row in sheet.iter(f"{_SHEET_NS}row"):
-        values = _row_values(row, shared)
-        if not any(values.values()):
-            continue
-        if not header_skipped and not cases and _looks_like_header(values):
-            header_skipped = True
-            continue
+    for cells in rows[data_start:]:
+        values = {
+            field: cells.get(letter, "") for letter, field in column_map.items()
+        }
         test_id = values.get("test_id", "")
         deep_link = values.get("deep_link", "")
         expected = values.get("expected_result", "")
@@ -169,12 +305,19 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
             raise ValueError(
                 f"Deeplink test row is missing required column(s): {', '.join(missing)}"
             )
+        installed_raw = values.get("installed", "")
+        installed = (
+            _parse_installed(installed_raw)
+            if installed_raw
+            else _derive_installed(deep_link)
+        )
         cases.append(
             DeeplinkTestCase(
                 test_id=test_id,
                 deep_link=deep_link,
                 user_type=values.get("user_type", ""),
                 expected_result=expected,
+                installed=installed,
             )
         )
     if not cases:
@@ -347,6 +490,68 @@ class MaestroWarmUp:
 
 
 # --------------------------------------------------------------------------- #
+# Shared login capability + fresh-install (Play Store) capability
+# --------------------------------------------------------------------------- #
+class LoginCapability(Protocol):
+    def ensure_ready(self) -> None:
+        ...
+
+
+class SharedLoginFlow:
+    """Ensures the app is signed-in/ready via the SHARED generic login flow
+    (flows.login -> AppPilotAgent + Brain). No login UI is hardcoded: the agent's
+    goal evaluator reports success immediately when already signed in, otherwise
+    the model drives each onboarding action. The SAME instance is reused by both
+    the installed and uninstalled scenarios (DRY)."""
+
+    def __init__(self, agent) -> None:
+        self._agent = agent
+
+    def ensure_ready(self) -> None:
+        self._agent.run(PROTOTYPE_GOAL, DEFAULT_GUIDANCE)
+
+
+class AppInstaller(Protocol):
+    def ensure_absent(self) -> None:
+        ...
+
+    def install_and_open(self) -> None:
+        ...
+
+
+class PlayStoreInstaller:
+    """Best-effort, deterministic Play Store install + open (see module
+    LIMITATION). ``ensure_absent`` genuinely uninstalls the APK (adb) so the
+    next deeplink is a real first-open; ``install_and_open`` taps the Play
+    Store's visible "Install" then "Open" buttons by text via Maestro. No
+    coordinate taps and no LLM are involved."""
+
+    def __init__(
+        self,
+        executor: MaestroExecutor,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+        install_wait_seconds: float = DEFAULT_INSTALL_WAIT_SECONDS,
+        install_text: str = "Install",
+        open_text: str = "Open",
+    ) -> None:
+        self._executor = executor
+        self._sleep = sleep
+        self._install_wait_seconds = install_wait_seconds
+        self._install_text = install_text
+        self._open_text = open_text
+
+    def ensure_absent(self) -> None:
+        self._executor.ensure_uninstalled()
+
+    def install_and_open(self) -> None:
+        self._executor.tap_text(self._install_text)
+        if self._install_wait_seconds:
+            self._sleep(self._install_wait_seconds)
+        self._executor.tap_text(self._open_text)
+
+
+# --------------------------------------------------------------------------- #
 # Results and reporting (deterministic)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -424,6 +629,8 @@ class DeeplinkTestRunner:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         retry_wait_seconds: float = DEFAULT_RETRY_WAIT_SECONDS,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
+        login_flow: LoginCapability | None = None,
+        installer: AppInstaller | None = None,
     ) -> None:
         self._observer = observer
         self._executor = executor
@@ -433,17 +640,36 @@ class DeeplinkTestRunner:
         self._max_attempts = max(1, max_attempts)
         self._retry_wait_seconds = retry_wait_seconds
         self._settle_seconds = settle_seconds
+        self._login_flow = login_flow
+        self._installer = installer
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
-        # First-install warm-up happens once for the whole suite, if provided,
-        # and is deliberately never invoked again during per-attempt retries.
-        if self._warm_up is not None:
-            self._warm_up()
+        # The INSTALLED value is deterministic (from Excel), so the two scenarios
+        # are handled separately while sharing execution, observation, judging,
+        # login, retry counting and reporting. Installed cases run as one batch
+        # (login + single warm-up), then each uninstalled first-open case runs.
+        installed = [case for case in cases if case.installed]
+        uninstalled = [case for case in cases if not case.installed]
 
         report = SuiteReport()
+        if installed:
+            self._run_installed_batch(installed, report)
+        for case in uninstalled:
+            report.results.append(self._run_uninstalled_case(case))
+        return report
+
+    def _run_installed_batch(
+        self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
+    ) -> None:
+        # 1) Ensure signed in via the SHARED login flow (a no-op if already
+        #    signed in). 2) Run the installed warm-up EXACTLY ONCE for the whole
+        #    batch - never per case and never during a retry.
+        if self._login_flow is not None:
+            self._login_flow.ensure_ready()
+        if self._warm_up is not None:
+            self._warm_up()
         for case in cases:
             report.results.append(self._run_case(case))
-        return report
 
     def _run_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         result = TestCaseResult(case=case)
@@ -454,6 +680,41 @@ class DeeplinkTestRunner:
                 self._sleep(self._retry_wait_seconds)
 
             self._executor.open_link(case.deep_link)
+            if self._settle_seconds:
+                self._sleep(self._settle_seconds)
+
+            observation = self._observer.observe()
+            verdict = self._judge.evaluate(case.expected_result, observation)
+            result.attempts.append(
+                AttemptResult(
+                    attempt=attempt, matched=verdict.matched, reason=verdict.reason
+                )
+            )
+            if verdict.matched:
+                break
+        return result
+
+    def _run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
+        # First-open-after-install scenario. There is NO installed warm-up. To
+        # keep every attempt a genuine first open, the fresh/uninstalled state is
+        # re-established on each attempt (uninstalling if present) rather than the
+        # kill -> wait -> reopen recipe, which would leave the app installed and
+        # silently degrade a retry into an installed scenario.
+        result = TestCaseResult(case=case)
+        for attempt in range(1, self._max_attempts + 1):
+            if self._installer is not None:
+                self._installer.ensure_absent()
+
+            # The EXACT Excel deeplink triggers the flow; with the app absent
+            # Android routes to the Play Store.
+            self._executor.open_link(case.deep_link)
+            if self._installer is not None:
+                self._installer.install_and_open()
+
+            # Same SHARED login/onboarding flow as the installed scenario.
+            if self._login_flow is not None:
+                self._login_flow.ensure_ready()
+
             if self._settle_seconds:
                 self._sleep(self._settle_seconds)
 
@@ -524,12 +785,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     executor = MaestroExecutor(APP_ID, args.device)
     observer = MaestroHierarchyObserver(args.device)
     warm_up = None if args.no_warm_up else MaestroWarmUp(executor)
+
+    # Shared login capability: the SAME generic AppPilotAgent + Brain used by the
+    # standalone login flow, reused (DRY) by both installed and uninstalled cases.
+    # The device's executor/observer are reused so no infrastructure is duplicated.
+    login_agent = build_login_agent(args.device, executor=executor, observer=observer)
+    login_flow: LoginCapability = SharedLoginFlow(login_agent)
+
+    installer = PlayStoreInstaller(executor)
     runner = DeeplinkTestRunner(
         observer=observer,
         executor=executor,
         judge=judge,
         warm_up=warm_up,
         max_attempts=args.max_attempts,
+        login_flow=login_flow,
+        installer=installer,
     )
     report = runner.run(cases)
     print(report.format())
