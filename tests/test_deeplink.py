@@ -701,5 +701,177 @@ class SuggestedPromptGuardTests(unittest.TestCase):
         self.assertTrue(evaluator.is_reached("goal", observation))
 
 
+class DeeplinkSuiteOrchestratorTests(unittest.TestCase):
+    def _orch(self, judge, **kwargs):
+        runner, executor, sleeps = _make_runner(judge, **kwargs)
+        return d.DeeplinkSuiteOrchestrator(runner), executor, sleeps
+
+    def test_prepare_installed_batch_logs_in_then_warms_up(self):
+        order = []
+
+        class _OrderLogin:
+            def ensure_ready(self_inner):
+                order.append("login")
+
+        def warm_up():
+            order.append("warm_up")
+
+        orch, _, _ = self._orch(
+            _ScriptedJudge([]), warm_up=warm_up, login_flow=_OrderLogin()
+        )
+        orch.prepare_installed_batch()
+        # Login-if-needed happens before the single warm-up.
+        self.assertEqual(order, ["login", "warm_up"])
+
+    def test_installed_batch_one_warm_up_before_all_cases(self):
+        order = []
+
+        class _OrderLogin:
+            def ensure_ready(self_inner):
+                order.append("login")
+
+        def warm_up():
+            order.append("warm_up")
+
+        judge = _ScriptedJudge([(True, "ok")] * 3)
+        executor = _RecordingExecutor()
+        original_open = executor.open_link
+
+        def open_link(deep_link):
+            order.append("open_link")
+            original_open(deep_link)
+
+        executor.open_link = open_link
+        orch, _, _ = self._orch(
+            judge, executor=executor, warm_up=warm_up, login_flow=_OrderLogin()
+        )
+        report = orch.run([_icase("T1"), _icase("T2"), _icase("T3")])
+        self.assertEqual(order.count("warm_up"), 1)  # exactly one, batch-level
+        self.assertEqual(order[:2], ["login", "warm_up"])  # before any case
+        self.assertEqual(order.count("open_link"), 3)
+        self.assertEqual(report.passed, 3)
+
+    def test_uninstalled_never_warms_up_and_uses_shared_login(self):
+        warm = _CountingWarmUp()
+        login = _FakeLogin()
+        installer = _FakeInstaller()
+        judge = _ScriptedJudge([(True, "ok")])
+        orch, _, _ = self._orch(
+            judge, warm_up=warm, login_flow=login, installer=installer
+        )
+        orch.run([_ucase()])
+        self.assertEqual(warm.n, 0)
+        self.assertEqual(login.ready_calls, 1)
+        self.assertEqual(installer.absent_calls, 1)
+
+    def test_mixed_shares_one_login_object_and_one_warm_up(self):
+        warm = _CountingWarmUp()
+        login = _FakeLogin()  # the SAME shared capability object for both paths
+        installer = _FakeInstaller()
+        judge = _ScriptedJudge([(True, "installed ok"), (True, "fresh ok")])
+        orch, _, _ = self._orch(
+            judge, warm_up=warm, login_flow=login, installer=installer
+        )
+        report = orch.run([_icase("T1"), _ucase("T2")])
+        self.assertEqual([r.case.test_id for r in report.results], ["T1", "T2"])
+        self.assertEqual(warm.n, 1)  # only the installed batch warms up
+        # One shared login object invoked by both scenarios (batch + uninstalled).
+        self.assertEqual(login.ready_calls, 2)
+
+    def test_orchestrator_matches_runner_run(self):
+        # runner.run() delegates to the orchestrator, so results are equivalent.
+        judge_a = _ScriptedJudge([(True, "ok"), (False, "no"), (True, "ok")])
+        judge_b = _ScriptedJudge([(True, "ok"), (False, "no"), (True, "ok")])
+        runner_a, _, _ = _make_runner(judge_a)
+        runner_b, _, _ = _make_runner(judge_b)
+        cases = [_icase("T1"), _icase("T2")]
+        via_runner = runner_a.run(cases).format()
+        via_orch = d.DeeplinkSuiteOrchestrator(runner_b).run(cases).format()
+        self.assertEqual(via_runner, via_orch)
+
+
+def _ui_el(*, text="", resource_id="", is_input=False):
+    return a.UIElement(
+        element_id="e",
+        parent_id=None,
+        text=text,
+        accessibility_text="",
+        hint_text="",
+        resource_id=resource_id,
+        class_name="",
+        clickable=False,
+        enabled=True,
+        is_input=is_input,
+        label="",
+    )
+
+
+class _RecordingProvider:
+    """A decision provider that records whether the Brain was ever asked."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def decide(self, request):
+        self.calls += 1
+        # Stop immediately without proposing an action; we only need to observe
+        # whether the shared login delegated a decision to the Brain.
+        return a.ModelDecision(action=None, reason="test: no action")
+
+
+class _FixedObserver:
+    def __init__(self, observation):
+        self._observation = observation
+
+    def observe(self):
+        return self._observation
+
+
+class _NoopExecutor:
+    def execute(self, *args, **kwargs):  # pragma: no cover - never called here
+        raise AssertionError("no login action should be executed in these tests")
+
+
+class SharedLoginOnlyIfNeededTests(unittest.TestCase):
+    """The shared login capability reuses the existing SignedInCopilotGoalEvaluator
+    to decide whether any login/onboarding is needed - not a new detector."""
+
+    def _login_flow(self, observation, provider):
+        import flows.login as login_mod
+
+        agent = login_mod.build_login_agent(
+            provider=provider,
+            observer=_FixedObserver(observation),
+            executor=_NoopExecutor(),
+        )
+        return d.SharedLoginFlow(agent)
+
+    def test_already_signed_in_takes_no_login_actions(self):
+        import contextlib
+        import io as _io
+
+        signed_in = a.UIObservation((_ui_el(text="Message Copilot"),))
+        provider = _RecordingProvider()
+        flow = self._login_flow(signed_in, provider)
+        with contextlib.redirect_stdout(_io.StringIO()):
+            flow.ensure_ready()
+        # SignedInCopilotGoalEvaluator reports ready at step 0: the Brain is never
+        # consulted and no login action is taken.
+        self.assertEqual(provider.calls, 0)
+
+    def test_logged_out_invokes_shared_login_brain(self):
+        import contextlib
+        import io as _io
+
+        logged_out = a.UIObservation(())  # not signed in
+        provider = _RecordingProvider()
+        flow = self._login_flow(logged_out, provider)
+        with contextlib.redirect_stdout(_io.StringIO()):
+            flow.ensure_ready()
+        # Not signed in -> the existing AppPilotAgent + Brain is asked to drive
+        # login/onboarding (decision delegated to the model, not hardcoded).
+        self.assertGreaterEqual(provider.calls, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

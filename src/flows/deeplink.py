@@ -644,32 +644,31 @@ class DeeplinkTestRunner:
         self._installer = installer
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
-        # The INSTALLED value is deterministic (from Excel), so the two scenarios
-        # are handled separately while sharing execution, observation, judging,
-        # login, retry counting and reporting. Installed cases run as one batch
-        # (login + single warm-up), then each uninstalled first-open case runs.
-        installed = [case for case in cases if case.installed]
-        uninstalled = [case for case in cases if not case.installed]
+        # Delegate the top-level lifecycle to the explicit orchestrator, which
+        # composes this runner's per-case execution. Kept as a convenience entry
+        # point so existing callers/tests that hold a runner still work.
+        return DeeplinkSuiteOrchestrator(self).run(cases)
 
-        report = SuiteReport()
-        if installed:
-            self._run_installed_batch(installed, report)
-        for case in uninstalled:
-            report.results.append(self._run_uninstalled_case(case))
-        return report
-
-    def _run_installed_batch(
-        self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
-    ) -> None:
-        # 1) Ensure signed in via the SHARED login flow (a no-op if already
-        #    signed in). 2) Run the installed warm-up EXACTLY ONCE for the whole
-        #    batch - never per case and never during a retry.
+    def ensure_logged_in(self) -> None:
+        # Login ONLY if needed, via the SHARED login capability. The underlying
+        # AppPilotAgent + SignedInCopilotGoalEvaluator report ready and take no
+        # actions when already signed in; otherwise the Brain drives onboarding.
         if self._login_flow is not None:
             self._login_flow.ensure_ready()
+
+    def run_warm_up(self) -> None:
+        # The installed warm-up (launch -> wait -> stop, x3). Invoked once per
+        # installed batch by the orchestrator - never per case, never on retry.
         if self._warm_up is not None:
             self._warm_up()
-        for case in cases:
-            report.results.append(self._run_case(case))
+
+    def run_installed_case(self, case: DeeplinkTestCase) -> TestCaseResult:
+        """Run a single INSTALLED case (kill -> wait 2s -> reopen retry)."""
+        return self._run_case(case)
+
+    def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
+        """Run a single UNINSTALLED first-open case (fresh state every attempt)."""
+        return self._run_uninstalled_case(case)
 
     def _run_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         result = TestCaseResult(case=case)
@@ -728,6 +727,63 @@ class DeeplinkTestRunner:
             if verdict.matched:
                 break
         return result
+
+
+# --------------------------------------------------------------------------- #
+# Suite orchestrator (explicit top-level lifecycle; composes the runner)
+# --------------------------------------------------------------------------- #
+class DeeplinkSuiteOrchestrator:
+    """Makes the deeplink suite lifecycle explicit and readable.
+
+    It owns only the top-level flow - splitting cases by the deterministic
+    INSTALLED value, preparing the installed batch (login-if-needed + one-time
+    warm-up), and driving each case - while COMPOSING the existing
+    DeeplinkTestRunner for individual case execution, semantic judging, retry
+    behavior, and reporting. Nothing here duplicates the runner, the shared
+    login capability, the judge, the Play Store installer, or Maestro/Android
+    behavior.
+
+        run()
+            -> INSTALLED batch: prepare_installed_batch() then run each case
+            -> UNINSTALLED cases: run each first-open case (no warm-up)
+            -> final SuiteReport
+    """
+
+    def __init__(self, runner: DeeplinkTestRunner) -> None:
+        self._runner = runner
+
+    def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
+        # INSTALLED is deterministic (from Excel); installed cases run as one
+        # batch (single login-if-needed + single warm-up), then each uninstalled
+        # first-open case runs independently.
+        installed = [case for case in cases if case.installed]
+        uninstalled = [case for case in cases if not case.installed]
+
+        report = SuiteReport()
+        if installed:
+            self.run_installed_batch(installed, report)
+        for case in uninstalled:
+            report.results.append(self.run_uninstalled_case(case))
+        return report
+
+    def prepare_installed_batch(self) -> None:
+        # 1) Ensure signed in via the SHARED login capability (a no-op when
+        #    already signed in). 2) Run the installed warm-up EXACTLY ONCE for the
+        #    whole batch - never per case and never during a retry.
+        self._runner.ensure_logged_in()
+        self._runner.run_warm_up()
+
+    def run_installed_batch(
+        self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
+    ) -> None:
+        self.prepare_installed_batch()
+        for case in cases:
+            report.results.append(self._runner.run_installed_case(case))
+
+    def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
+        # First-open-after-install: NO warm-up. The runner re-establishes the
+        # genuine fresh/uninstalled state on every attempt.
+        return self._runner.run_uninstalled_case(case)
 
 
 # --------------------------------------------------------------------------- #
@@ -802,7 +858,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         login_flow=login_flow,
         installer=installer,
     )
-    report = runner.run(cases)
+    # The orchestrator owns the explicit top-level lifecycle and composes the
+    # runner for per-case execution, judging, retry and reporting.
+    report = DeeplinkSuiteOrchestrator(runner).run(cases)
     print(report.format())
     return 0 if report.failed == 0 else 1
 
