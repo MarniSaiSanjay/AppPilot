@@ -530,7 +530,7 @@ class _FakeInstaller:
     def open(self):
         self.open_calls += 1
 
-    def install_and_open(self):
+    def install_and_open(self, via_store_button=False):
         self.install_calls += 1
         if self.install_calls <= self._fail_times:
             raise RuntimeError("install did not complete")
@@ -798,6 +798,9 @@ class LocalApkInstallerTests(unittest.TestCase):
         def launch_app_via_adb(self, timeout=30):
             self.events.append("launch_app_via_adb")
 
+        def launch_app_via_open_btn_click(self, timeout=60):
+            self.events.append("launch_app_via_open_btn_click")
+
         def is_foreground(self, timeout=15):
             self.events.append("is_foreground")
             self._foreground_calls += 1
@@ -821,6 +824,39 @@ class LocalApkInstallerTests(unittest.TestCase):
                 "uninstall",
                 ("install_apk", "/tmp/officemobile.apk"),
                 "launch_app_via_adb",
+                "is_foreground",
+            ],
+        )
+
+    def test_install_and_open_via_store_button_sequence(self):
+        # Uninstalled flow: adb install the local APK -> open by tapping the
+        # store's "Open" button via Maestro -> confirm the app is foreground.
+        exe = self._FakeExec()
+        installer = self._installer(exe)
+        installer.install_and_open(via_store_button=True)
+        self.assertEqual(
+            exe.events,
+            [
+                ("install_apk", "/tmp/officemobile.apk"),
+                "launch_app_via_open_btn_click",
+                "is_foreground",
+            ],
+        )
+
+    def test_store_button_open_retaps_until_foreground(self):
+        # A store Open tap returning is NOT proof the app opened: while not yet
+        # foreground the installer re-taps Open (best-effort) and polls again.
+        exe = self._FakeExec(foreground_after=2)
+        self._installer(exe).install_and_open(via_store_button=True)
+        self.assertEqual(
+            exe.events,
+            [
+                ("install_apk", "/tmp/officemobile.apk"),
+                "launch_app_via_open_btn_click",
+                "is_foreground",
+                "launch_app_via_open_btn_click",
+                "is_foreground",
+                "launch_app_via_open_btn_click",
                 "is_foreground",
             ],
         )
@@ -2233,7 +2269,7 @@ class ExecutionTraceLoggingTests(unittest.TestCase):
             "[UNINSTALLED] T9 ensuring app is uninstalled",
             "[UNINSTALLED] T9 app is uninstalled",
             "[UNINSTALLED] T9 opening deeplink",
-            "[INSTALL] T9 installing local build and launching app",
+            "[INSTALL] T9 installing local build and opening via store button",
             "[INSTALL] T9 app opened",
             "[UNINSTALLED] T9 ensuring login",
             "[UNINSTALLED] T9 login ready",

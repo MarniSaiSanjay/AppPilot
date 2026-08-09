@@ -20,12 +20,11 @@ INSTALLED vs UNINSTALLED (from the Excel INSTALLED column):
 
   * INSTALLED=FALSE: test the genuine FIRST OPEN AFTER INSTALL - uninstall the
     app, trigger the deeplink (Android routes to the store window), install the
-    local APK via adb, launch directly via a deterministic adb command (monkey
-    LAUNCHER intent, NOT the store "Open" button, NOT re-firing the deeplink;
-    the app recovers the deferred deeplink itself). The app is confirmed
-    FOREGROUND via adb before the shared login flow runs. No installed warm-up.
-    Every retry re-establishes the fresh/uninstalled state (never a warmed-up
-    scenario).
+    local APK via adb, then open the app by tapping the store's "Open" button
+    via Maestro (NOT re-firing the deeplink; the app recovers the deferred
+    deeplink itself). The app is confirmed FOREGROUND via adb before the shared
+    login flow runs. No installed warm-up. Every retry re-establishes the
+    fresh/uninstalled state (never a warmed-up scenario).
 
 INSTALL is always from the locally built APK via ``adb install`` (never the Play
 Store), behind a replaceable interface; no LLM decides how to install or launch.
@@ -606,10 +605,10 @@ class AppInstaller(Protocol):
     def install_fresh(self) -> None:
         ...
 
-    def open(self) -> None:
+    def open(self, via_store_button: bool = False) -> None:
         ...
 
-    def install_and_open(self) -> None:
+    def install_and_open(self, via_store_button: bool = False) -> None:
         ...
 
 
@@ -617,14 +616,13 @@ class LocalApkInstaller:
     """Deterministic install of the locally built APK via adb, then open.
 
     Replaces installing from the Play Store: we ``adb install`` the local build
-    directly, then launch it with a deterministic adb CLI command (monkey
-    LAUNCHER intent). This is NOT the Play Store "Open" button (whose Maestro tap
-    could silently no-op) and NOT re-firing the deeplink. The app recovers the
-    pending (deferred) deeplink itself on this launch, so no deeplink intent is
-    re-sent. After launch the app is confirmed foreground via a deterministic adb
-    check before control is handed on. ``install_fresh`` is also used by the
-    installed batch to put the local build on the device up front. No coordinate
-    taps and no LLM are involved.
+    directly. ``open`` has two modes, neither re-fires the deeplink (the app
+    recovers the pending deeplink itself on launch): the default launches via a
+    deterministic adb LAUNCHER intent (installed batch, no store window);
+    ``via_store_button=True`` taps the store's Open button via Maestro
+    (uninstalled flow, which lands on the store window from the deeplink). Both
+    confirm the app is foreground via a deterministic adb check before handing
+    on. No coordinate taps, no LLM.
     """
 
     def __init__(
@@ -651,18 +649,24 @@ class LocalApkInstaller:
         _trace(f"[INSTALL] installing local build: {self._apk_path}")
         self._executor.install_apk(self._apk_path)
 
-    def install_and_open(self) -> None:
+    def install_and_open(self, via_store_button: bool = False) -> None:
         self.install_fresh()
-        self.open()
+        self.open(via_store_button)
 
-    def open(self) -> None:
-        # Launch the already-installed build via adb (NOT the store button, NOT
-        # the deeplink); return only once confirmed foreground.
-        _trace("[INSTALL] launching app via adb")
-        self._executor.launch_app_via_adb()
-        self._wait_until_foreground()
+    def open(self, via_store_button: bool = False) -> None:
+        # Uninstalled flow taps the store's Open button (it lands on the store
+        # window from the deeplink); the installed batch launches via adb (no
+        # store window). Neither re-fires the deeplink. Return once foreground.
+        if via_store_button:
+            _trace("[INSTALL] tapping store Open button via Maestro")
+            launch = self._executor.launch_app_via_open_btn_click
+        else:
+            _trace("[INSTALL] launching app via adb")
+            launch = self._executor.launch_app_via_adb
+        launch()
+        self._wait_until_foreground(launch)
 
-    def _wait_until_foreground(self) -> None:
+    def _wait_until_foreground(self, relaunch: Callable[[], None]) -> None:
         _trace("[INSTALL] waiting for target app to become foreground")
         deadline = self._monotonic() + self._foreground_timeout_seconds
         while True:
@@ -675,11 +679,9 @@ class LocalApkInstaller:
                 )
             self._sleep(self._foreground_poll_seconds)
             # The first launch can be missed while the store window is still
-            # settling; re-launch via adb (best-effort) and poll again. A
-            # re-launch failure is not fatal here - keep polling until foreground
-            # or timeout.
+            # settling; re-launch (best-effort) and poll again.
             try:
-                self._executor.launch_app_via_adb()
+                relaunch()
             except RuntimeError:
                 pass
 
@@ -998,12 +1000,12 @@ class DeeplinkTestRunner:
             _trace(f"[UNINSTALLED] {case.test_id} opening deeplink")
             self._executor.open_link(case.deep_link)
             if self._installer is not None:
-                # 2) Install the local build via adb, then 3) launch it with a
-                # deterministic adb CLI command (NOT the store's "Open" button
-                # and NOT re-firing the deeplink). "app opened" is only emitted
-                # after the app is confirmed foreground.
-                _trace(f"[INSTALL] {case.test_id} installing local build and launching app")
-                self._installer.install_and_open()
+                # 2) Install the local build via adb, then 3) open it by tapping
+                # the store's Open button via Maestro (NOT re-firing the
+                # deeplink). "app opened" is only emitted after the app is
+                # confirmed foreground.
+                _trace(f"[INSTALL] {case.test_id} installing local build and opening via store button")
+                self._installer.install_and_open(via_store_button=True)
                 _trace(f"[INSTALL] {case.test_id} app opened")
             if self._login_flow is not None:  # SAME shared login as the installed path
                 _trace(f"[UNINSTALLED] {case.test_id} ensuring login")

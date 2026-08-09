@@ -344,14 +344,22 @@ class MaestroExecutor:
         """Launch the app (used e.g. by first-install warm-up)."""
         self._run_flow(f"- launchApp: {json.dumps(self._app_id)}\n")
 
-    def launch_app_via_adb(self, timeout: float = 30) -> None:
-        """Launch the freshly installed app directly via adb (monkey LAUNCHER).
+    def launch_app_via_open_btn_click(self, timeout: float = 60) -> None:
+        """Launch the app by tapping the store's "Open" button via Maestro.
 
-        Deterministic CLI launch - NOT the Play Store "Open" button (whose
-        Maestro tap can silently no-op) and NOT re-firing the deeplink. The app
-        recovers the pending (deferred) deeplink itself on this launch, so no
-        deeplink intent needs to be re-sent. Uses the package's default launcher
-        activity, so no activity name needs to be known in advance.
+        Deterministic text tap - launches the freshly installed app the way a
+        user would, instead of an adb CLI launch. Maestro waits for the button to
+        appear (so it tolerates the install finishing). No coordinates, OCR, or
+        model involved.
+        """
+        self._run_flow('- tapOn:\n    text: "Open"\n', timeout=timeout)
+
+    def launch_app_via_adb(self, timeout: float = 30) -> None:
+        """Launch the app via its default launcher activity (adb monkey LAUNCHER).
+
+        Deterministic CLI launch used by the installed batch to bring the app to
+        the foreground. Uses the package's default launcher activity, so no
+        activity name needs to be known in advance.
         """
         result = self._run_adb(
             [
