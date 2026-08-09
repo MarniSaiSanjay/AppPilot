@@ -39,30 +39,20 @@ class ModelDecision:
     action: Action | None
     reason: str
 
-    @property
-    def can_proceed(self) -> bool:
-        return self.action is not None
 
 
 class ModelDecisionProvider(Protocol):
-    """Boundary for a real, model-backed decision maker.
-
-    Implementations turn a :class:`DecisionRequest` into a :class:`ModelDecision`.
-    The concrete model is selected via configuration/environment so the agent
-    loop never depends on a specific provider.
-    """
+    """Boundary for a real, model-backed decision maker: turns a
+    :class:`DecisionRequest` into a :class:`ModelDecision`. The concrete model is
+    chosen via configuration so the agent loop never depends on a provider."""
 
     def decide(self, request: DecisionRequest) -> ModelDecision:
         ...
 
 
 class UnconfiguredModelDecisionProvider:
-    """Honest placeholder used when no decision model is configured.
-
-    It makes no decisions and never guesses: every request returns "cannot
-    safely proceed" with configuration guidance. This keeps the agent loop
-    runnable without pretending to be intelligent.
-    """
+    """Placeholder used when no model is configured: every request returns
+    "cannot safely proceed", so the agent loop runs without guessing."""
 
     def __init__(self, detail: str) -> None:
         self._detail = detail
@@ -78,16 +68,13 @@ class UnconfiguredModelDecisionProvider:
 class LLMModelDecisionProvider:
     """Model-backed decision provider using an OpenAI-compatible chat API.
 
-    The endpoint, model name and API key are read from the environment so that
-    no provider, model, or credential is hardcoded in the orchestration logic:
-
+    Endpoint, model, and key come from the environment (nothing hardcoded):
     - ``APPPILOT_MODEL_API_KEY``  (required)
     - ``APPPILOT_MODEL``          (required, e.g. "gpt-4o-mini")
     - ``APPPILOT_MODEL_BASE_URL`` (optional, defaults to the OpenAI v1 endpoint)
 
-    The model selects only from the safe actions supplied in the request, so it
-    can never invent an element that is not in the current observation. The HTTP
-    call is isolated in ``transport`` so it can be replaced or stubbed.
+    The model selects only from the safe actions in the request, so it can never
+    invent an off-screen element. The HTTP call is isolated in ``transport``.
     """
 
     _SYSTEM_PROMPT = (

@@ -44,7 +44,7 @@ try:  # package-relative (python -m src.apppilot_agent)
     )
     from .flows.login import (
         DEFAULT_GUIDANCE,
-        MicrosoftSignInGoalEvaluator,
+        LLMLoginGoalEvaluator,
         PROTOTYPE_GOAL,
         SignedInCopilotGoalEvaluator,
         _parse_args,
@@ -87,7 +87,7 @@ except ImportError:  # top-level (src on sys.path)
     )
     from flows.login import (
         DEFAULT_GUIDANCE,
-        MicrosoftSignInGoalEvaluator,
+        LLMLoginGoalEvaluator,
         PROTOTYPE_GOAL,
         SignedInCopilotGoalEvaluator,
         _parse_args,

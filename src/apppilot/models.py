@@ -34,10 +34,27 @@ class UIElement:
     enabled: bool
     is_input: bool
     label: str
+    bounds: "tuple[int, int, int, int] | None" = None
 
     @property
     def selector_text(self) -> str:
         return self.text or self.accessibility_text or self.hint_text or self.label
+
+    @property
+    def own_text(self) -> str:
+        """Text belonging to THIS node (not merged from a descendant).
+
+        Matching a clickable node by a label that actually lives on a child can
+        tap the child (often zero/opaque bounds in Compose) instead. Only this
+        node's own text is safe to drive a text selector."""
+        return self.text or self.accessibility_text or self.hint_text
+
+    @property
+    def center(self) -> "tuple[int, int] | None":
+        if self.bounds is None:
+            return None
+        left, top, right, bottom = self.bounds
+        return ((left + right) // 2, (top + bottom) // 2)
 
 
 
@@ -128,10 +145,9 @@ class ExecutionContext:
 class RuntimeContext:
     """Secure, non-UI runtime test data such as credentials.
 
-    This is intentionally NOT part of :class:`DecisionRequest`: it is never
-    included in prompts sent to the model, in the UI observation, in model
-    responses, or in logs. The agent resolves a requested credential locally and
-    passes the value directly to Maestro. Its ``repr`` deliberately hides values.
+    Never part of :class:`DecisionRequest`: never in prompts, observations, model
+    responses, or logs. The agent resolves a credential locally and passes it
+    straight to Maestro. ``repr`` deliberately hides values.
     """
 
     def __init__(self, credentials: dict[CredentialKind, str]) -> None:

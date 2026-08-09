@@ -1,43 +1,34 @@
 """Data-driven deeplink test runner for AppPilot.
 
-This reuses the existing AppPilot abstractions - the same Maestro executor,
-Maestro UI observer, the shared generic login flow, and the same
-OpenAI-compatible model configuration - rather than introducing a second agent
-framework. Its shape is deliberately narrow:
+Reuses the existing AppPilot abstractions (Maestro executor/observer, the shared
+login flow, the OpenAI-compatible model config) rather than a second framework:
 
     load test cases (Excel)
         -> for each case: launch the EXACT deeplink (deterministic, Maestro)
             -> observe the resulting Android UI (deterministic, Maestro)
-                -> AI judges whether the observed UI satisfies the natural
-                   language Expected Result (semantic, model)
+                -> AI judges observed UI vs the Expected Result (semantic)
                     -> PASS, or kill + wait + retry (deterministic)
 
-The deeplink and the Expected Result both come from the Excel and are used
-verbatim. The model never invents, modifies, or chooses a deeplink; it only
-evaluates expected-vs-observed. Retry and reporting are fully deterministic.
+Deeplink and Expected Result come from the Excel verbatim; the model only judges
+expected-vs-observed. Retry and reporting are fully deterministic.
 
-INSTALLED vs UNINSTALLED (deterministic, from the Excel INSTALLED column):
+INSTALLED vs UNINSTALLED (from the Excel INSTALLED column):
 
-  * INSTALLED=TRUE cases run as a batch: ensure the app is signed in via the
-    SHARED login flow (AI-driven; a no-op if already signed in), then run the
-    installed-environment warm-up exactly ONCE for the whole batch, then run
-    each case. Per-case retry is the standard kill -> wait 2s -> reopen recipe.
-    The warm-up is never repeated per case or per retry.
+  * INSTALLED=TRUE: run as a batch - sign in via the shared login flow (no-op if
+    already signed in), run the installed warm-up exactly ONCE for the batch,
+    then each case. Per-case retry is kill -> wait 2s -> reopen (no re-warm-up).
 
-  * INSTALLED=FALSE cases test the genuine FIRST OPEN AFTER INSTALL: the app is
-    uninstalled (clearing data is not enough), the exact deeplink is triggered
-    so Android routes to the Play Store, the app is installed and opened, then
-    the SAME shared login flow runs. No installed warm-up is performed. To keep
-    each retry a true first-install (never a warmed-up/installed scenario), the
-    fresh/uninstalled state is re-established on EVERY attempt instead of the
-    kill -> wait -> reopen recipe.
+  * INSTALLED=FALSE: test the genuine FIRST OPEN AFTER INSTALL - uninstall the
+    app, trigger the deeplink (Android routes to the store window), install the
+    local APK via adb, launch directly via a deterministic adb command (monkey
+    LAUNCHER intent, NOT the store "Open" button, NOT re-firing the deeplink;
+    the app recovers the deferred deeplink itself). The app is confirmed
+    FOREGROUND via adb before the shared login flow runs. No installed warm-up.
+    Every retry re-establishes the fresh/uninstalled state (never a warmed-up
+    scenario).
 
-LIMITATION - Play Store install/open is best-effort: it taps the Play Store's
-visible "Install"/"Open" buttons by text via Maestro (a deterministic selector,
-NOT coordinate taps and NOT AI-driven), so it depends on the Play Store's
-current button labels and cannot be guaranteed across store versions. It is
-injected behind an interface so it can be replaced; no LLM is ever used to
-decide how to install the app.
+INSTALL is always from the locally built APK via ``adb install`` (never the Play
+Store), behind a replaceable interface; no LLM decides how to install or launch.
 """
 
 from __future__ import annotations
@@ -53,7 +44,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 # Reuse the committed AppPilot building blocks; do not fork a new framework.
 # Support both `python -m src.flows.deeplink` (package-relative) and running
@@ -66,6 +57,7 @@ try:
     )
     from ..apppilot.agent import _load_dotenv  # noqa: E402
     from ..apppilot.models import UIObservation  # noqa: E402
+    from ..apppilot import officemobile_build  # noqa: E402
 except ImportError:
     from apppilot.android import (  # noqa: E402
         APP_ID,
@@ -74,23 +66,42 @@ except ImportError:
     )
     from apppilot.agent import _load_dotenv  # noqa: E402
     from apppilot.models import UIObservation  # noqa: E402
+    from apppilot import officemobile_build  # noqa: E402
 
 # The SHARED login capability (same generic AppPilotAgent + Brain) - reused, not
 # duplicated. Sibling import works whether this module is loaded as
 # ``src.flows.deeplink`` or top-level ``flows.deeplink`` (via the compat shim).
 from .login import DEFAULT_GUIDANCE, PROTOTYPE_GOAL, build_login_agent  # noqa: E402
 
-# Absolute deterministic bounds for the deeplink suite. These are unrelated to
-# the agent's own action/stuck limits; a deeplink attempt is a single launch +
-# observe + evaluate, not an action loop.
-DEFAULT_MAX_ATTEMPTS = 3
+# Deterministic bounds for the deeplink suite (separate from the agent's
+# action/stuck limits). A failed test is retried once (1 attempt + 1 retry).
+DEFAULT_MAX_ATTEMPTS = 2
 DEFAULT_RETRY_WAIT_SECONDS = 2.0
-# Time to let the app settle after a deeplink launch before observing. Injected
-# via the same sleep hook so tests can make it a no-op.
+# Settle time after a deeplink launch before the first verification observation.
+# Injected via the sleep hook so tests can no-op it.
 DEFAULT_SETTLE_SECONDS = 3.0
-# Time to allow a Play Store install to complete before tapping Open. Best-effort
-# and injectable so tests make it a no-op.
-DEFAULT_INSTALL_WAIT_SECONDS = 90.0
+# Bounded verification polling: observe -> judge repeatedly, PASS on first match,
+# mismatch only after the window elapses. Same for installed AND uninstalled.
+DEFAULT_VERIFY_TIMEOUT_SECONDS = 15.0
+DEFAULT_VERIFY_POLL_INTERVAL_SECONDS = 2.0
+# Bounded wait for the app to become foreground after an adb launch (a returning
+# launch command is not proof); confirmed via the deterministic adb foreground check.
+DEFAULT_FOREGROUND_TIMEOUT_SECONDS = 30.0
+DEFAULT_FOREGROUND_POLL_SECONDS = 1.0
+
+
+def _trace(message: str) -> None:
+    """Emit one execution-trace line to stdout.
+
+    This is deliberately a dumb printer, NOT a narration helper: every call site
+    sits immediately next to a REAL operation (a launch, a stop, an open_link, an
+    ensure_absent, an install, a login, a judge, ...) so the terminal output is a
+    faithful chronological record of what actually executed. A success line is
+    only emitted after the underlying call returns, so if an operation raises the
+    corresponding "done" line is never printed. Secrets and full deeplink URLs
+    are never passed in here.
+    """
+    print(message)
 
 
 # --------------------------------------------------------------------------- #
@@ -112,10 +123,8 @@ class DeeplinkTestCase:
 
 
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-# Positional fallback used only when no header row can be recognised. The parser
-# is not strict about exact layout: when a header row IS present, columns are
-# mapped by header name (see _map_header) so extra/renamed/reordered columns and
-# leading title rows are all handled generically.
+# Positional fallback used only when no header row is recognised; otherwise
+# columns are mapped by header name (see _map_header).
 _COLUMNS = {
     "A": "test_id",
     "B": "deep_link",
@@ -166,11 +175,11 @@ def _match_field(label: str) -> str | None:
         return None
     best_field: str | None = None
     best_len = 0
-    for field, synonyms in _FIELD_SYNONYMS.items():
+    for logical_field, synonyms in _FIELD_SYNONYMS.items():
         for synonym in synonyms:
             if synonym == norm or synonym in norm:
                 if len(synonym) > best_len:
-                    best_field, best_len = field, len(synonym)
+                    best_field, best_len = logical_field, len(synonym)
     return best_field
 
 
@@ -233,10 +242,10 @@ def _map_header(cells: dict[str, str]) -> dict[str, str]:
     scored = [
         (letter, _match_field(label)) for letter, label in cells.items()
     ]
-    for letter, field in sorted(scored, key=lambda item: item[0]):
-        if field and field not in assigned:
-            mapping[letter] = field
-            assigned.add(field)
+    for letter, logical_field in sorted(scored, key=lambda item: item[0]):
+        if logical_field and logical_field not in assigned:
+            mapping[letter] = logical_field
+            assigned.add(logical_field)
     return mapping
 
 
@@ -287,7 +296,8 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
     cases: list[DeeplinkTestCase] = []
     for cells in rows[data_start:]:
         values = {
-            field: cells.get(letter, "") for letter, field in column_map.items()
+            logical_field: cells.get(letter, "")
+            for letter, logical_field in column_map.items()
         }
         test_id = values.get("test_id", "")
         deep_link = values.get("deep_link", "")
@@ -354,22 +364,30 @@ class LLMExpectationJudge:
     _SYSTEM_PROMPT = (
         "You are AppPilot's deeplink result judge. You are given an EXPECTED "
         "RESULT written in natural language (for example \"Chat screen\", \"Chat "
-        "screen with prompt\", \"Researcher screen with prompt\", or an expected "
-        "error/failure state) and the CURRENT observed Android UI after a deep "
-        "link was launched.\n"
+        "screen with prompt\", \"Chat screen with prompt \\\"<specific text>\\\"\", "
+        "\"Researcher screen with prompt\", or an expected error/failure state) "
+        "and the CURRENT observed Android UI after a deep link was launched.\n"
         "\n"
-        "Your only job is to decide whether the observed UI SEMANTICALLY "
-        "satisfies the expected result. Judge by meaning, not by exact wording or "
-        "specific selectors. Do NOT rely on any single hardcoded label; reason "
-        "about what the screen is and whether it is the expected state.\n"
+        "Decide whether the observed UI SEMANTICALLY satisfies the expected "
+        "result. Judge the screen TYPE by meaning, not by exact wording or "
+        "specific selectors, and do not rely on any single hardcoded label.\n"
         "\n"
-        "IMPORTANT:\n"
-        "- The test passes when the OBSERVED state matches the EXPECTED state - "
-        "not when the deeplink 'succeeded'. If the expected result describes an "
-        "error or failure state and that error/failure is what is observed, that "
-        "is a MATCH (pass).\n"
-        "- 'with prompt' means a prompt/text is present in the composer or input; "
-        "its absence when expected is a mismatch, and vice versa.\n"
+        "RULES:\n"
+        "- Match on the OBSERVED state, not on whether the deeplink 'succeeded'. "
+        "If the expected result describes an error/failure state and that is what "
+        "is observed, that is a MATCH.\n"
+        "- 'with prompt' with NO specific text: a non-empty prompt/text must be "
+        "present in the composer/input; its expected presence/absence must "
+        "agree.\n"
+        "- If the expected result SPECIFIES OR QUOTES a particular prompt, topic, "
+        "or content, the observed composer/input must actually contain THAT SAME "
+        "prompt (same meaning/topic) - not merely some text. A generic, "
+        "placeholder, suggested, or DIFFERENT prompt is a MISMATCH. Minor "
+        "wording/whitespace differences are acceptable; a different topic or a "
+        "different prompt is NOT.\n"
+        "- An initial suggested-prompt / welcome / onboarding screen that shows a "
+        "random or different suggested prompt does NOT satisfy an expected "
+        "specific prompt.\n"
         "- If the observed UI is ambiguous, incidental (a transient/loading or "
         "unrelated interruption), or clearly a different screen than expected, it "
         "is NOT a match.\n"
@@ -482,18 +500,32 @@ class MaestroWarmUp:
         self._sleep = sleep
 
     def __call__(self) -> None:
-        for _ in range(self._launches):
+        _trace(
+            f"[WARM-UP] Starting installed-app preparation: {self._launches} cycles"
+        )
+        for index in range(self._launches):
+            cycle = index + 1
+            _trace(f"[WARM-UP] Cycle {cycle}/{self._launches}: launch app")
             self._executor.launch_app()
             if self._settle_seconds:
+                _trace(
+                    f"[WARM-UP] Cycle {cycle}/{self._launches}: "
+                    f"waiting {self._settle_seconds:g}s"
+                )
                 self._sleep(self._settle_seconds)
+            _trace(f"[WARM-UP] Cycle {cycle}/{self._launches}: stop app")
             self._executor.stop_app()
+            _trace(f"[WARM-UP] Cycle {cycle}/{self._launches} complete")
+        _trace("[WARM-UP] Installed-app preparation complete")
 
 
 # --------------------------------------------------------------------------- #
-# Shared login capability + fresh-install (Play Store) capability
+# Shared login capability + fresh-install (local APK via adb) capability
 # --------------------------------------------------------------------------- #
 class LoginCapability(Protocol):
-    def ensure_ready(self) -> None:
+    def ensure_ready(self) -> bool:
+        """Return True iff login preparation reached success. This is the sole
+        signal the caller inspects; it never implies deeplink success."""
         ...
 
 
@@ -506,49 +538,150 @@ class SharedLoginFlow:
 
     def __init__(self, agent) -> None:
         self._agent = agent
+        # Observability only: wrap the agent's goal evaluator so the [LOGIN] trace
+        # reflects real verdicts. The wrapper returns each verdict verbatim, so
+        # behavior is unchanged. Guard against double-wrapping if reused.
+        self._tracer: _SignInTracer | None = None
+        evaluator = getattr(agent, "_goal_evaluator", None)
+        if evaluator is not None and not isinstance(evaluator, _SignInTracer):
+            self._tracer = _SignInTracer(evaluator)
+            agent._goal_evaluator = self._tracer
 
-    def ensure_ready(self) -> None:
-        self._agent.run(PROTOTYPE_GOAL, DEFAULT_GUIDANCE)
+    def ensure_ready(self) -> bool:
+        # Reset the per-run trace state so each login attempt reports its own
+        # already/required/completed verdict (the login flow is reused across the
+        # installed batch and every uninstalled attempt).
+        if self._tracer is not None:
+            self._tracer.begin_run()
+        # Propagate the agent's verdict verbatim (True = login goal reached,
+        # False = preparation failed) - do NOT swallow it.
+        return bool(self._agent.run(PROTOTYPE_GOAL, DEFAULT_GUIDANCE))
+
+
+class _SignInTracer:
+    """Observability wrapper around the shared login goal evaluator.
+
+    Emits [LOGIN] trace lines derived only from the real verdicts the underlying
+    evaluator returns, passing those verdicts through unchanged:
+
+    * the first verdict decides "Already signed in" vs "Sign-in required";
+    * a later transition to signed-in is the actual completion.
+    """
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self._seen_first = False
+        self._required = False
+
+    def begin_run(self) -> None:
+        self._seen_first = False
+        self._required = False
+        # Reset any per-run state the wrapped evaluator exposes. The boundary
+        # evaluator is stateless (no-op here); kept as a forward-safe hook.
+        inner_begin = getattr(self._inner, "begin_run", None)
+        if callable(inner_begin):
+            inner_begin()
+
+    def is_reached(self, goal: str, observation: UIObservation) -> bool:
+        reached = self._inner.is_reached(goal, observation)
+        if not self._seen_first:
+            self._seen_first = True
+            if reached:
+                _trace("[LOGIN] Already signed in - no login actions required")
+            else:
+                self._required = True
+                _trace("[LOGIN] Sign-in required - starting shared login flow")
+        elif reached and self._required:
+            self._required = False
+            _trace("[LOGIN] Authentication/onboarding boundary reached")
+            _trace("[LOGIN] Login goal reached: true")
+            _trace("[LOGIN] Returning control to deeplink test")
+        return reached
 
 
 class AppInstaller(Protocol):
-    def ensure_absent(self) -> None:
+    def ensure_absent(self) -> bool:
+        ...
+
+    def install_fresh(self) -> None:
+        ...
+
+    def open(self) -> None:
         ...
 
     def install_and_open(self) -> None:
         ...
 
 
-class PlayStoreInstaller:
-    """Best-effort, deterministic Play Store install + open (see module
-    LIMITATION). ``ensure_absent`` genuinely uninstalls the APK (adb) so the
-    next deeplink is a real first-open; ``install_and_open`` taps the Play
-    Store's visible "Install" then "Open" buttons by text via Maestro. No
-    coordinate taps and no LLM are involved."""
+class LocalApkInstaller:
+    """Deterministic install of the locally built APK via adb, then open.
+
+    Replaces installing from the Play Store: we ``adb install`` the local build
+    directly, then launch it with a deterministic adb CLI command (monkey
+    LAUNCHER intent). This is NOT the Play Store "Open" button (whose Maestro tap
+    could silently no-op) and NOT re-firing the deeplink. The app recovers the
+    pending (deferred) deeplink itself on this launch, so no deeplink intent is
+    re-sent. After launch the app is confirmed foreground via a deterministic adb
+    check before control is handed on. ``install_fresh`` is also used by the
+    installed batch to put the local build on the device up front. No coordinate
+    taps and no LLM are involved.
+    """
 
     def __init__(
         self,
         executor: MaestroExecutor,
+        apk_path: str,
         *,
+        foreground_timeout_seconds: float = DEFAULT_FOREGROUND_TIMEOUT_SECONDS,
+        foreground_poll_seconds: float = DEFAULT_FOREGROUND_POLL_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
-        install_wait_seconds: float = DEFAULT_INSTALL_WAIT_SECONDS,
-        install_text: str = "Install",
-        open_text: str = "Open",
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._executor = executor
+        self._apk_path = apk_path
+        self._foreground_timeout_seconds = max(0.0, foreground_timeout_seconds)
+        self._foreground_poll_seconds = max(0.0, foreground_poll_seconds)
         self._sleep = sleep
-        self._install_wait_seconds = install_wait_seconds
-        self._install_text = install_text
-        self._open_text = open_text
+        self._monotonic = monotonic
 
-    def ensure_absent(self) -> None:
-        self._executor.ensure_uninstalled()
+    def ensure_absent(self) -> bool:
+        return self._executor.ensure_uninstalled()
+
+    def install_fresh(self) -> None:
+        _trace(f"[INSTALL] installing local build: {self._apk_path}")
+        self._executor.install_apk(self._apk_path)
 
     def install_and_open(self) -> None:
-        self._executor.tap_text(self._install_text)
-        if self._install_wait_seconds:
-            self._sleep(self._install_wait_seconds)
-        self._executor.tap_text(self._open_text)
+        self.install_fresh()
+        self.open()
+
+    def open(self) -> None:
+        # Launch the already-installed build via adb (NOT the store button, NOT
+        # the deeplink); return only once confirmed foreground.
+        _trace("[INSTALL] launching app via adb")
+        self._executor.launch_app_via_adb()
+        self._wait_until_foreground()
+
+    def _wait_until_foreground(self) -> None:
+        _trace("[INSTALL] waiting for target app to become foreground")
+        deadline = self._monotonic() + self._foreground_timeout_seconds
+        while True:
+            if self._executor.is_foreground():
+                _trace("[INSTALL] target app is foreground")
+                return
+            if self._monotonic() >= deadline:
+                raise RuntimeError(
+                    "[INSTALL] target app did not become foreground within timeout"
+                )
+            self._sleep(self._foreground_poll_seconds)
+            # The first launch can be missed while the store window is still
+            # settling; re-launch via adb (best-effort) and poll again. A
+            # re-launch failure is not fatal here - keep polling until foreground
+            # or timeout.
+            try:
+                self._executor.launch_app_via_adb()
+            except RuntimeError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -595,13 +728,21 @@ class SuiteReport:
         return self.total - self.passed
 
     def format(self) -> str:
-        lines = ["DEEPLINK TEST REPORT", ""]
+        lines = [
+            "DEEPLINK TEST REPORT",
+            "(Login is a precondition, reported inline per run as [LOGIN RESULT]. "
+            "The PASS/FAIL below is the deeplink verification result, which is the "
+            "overall test-case result.)",
+            "",
+        ]
         for result in self.results:
             status = "PASS" if result.passed else "FAIL"
             attempt_no = result.passing_attempt or len(result.attempts)
             lines.append(
                 f"{result.case.test_id}  {status}  Attempt {attempt_no}"
             )
+            lines.append(f"    Deeplink test: {status}")
+            lines.append(f"    Overall test case: {status}")
             lines.append(f"    Expected: {result.case.expected_result}")
             for attempt in result.attempts:
                 mark = "match" if attempt.matched else "mismatch"
@@ -609,10 +750,26 @@ class SuiteReport:
                     f"    Attempt {attempt.attempt}: {mark} - {attempt.reason}"
                 )
             lines.append("")
-        lines.append(f"Total: {self.total}")
-        lines.append(f"Passed: {self.passed}")
-        lines.append(f"Failed: {self.failed}")
+        lines.append(f"Total test cases: {self.total}")
+        lines.append(f"Deeplink test cases passed: {self.passed}")
+        lines.append(f"Deeplink test cases failed: {self.failed}")
         return "\n".join(lines)
+
+
+def _login_failed_result(case: DeeplinkTestCase) -> TestCaseResult:
+    """FAIL result for a case whose login failed: one failed attempt, no deeplink
+    verdict (``_verify()`` never ran). Used by the installed batch on login
+    failure; the uninstalled flow reaches this via the per-attempt setup path."""
+    return TestCaseResult(
+        case=case,
+        attempts=[
+            AttemptResult(
+                attempt=1,
+                matched=False,
+                reason="login preparation failed; deeplink verification skipped",
+            )
+        ],
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -629,6 +786,9 @@ class DeeplinkTestRunner:
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         retry_wait_seconds: float = DEFAULT_RETRY_WAIT_SECONDS,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
+        verify_timeout_seconds: float = DEFAULT_VERIFY_TIMEOUT_SECONDS,
+        verify_poll_interval_seconds: float = DEFAULT_VERIFY_POLL_INTERVAL_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
         login_flow: LoginCapability | None = None,
         installer: AppInstaller | None = None,
     ) -> None:
@@ -640,6 +800,9 @@ class DeeplinkTestRunner:
         self._max_attempts = max(1, max_attempts)
         self._retry_wait_seconds = retry_wait_seconds
         self._settle_seconds = settle_seconds
+        self._verify_timeout_seconds = max(0.0, verify_timeout_seconds)
+        self._verify_poll_interval_seconds = max(0.0, verify_poll_interval_seconds)
+        self._monotonic = monotonic
         self._login_flow = login_flow
         self._installer = installer
 
@@ -649,18 +812,42 @@ class DeeplinkTestRunner:
         # point so existing callers/tests that hold a runner still work.
         return DeeplinkSuiteOrchestrator(self).run(cases)
 
-    def ensure_logged_in(self) -> None:
-        # Login ONLY if needed, via the SHARED login capability. The underlying
-        # AppPilotAgent + SignedInCopilotGoalEvaluator report ready and take no
-        # actions when already signed in; otherwise the Brain drives onboarding.
+    def ensure_logged_in(self) -> bool:
+        # Login only if needed, via the shared login capability. Returns True iff
+        # login succeeded (True when no login flow is configured).
         if self._login_flow is not None:
-            self._login_flow.ensure_ready()
+            return self._login_flow.ensure_ready()
+        return True
 
     def run_warm_up(self) -> None:
         # The installed warm-up (launch -> wait -> stop, x3). Invoked once per
         # installed batch by the orchestrator - never per case, never on retry.
         if self._warm_up is not None:
             self._warm_up()
+
+    def install_local_build(self) -> None:
+        # Put the freshly built local APK on the device (adb install -r). Used by
+        # the installed batch so every installed case runs against the local build.
+        if self._installer is not None:
+            self._installer.install_fresh()
+
+    def ensure_clean_install_state(self) -> None:
+        # One-time suite-startup cleanup: guarantee the app is uninstalled so
+        # every run starts from a deterministic clean state. No-op if absent or
+        # no installer is configured.
+        if self._installer is None:
+            return
+        if self._installer.ensure_absent():
+            _trace("[SUITE] Removed existing app install")
+        else:
+            _trace("[SUITE] No existing app install to remove")
+
+    def open_installed_app(self) -> None:
+        # Launch the already-installed build to the foreground so login observes
+        # the APP, not the launcher home screen. The batch only installs the APK
+        # (install_fresh); the uninstalled path launches via install_and_open.
+        if self._installer is not None:
+            self._installer.open()
 
     def run_installed_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         """Run a single INSTALLED case (kill -> wait 2s -> reopen retry)."""
@@ -670,20 +857,74 @@ class DeeplinkTestRunner:
         """Run a single UNINSTALLED first-open case (fresh state every attempt)."""
         return self._run_uninstalled_case(case)
 
-    def _run_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        result = TestCaseResult(case=case)
-        for attempt in range(1, self._max_attempts + 1):
-            if attempt > 1:
-                # Retry recipe: kill app -> wait 2s -> execute same deeplink.
-                self._executor.stop_app()
-                self._sleep(self._retry_wait_seconds)
+    def _verify(self, case: DeeplinkTestCase, attempt: int):
+        """Shared, bounded verification polling for a single attempt.
 
-            self._executor.open_link(case.deep_link)
+        Used IDENTICALLY by installed and uninstalled cases. After the deeplink
+        has been executed and the app is ready to be observed, repeatedly
+        observe -> judge until the expected result matches (PASS immediately) or
+        the bounded verification window elapses (genuine mismatch -> caller
+        retries). A deeplink destination may take several seconds to appear, so a
+        first non-matching observation is NOT a failure. Uses a monotonic clock
+        so the window can never be skewed by wall-clock jumps, and always makes
+        at least one observe/judge call.
+        """
+        deadline = self._monotonic() + self._verify_timeout_seconds
+        verdict = None
+        while True:
+            _trace(
+                f"[VERIFY] {case.test_id} attempt "
+                f"{attempt}/{self._max_attempts}: checking expected result"
+            )
+            observation = self._observer.observe()
+            verdict = self._judge.evaluate(case.expected_result, observation)
+            if verdict.matched:
+                _trace(f"[VERIFY] {case.test_id}: expected result matched")
+                return verdict
+            if self._monotonic() >= deadline:
+                _trace(f"[VERIFY] {case.test_id}: verification timeout reached")
+                return verdict
+            _trace(
+                f"[VERIFY] {case.test_id}: expected result not reached; "
+                f"waiting {self._verify_poll_interval_seconds:g}s"
+            )
+            self._sleep(self._verify_poll_interval_seconds)
+
+    def _run_attempts(
+        self,
+        case: DeeplinkTestCase,
+        label: str,
+        prepare: Callable[[int], None],
+        on_start: "Callable[[], None] | None" = None,
+    ) -> TestCaseResult:
+        """Generic attempt loop shared by every scenario.
+
+        Scenarios differ ONLY in how each attempt PREPARES the app before
+        verification (``prepare``); the retry loop, shared bounded verification,
+        per-attempt result recording and PASS/FAIL reporting are identical. A
+        preparation failure is a retryable failed attempt, never a crash, so the
+        suite always continues.
+        """
+        result = TestCaseResult(case=case)
+        _trace(f"[{label}] {case.test_id} starting")
+        if on_start is not None:
+            on_start()
+        for attempt in range(1, self._max_attempts + 1):
+            _trace(f"[{label}] {case.test_id} attempt {attempt}/{self._max_attempts}")
+            try:
+                prepare(attempt)
+            except RuntimeError as exc:
+                _trace(f"[{label}] {case.test_id} attempt setup failed: {exc}")
+                result.attempts.append(
+                    AttemptResult(attempt=attempt, matched=False, reason=str(exc))
+                )
+                continue
+
             if self._settle_seconds:
                 self._sleep(self._settle_seconds)
 
-            observation = self._observer.observe()
-            verdict = self._judge.evaluate(case.expected_result, observation)
+            _trace(f"[{label}] {case.test_id} verifying deeplink expected result")
+            verdict = self._verify(case, attempt)
             result.attempts.append(
                 AttemptResult(
                     attempt=attempt, matched=verdict.matched, reason=verdict.reason
@@ -691,42 +932,93 @@ class DeeplinkTestRunner:
             )
             if verdict.matched:
                 break
+            _trace(f"[{label}] {case.test_id} attempt {attempt}/{self._max_attempts}: MISMATCH")
+        _trace(
+            f"[{label}] {case.test_id} deeplink test case result: "
+            f"{'PASS' if result.passed else 'FAIL'}"
+        )
         return result
+
+    def _run_case(self, case: DeeplinkTestCase) -> TestCaseResult:
+        """INSTALLED scenario: retry recipe is kill -> wait -> reopen same deeplink.
+
+        Process-isolated: the app is always stopped when the case finishes (PASS,
+        FAIL, or error) via one finally boundary, so the next case's deeplink
+        launches a fresh process. Installed-only; uninstalled is untouched.
+        """
+        try:
+            return self._run_attempts(
+                case, "INSTALLED", self._installed_prepare(case)
+            )
+        finally:
+            _trace(f"[INSTALLED] {case.test_id} stopping app (case cleanup)")
+            self._executor.stop_app()
+
+    def _installed_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
+        def prepare(attempt: int) -> None:
+            if attempt > 1:  # retry recipe: kill -> wait -> reopen the same deeplink
+                _trace(f"[INSTALLED] {case.test_id} retry: stopping app")
+                self._executor.stop_app()
+                _trace(
+                    f"[INSTALLED] {case.test_id} retry: "
+                    f"waiting {self._retry_wait_seconds:g}s"
+                )
+                self._sleep(self._retry_wait_seconds)
+                _trace(f"[INSTALLED] {case.test_id} retry: reopening same deeplink")
+            else:
+                _trace(f"[INSTALLED] {case.test_id} opening deeplink")
+            self._executor.open_link(case.deep_link)
+
+        return prepare
 
     def _run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        # First-open-after-install scenario. There is NO installed warm-up. To
-        # keep every attempt a genuine first open, the fresh/uninstalled state is
-        # re-established on each attempt (uninstalling if present) rather than the
-        # kill -> wait -> reopen recipe, which would leave the app installed and
-        # silently degrade a retry into an installed scenario.
-        result = TestCaseResult(case=case)
-        for attempt in range(1, self._max_attempts + 1):
-            if self._installer is not None:
-                self._installer.ensure_absent()
+        """UNINSTALLED first-open scenario: NO warm-up. Every attempt re-establishes
+        genuine fresh state (uninstall -> deeplink -> install/open -> shared login),
+        so a retry can never silently degrade into an installed run."""
+        return self._run_attempts(
+            case,
+            "UNINSTALLED",
+            self._uninstalled_prepare(case),
+            on_start=lambda: _trace(
+                f"[UNINSTALLED] {case.test_id} first-open flow - warm-up not applicable"
+            ),
+        )
 
-            # The EXACT Excel deeplink triggers the flow; with the app absent
-            # Android routes to the Play Store.
+    def _uninstalled_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
+        def prepare(attempt: int) -> None:
+            if attempt > 1:  # every retry rebuilds genuine fresh state
+                _trace(
+                    f"[UNINSTALLED] {case.test_id} retry: recreating fresh-install state"
+                )
+            if self._installer is not None:
+                _trace(f"[UNINSTALLED] {case.test_id} ensuring app is uninstalled")
+                self._installer.ensure_absent()
+                _trace(f"[UNINSTALLED] {case.test_id} app is uninstalled")
+            # 1) The EXACT deeplink routes to the store window while absent.
+            _trace(f"[UNINSTALLED] {case.test_id} opening deeplink")
             self._executor.open_link(case.deep_link)
             if self._installer is not None:
+                # 2) Install the local build via adb, then 3) launch it with a
+                # deterministic adb CLI command (NOT the store's "Open" button
+                # and NOT re-firing the deeplink). "app opened" is only emitted
+                # after the app is confirmed foreground.
+                _trace(f"[INSTALL] {case.test_id} installing local build and launching app")
                 self._installer.install_and_open()
+                _trace(f"[INSTALL] {case.test_id} app opened")
+            if self._login_flow is not None:  # SAME shared login as the installed path
+                _trace(f"[UNINSTALLED] {case.test_id} ensuring login")
+                # On login failure, raise into the per-attempt setup-failure path
+                # (failed attempt -> skip _verify() -> retry fresh / else FAIL)
+                # instead of reporting ready.
+                if not self._login_flow.ensure_ready():
+                    _trace(f"[UNINSTALLED] {case.test_id} login failed")
+                    _trace(
+                        f"[UNINSTALLED] {case.test_id} skipping deeplink verification"
+                    )
+                    raise RuntimeError("login preparation failed")
+                _trace(f"[UNINSTALLED] {case.test_id} login ready")
 
-            # Same SHARED login/onboarding flow as the installed scenario.
-            if self._login_flow is not None:
-                self._login_flow.ensure_ready()
-
-            if self._settle_seconds:
-                self._sleep(self._settle_seconds)
-
-            observation = self._observer.observe()
-            verdict = self._judge.evaluate(case.expected_result, observation)
-            result.attempts.append(
-                AttemptResult(
-                    attempt=attempt, matched=verdict.matched, reason=verdict.reason
-                )
-            )
-            if verdict.matched:
-                break
-        return result
+        return prepare
 
 
 # --------------------------------------------------------------------------- #
@@ -740,7 +1032,7 @@ class DeeplinkSuiteOrchestrator:
     warm-up), and driving each case - while COMPOSING the existing
     DeeplinkTestRunner for individual case execution, semantic judging, retry
     behavior, and reporting. Nothing here duplicates the runner, the shared
-    login capability, the judge, the Play Store installer, or Maestro/Android
+    login capability, the judge, the app installer, or Maestro/Android
     behavior.
 
         run()
@@ -759,24 +1051,52 @@ class DeeplinkSuiteOrchestrator:
         installed = [case for case in cases if case.installed]
         uninstalled = [case for case in cases if not case.installed]
 
+        _trace("[SUITE] Starting deeplink test suite")
+        _trace(f"[SUITE] Loaded {len(cases)} test cases")
+        _trace(f"[SUITE] Installed cases: {len(installed)}")
+        _trace(f"[SUITE] Uninstalled cases: {len(uninstalled)}")
+
+        # One-time clean state: uninstall the app once at suite startup so every
+        # run begins deterministically. Existing per-case semantics are unchanged.
+        self._runner.ensure_clean_install_state()
+
         report = SuiteReport()
         if installed:
             self.run_installed_batch(installed, report)
         for case in uninstalled:
             report.results.append(self.run_uninstalled_case(case))
+        # Only reached if the suite ran to completion; a setup failure that
+        # raises propagates before this line, so "Completed" is never misleading.
+        _trace("[SUITE] Completed")
         return report
 
-    def prepare_installed_batch(self) -> None:
-        # 1) Ensure signed in via the SHARED login capability (a no-op when
-        #    already signed in). 2) Run the installed warm-up EXACTLY ONCE for the
-        #    whole batch - never per case and never during a retry.
-        self._runner.ensure_logged_in()
+    def prepare_installed_batch(self) -> bool:
+        # Once per batch: install the local APK, launch it, log in, then warm up
+        # (never per case / retry). Returns True iff login succeeded; on failure
+        # skip warm-up and don't proceed to verification.
+        _trace("[INSTALLED BATCH] Installing local build")
+        self._runner.install_local_build()
+        _trace("[INSTALLED BATCH] Launching app before login")
+        self._runner.open_installed_app()
+        _trace("[INSTALLED BATCH] Ensuring login")
+        if not self._runner.ensure_logged_in():
+            _trace("[INSTALLED BATCH] login failed")
+            return False
         self._runner.run_warm_up()
+        return True
 
     def run_installed_batch(
         self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
     ) -> None:
-        self.prepare_installed_batch()
+        _trace("[INSTALLED BATCH] Starting")
+        if not self.prepare_installed_batch():
+            # Batch login failed: record every case as a login-prep failure
+            # (no _verify()), so each is FAIL like the uninstalled flow.
+            for case in cases:
+                _trace(f"[INSTALLED] {case.test_id} login failed")
+                _trace(f"[INSTALLED] {case.test_id} skipping deeplink verification")
+                report.results.append(_login_failed_result(case))
+            return
         for case in cases:
             report.results.append(self._runner.run_installed_case(case))
 
@@ -807,11 +1127,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="emulator-5554")
     parser.add_argument(
         "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
-        help="Maximum attempts per deeplink test case (default 3).",
+        help="Maximum attempts per deeplink test case (default 2: 1 try + 1 retry).",
+    )
+    parser.add_argument(
+        "--verify-timeout", type=float, default=DEFAULT_VERIFY_TIMEOUT_SECONDS,
+        help=(
+            "Maximum seconds to poll for the expected result after a deeplink "
+            "before declaring a mismatch (default 15)."
+        ),
     )
     parser.add_argument(
         "--no-warm-up", action="store_true",
         help="Skip the one-time first-install warm-up before the suite.",
+    )
+    parser.add_argument(
+        "--rebuild", action="store_true",
+        help="Force a fresh officemobile build even if a prior APK exists.",
     )
     return parser.parse_args(argv)
 
@@ -821,6 +1152,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.max_attempts < 1:
         print("ERROR: --max-attempts must be at least 1", file=sys.stderr)
+        return 2
+    if args.verify_timeout < 0:
+        print("ERROR: --verify-timeout must not be negative", file=sys.stderr)
         return 2
 
     try:
@@ -842,19 +1176,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     observer = MaestroHierarchyObserver(args.device)
     warm_up = None if args.no_warm_up else MaestroWarmUp(executor)
 
-    # Shared login capability: the SAME generic AppPilotAgent + Brain used by the
-    # standalone login flow, reused (DRY) by both installed and uninstalled cases.
-    # The device's executor/observer are reused so no infrastructure is duplicated.
-    login_agent = build_login_agent(args.device, executor=executor, observer=observer)
+    # Shared login capability: the same generic AppPilotAgent + Brain, reusing
+    # the device's executor/observer (DRY). The executor's foreground check is
+    # injected so login never completes while the app is not foreground.
+    login_agent = build_login_agent(
+        args.device,
+        executor=executor,
+        observer=observer,
+        foreground_check=executor.is_foreground,
+    )
     login_flow: LoginCapability = SharedLoginFlow(login_agent)
 
-    installer = PlayStoreInstaller(executor)
+    # Build (or reuse) the local officemobile APK and install it via adb - never
+    # from the actual Play Store.
+    try:
+        apk_path = officemobile_build.APK_PATH
+        if args.rebuild or not apk_path.exists():
+            _trace("[BUILD] building local officemobile APK")
+            apk_path = officemobile_build.build_apk()
+        _trace(f"[BUILD] using local APK: {apk_path}")
+    except officemobile_build.BuildError as error:
+        print(f"ERROR: could not build local APK: {error}", file=sys.stderr)
+        return 2
+    installer = LocalApkInstaller(executor, str(apk_path))
     runner = DeeplinkTestRunner(
         observer=observer,
         executor=executor,
         judge=judge,
         warm_up=warm_up,
         max_attempts=args.max_attempts,
+        verify_timeout_seconds=args.verify_timeout,
         login_flow=login_flow,
         installer=installer,
     )

@@ -7,11 +7,15 @@ past failures, expected-failure-state matching, report generation, and the
 one-time warm-up.
 """
 
+import contextlib
 import io
+import json
 import sys
+import types
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -123,6 +127,11 @@ class _ScriptedJudge:
 def _make_runner(judge, executor=None, warm_up=None, **kwargs):
     sleeps = []
     executor = executor or _RecordingExecutor()
+    # Behaviour tests script exactly ONE judge verdict per attempt. A zero-length
+    # verification window makes _verify observe/judge once per attempt; the
+    # dedicated polling tests exercise multi-poll windows via an injected clock.
+    kwargs.setdefault("verify_timeout_seconds", 0)
+    kwargs.setdefault("verify_poll_interval_seconds", 0)
     runner = d.DeeplinkTestRunner(
         observer=_StubObserver(),
         executor=executor,
@@ -140,12 +149,27 @@ def _make_runner(judge, executor=None, warm_up=None, **kwargs):
 # --------------------------------------------------------------------------- #
 class ExcelLoadingTests(unittest.TestCase):
     def test_loads_bundled_workbook(self):
+        # The bundled workbook is user-owned, so assert structural invariants,
+        # not an exact layout: every row read, deep link + expected result kept
+        # verbatim, deterministic Installed bool, and at least one quoted prompt.
         cases = d.load_deeplink_cases(REAL_XLSX)
-        self.assertEqual([c.test_id for c in cases], ["TC001", "TC002"])
-        self.assertTrue(cases[0].deep_link.startswith("https://m365.cloud.microsoft"))
-        self.assertEqual(cases[0].expected_result, "Chat screen with prompt")
-        self.assertEqual(cases[1].expected_result, "Chat screen")
-        self.assertEqual(cases[0].user_type, "Premium")
+        self.assertTrue(cases, "expected at least one case in the bundled workbook")
+        ids = [c.test_id for c in cases]
+        self.assertTrue(all(ids), "every case must have a non-empty test id")
+        self.assertEqual(len(ids), len(set(ids)), "test ids must be unique")
+        for case in cases:
+            self.assertTrue(case.deep_link.startswith("https://"))
+            self.assertTrue(case.expected_result.strip())
+            self.assertIsInstance(case.installed, bool)
+        with_prompt = [
+            c for c in cases
+            if c.expected_result.startswith("Chat screen with prompt")
+            and "Summarize" in c.expected_result
+        ]
+        self.assertTrue(
+            with_prompt,
+            "expected a case whose Expected Screen quotes a concrete prompt",
+        )
 
     def test_extracts_deeplink_and_expected_result(self):
         path = _write_xlsx(
@@ -207,8 +231,11 @@ class RunnerBehaviourTests(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(len(result.attempts), 1)
         self.assertEqual(result.passing_attempt, 1)
-        # No retry -> no stop_app, no wait; a single deeplink launch.
-        self.assertEqual(executor.calls, [("open_link", "myapp://open/chat")])
+        # No retry -> no stop_app during attempts, then one case-cleanup stop.
+        self.assertEqual(
+            executor.calls,
+            [("open_link", "myapp://open/chat"), ("stop_app", None)],
+        )
         self.assertEqual(sleeps, [])
 
     def test_mismatch_triggers_kill_wait_relaunch(self):
@@ -218,34 +245,55 @@ class RunnerBehaviourTests(unittest.TestCase):
         result = report.results[0]
         self.assertTrue(result.passed)
         self.assertEqual(result.passing_attempt, 2)
-        # Exact retry recipe between attempt 1 and 2: kill -> wait 2s -> relaunch.
+        # Exact retry recipe between attempt 1 and 2: kill -> wait 2s -> relaunch,
+        # then a final case-cleanup stop when the case finishes.
         self.assertEqual(
             executor.calls,
             [
                 ("open_link", "myapp://open/chat"),
                 ("stop_app", None),
                 ("open_link", "myapp://open/chat"),
+                ("stop_app", None),
             ],
         )
         self.assertEqual(sleeps, [d.DEFAULT_RETRY_WAIT_SECONDS])
 
     def test_maximum_three_attempts_then_fail(self):
         judge = _ScriptedJudge([(False, "no"), (False, "no"), (False, "no")])
-        runner, executor, sleeps = _make_runner(judge)
+        runner, executor, sleeps = _make_runner(judge, max_attempts=3)
         report = runner.run([_case()])
         result = report.results[0]
         self.assertFalse(result.passed)
         self.assertEqual(len(result.attempts), 3)
-        # Exactly two retries (before attempts 2 and 3): two kills, two waits.
+        # Exactly two retries (before attempts 2 and 3): two kills, two waits,
+        # then a final case-cleanup stop when the case finishes.
         self.assertEqual(
             [c[0] for c in executor.calls],
-            ["open_link", "stop_app", "open_link", "stop_app", "open_link"],
+            ["open_link", "stop_app", "open_link", "stop_app", "open_link",
+             "stop_app"],
         )
         self.assertEqual(sleeps, [d.DEFAULT_RETRY_WAIT_SECONDS] * 2)
 
+    def test_default_is_one_retry_then_fail(self):
+        # A failed test is retried exactly once by default (2 total attempts).
+        judge = _ScriptedJudge([(False, "no"), (False, "no")])
+        runner, executor, sleeps = _make_runner(judge)
+        report = runner.run([_case()])
+        result = report.results[0]
+        self.assertFalse(result.passed)
+        self.assertEqual(d.DEFAULT_MAX_ATTEMPTS, 2)
+        self.assertEqual(len(result.attempts), 2)
+        # Exactly one retry (before attempt 2): one kill, one wait, then a final
+        # case-cleanup stop when the case finishes.
+        self.assertEqual(
+            [c[0] for c in executor.calls],
+            ["open_link", "stop_app", "open_link", "stop_app"],
+        )
+        self.assertEqual(sleeps, [d.DEFAULT_RETRY_WAIT_SECONDS])
+
     def test_pass_on_third_attempt(self):
         judge = _ScriptedJudge([(False, "no"), (False, "no"), (True, "yes")])
-        runner, _, _ = _make_runner(judge)
+        runner, _, _ = _make_runner(judge, max_attempts=3)
         report = runner.run([_case()])
         self.assertTrue(report.results[0].passed)
         self.assertEqual(report.results[0].passing_attempt, 3)
@@ -340,7 +388,7 @@ class ReportTests(unittest.TestCase):
                 (False, "a"), (False, "b"), (False, "c"),  # TC003 all fail
             ]
         )
-        runner, _, _ = _make_runner(judge)
+        runner, _, _ = _make_runner(judge, max_attempts=3)
         report = runner.run([_case("TC001"), _case("TC002"), _case("TC003")])
         text = report.format()
         self.assertEqual(report.total, 3)
@@ -349,9 +397,9 @@ class ReportTests(unittest.TestCase):
         self.assertIn("TC001  PASS  Attempt 1", text)
         self.assertIn("TC002  PASS  Attempt 2", text)
         self.assertIn("TC003  FAIL  Attempt 3", text)
-        self.assertIn("Total: 3", text)
-        self.assertIn("Passed: 2", text)
-        self.assertIn("Failed: 1", text)
+        self.assertIn("Total test cases: 3", text)
+        self.assertIn("Deeplink test cases passed: 2", text)
+        self.assertIn("Deeplink test cases failed: 1", text)
         # Failure reason for the last attempt of the failing case is included.
         self.assertIn("mismatch - c", text)
 
@@ -384,6 +432,23 @@ class JudgeTests(unittest.TestCase):
         judge = self._judge("not json")
         verdict = judge.evaluate("Chat screen", a.UIObservation(()))
         self.assertFalse(verdict.matched)
+
+    def test_specific_expected_prompt_is_enforced(self):
+        # A specific/quoted expected prompt must require THAT prompt's content -
+        # a generic or different "chat with a prompt" (e.g. an onboarding
+        # suggested prompt, or a chat login wandered into) must not false-pass.
+        system_prompt = d.LLMExpectationJudge._SYSTEM_PROMPT.lower()
+        self.assertIn("same", system_prompt)
+        self.assertIn("mismatch", system_prompt)
+        self.assertIn("suggested", system_prompt)
+        self.assertIn("different prompt", system_prompt)
+
+    def test_expected_prompt_text_reaches_model_verbatim(self):
+        # The specific expected prompt from Excel must be handed to the judge so
+        # it can require that exact content (not just "some prompt present").
+        expected = 'Chat screen with prompt "Summarize the top three news"'
+        rendered = d.LLMExpectationJudge._render(expected, a.UIObservation(()))
+        self.assertIn(expected, rendered)
 
     def test_credential_values_never_reach_judge_prompt(self):
         # A password field's live text is redacted by the observer, so the
@@ -439,20 +504,36 @@ class _FakeLogin:
 
     def ensure_ready(self):
         self.ready_calls += 1
+        return True  # login preparation succeeded
 
 
 class _FakeInstaller:
     """Records the fresh-install lifecycle for the uninstalled scenario."""
 
-    def __init__(self):
+    def __init__(self, fail_times=0, preinstalled=False):
         self.absent_calls = 0
         self.install_calls = 0
+        self.fresh_calls = 0
+        self.open_calls = 0
+        self._fail_times = fail_times
+        self._preinstalled = preinstalled
 
     def ensure_absent(self):
         self.absent_calls += 1
+        was_installed = self._preinstalled
+        self._preinstalled = False
+        return was_installed
+
+    def install_fresh(self):
+        self.fresh_calls += 1
+
+    def open(self):
+        self.open_calls += 1
 
     def install_and_open(self):
         self.install_calls += 1
+        if self.install_calls <= self._fail_times:
+            raise RuntimeError("install did not complete")
 
 
 class _CountingWarmUp:
@@ -483,6 +564,7 @@ class InstalledOrchestrationTests(unittest.TestCase):
         class _OrderLogin:
             def ensure_ready(self_inner):
                 order.append("login")
+                return True  # login preparation succeeded
 
         def warm_up():
             order.append("warm_up")
@@ -504,14 +586,16 @@ class InstalledOrchestrationTests(unittest.TestCase):
     def test_installed_retry_does_not_repeat_warm_up(self):
         judge = _ScriptedJudge([(False, "no"), (False, "no"), (False, "no")])
         warm = _CountingWarmUp()
-        runner, executor, _ = _make_runner(judge, warm_up=warm)
+        runner, executor, _ = _make_runner(judge, warm_up=warm, max_attempts=3)
         report = runner.run([_icase()])
         self.assertEqual(warm.n, 1)  # not repeated across the 3 attempts
         self.assertFalse(report.results[0].passed)
-        # Installed retry recipe is still kill -> wait -> reopen.
+        # Installed retry recipe is still kill -> wait -> reopen, plus a final
+        # case-cleanup stop when the case finishes.
         self.assertEqual(
             [c[0] for c in executor.calls],
-            ["open_link", "stop_app", "open_link", "stop_app", "open_link"],
+            ["open_link", "stop_app", "open_link", "stop_app", "open_link",
+             "stop_app"],
         )
 
 
@@ -526,20 +610,22 @@ class UninstalledOrchestrationTests(unittest.TestCase):
         )
         runner.run([_ucase()])
         self.assertEqual(warm.n, 0)  # never warmed up for a fresh-install case
-        self.assertEqual(installer.absent_calls, 1)
+        self.assertEqual(installer.absent_calls, 2)  # 1 suite-startup + 1 per-attempt
         self.assertEqual(installer.install_calls, 1)
         self.assertEqual(login.ready_calls, 1)
 
     def test_uninstalled_reestablishes_fresh_state_each_attempt(self):
         judge = _ScriptedJudge([(False, "no"), (False, "no"), (False, "no")])
         installer = _FakeInstaller()
-        runner, executor, _ = _make_runner(judge, installer=installer)
+        runner, executor, _ = _make_runner(
+            judge, installer=installer, max_attempts=3
+        )
         report = runner.run([_ucase()])
         self.assertFalse(report.results[0].passed)
         self.assertEqual(len(report.results[0].attempts), 3)
         # Every attempt genuinely uninstalls + installs (no kill/wait recipe that
         # would leave the app installed and degrade a retry into installed).
-        self.assertEqual(installer.absent_calls, 3)
+        self.assertEqual(installer.absent_calls, 4)  # 1 suite-startup + 3 attempts
         self.assertEqual(installer.install_calls, 3)
         self.assertEqual([c[0] for c in executor.calls], ["open_link"] * 3)
         self.assertNotIn("stop_app", [c[0] for c in executor.calls])
@@ -549,7 +635,56 @@ class UninstalledOrchestrationTests(unittest.TestCase):
         installer = _FakeInstaller()
         runner, executor, _ = _make_runner(judge, installer=installer)
         runner.run([_ucase()])
+        # The deeplink routes to the store; the app is then launched by tapping
+        # the store's "Open" button (installer-side), so the executor fires the
+        # deeplink exactly once, verbatim.
         self.assertEqual(executor.calls, [("open_link", "myapp://open/chat")])
+
+    def test_install_failure_is_retryable_not_fatal(self):
+        # First attempt's install fails; the suite must not crash - it records a
+        # failed attempt and retries with fresh state, passing on a later attempt.
+        judge = _ScriptedJudge([(True, "ok")])  # only reached after install works
+        installer = _FakeInstaller(fail_times=1)
+        runner, _, _ = _make_runner(judge, installer=installer)
+        report = runner.run([_ucase()])
+        self.assertTrue(report.results[0].passed)
+        self.assertEqual(installer.install_calls, 2)  # failed once, then succeeded
+        self.assertEqual(installer.absent_calls, 3)  # 1 suite-startup + 2 attempts
+
+    def test_persistent_install_failure_fails_case_without_crashing_suite(self):
+        judge = _ScriptedJudge([])  # never consulted: setup fails every attempt
+        installer = _FakeInstaller(fail_times=99)
+        runner, _, _ = _make_runner(judge, installer=installer, max_attempts=3)
+        report = runner.run([_ucase()])
+        self.assertFalse(report.results[0].passed)
+        self.assertEqual(len(report.results[0].attempts), 3)  # all attempts tried
+        self.assertEqual(installer.install_calls, 3)
+
+    def test_suite_uninstalls_once_at_startup_for_installed_only_batch(self):
+        # One-time clean state at suite startup even when every case is installed:
+        # exactly one ensure_absent, regardless of the per-batch install/warm-up.
+        judge = _ScriptedJudge([(True, "ok")])
+        installer = _FakeInstaller()
+        login = _FakeLogin()
+        runner, _, _ = _make_runner(
+            judge, warm_up=_CountingWarmUp(), installer=installer, login_flow=login
+        )
+        runner.run([_icase("T1")])
+        self.assertEqual(installer.absent_calls, 1)  # suite-startup cleanup only
+
+    def test_suite_startup_logs_when_existing_app_is_removed(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        installer = _FakeInstaller(preinstalled=True)  # an old app is present
+        runner, _, _ = _make_runner(judge, installer=installer)
+        _, out = _capture(runner.run, [_icase("T1")])
+        self.assertIn("[SUITE] Removed existing app install", out)
+
+    def test_suite_startup_logs_when_no_existing_app(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        installer = _FakeInstaller()  # device already clean
+        runner, _, _ = _make_runner(judge, installer=installer)
+        _, out = _capture(runner.run, [_icase("T1")])
+        self.assertIn("[SUITE] No existing app install to remove", out)
 
 
 class MixedBatchTests(unittest.TestCase):
@@ -566,7 +701,7 @@ class MixedBatchTests(unittest.TestCase):
         self.assertEqual([r.case.test_id for r in report.results], ["T1", "T2"])
         self.assertTrue(all(r.passed for r in report.results))
         self.assertEqual(warm.n, 1)  # only for the installed batch
-        self.assertEqual(installer.absent_calls, 1)  # only for the uninstalled case
+        self.assertEqual(installer.absent_calls, 2)  # 1 suite-startup + 1 uninstalled case
         # Shared login used by both scenarios: once for the batch + once for the
         # single uninstalled attempt.
         self.assertEqual(login.ready_calls, 2)
@@ -645,27 +780,91 @@ class InstalledColumnLoadingTests(unittest.TestCase):
         self.assertEqual(cases[0].user_type, "Premium")
 
 
-class PlayStoreInstallerTests(unittest.TestCase):
+class LocalApkInstallerTests(unittest.TestCase):
     class _FakeExec:
-        def __init__(self):
+        def __init__(self, foreground_after=0):
             self.events = []
+            # Number of is_foreground() calls that return False before the app is
+            # reported foreground (0 = foreground immediately).
+            self._foreground_after = foreground_after
+            self._foreground_calls = 0
 
         def ensure_uninstalled(self):
             self.events.append("uninstall")
 
-        def tap_text(self, text, timeout=180):
-            self.events.append(("tap", text))
+        def install_apk(self, apk_path, timeout=300):
+            self.events.append(("install_apk", apk_path))
 
-    def test_ensure_absent_and_install_open_sequence(self):
+        def launch_app_via_adb(self, timeout=30):
+            self.events.append("launch_app_via_adb")
+
+        def is_foreground(self, timeout=15):
+            self.events.append("is_foreground")
+            self._foreground_calls += 1
+            return self._foreground_calls > self._foreground_after
+
+    def _installer(self, exe, **kw):
+        kw.setdefault("foreground_poll_seconds", 0)
+        return d.LocalApkInstaller(exe, "/tmp/officemobile.apk", **kw)
+
+    def test_ensure_absent_install_and_open_sequence(self):
+        # Uninstall -> adb install the local APK -> launch the app via the adb
+        # CLI (NOT the store's "Open" button, NOT re-firing the deeplink) ->
+        # confirm the target app is actually foreground.
         exe = self._FakeExec()
-        installer = d.PlayStoreInstaller(
-            exe, sleep=lambda s: None, install_wait_seconds=0
-        )
+        installer = self._installer(exe)
         installer.ensure_absent()
         installer.install_and_open()
         self.assertEqual(
-            exe.events, ["uninstall", ("tap", "Install"), ("tap", "Open")]
+            exe.events,
+            [
+                "uninstall",
+                ("install_apk", "/tmp/officemobile.apk"),
+                "launch_app_via_adb",
+                "is_foreground",
+            ],
         )
+
+    def test_install_and_open_waits_and_relaunches_until_foreground(self):
+        # A launch command returning is NOT proof the app opened: while the app
+        # is not yet foreground the installer re-launches via adb (best-effort)
+        # and polls again, only returning once the foreground check passes.
+        exe = self._FakeExec(foreground_after=2)
+        self._installer(exe).install_and_open()
+        self.assertEqual(
+            exe.events,
+            [
+                ("install_apk", "/tmp/officemobile.apk"),
+                "launch_app_via_adb",
+                "is_foreground",
+                "launch_app_via_adb",
+                "is_foreground",
+                "launch_app_via_adb",
+                "is_foreground",
+            ],
+        )
+
+    def test_install_and_open_fails_if_never_foreground(self):
+        # If the app never becomes foreground within the bounded window, the
+        # attempt fails cleanly (raises) rather than handing a not-yet-open UI to
+        # login. "app opened" must never be reported in this case.
+        exe = self._FakeExec(foreground_after=10_000)
+        installer = self._installer(
+            exe, foreground_timeout_seconds=0, foreground_poll_seconds=0
+        )
+        with self.assertRaises(RuntimeError):
+            installer.install_and_open()
+        # It launched the app and checked foreground, then failed - it never
+        # silently proceeded as if the app had opened.
+        self.assertIn("launch_app_via_adb", exe.events)
+        self.assertIn("is_foreground", exe.events)
+
+    def test_install_fresh_installs_via_adb_only(self):
+        # The installed batch uses install_fresh to put the local build on the
+        # device up front - install only, no launch.
+        exe = self._FakeExec()
+        self._installer(exe).install_fresh()
+        self.assertEqual(exe.events, [("install_apk", "/tmp/officemobile.apk")])
 
 
 class SuggestedPromptGuardTests(unittest.TestCase):
@@ -701,6 +900,564 @@ class SuggestedPromptGuardTests(unittest.TestCase):
         self.assertTrue(evaluator.is_reached("goal", observation))
 
 
+class _RecordingBackProvider:
+    """Counts Brain calls (recording each observation) and takes a safe Back."""
+
+    def __init__(self):
+        self.calls = 0
+        self.observations = []
+
+    def decide(self, request):
+        self.calls += 1
+        self.observations.append(request.observation)
+        return a.ModelDecision(
+            action=a.Action(a.ActionKind.PRESS_BACK), reason="advance"
+        )
+
+
+def _cred_el():
+    # A password field => SafetyValidator/evaluator see a credential field.
+    return a.UIElement(
+        element_id="e", parent_id=None, text="", accessibility_text="",
+        hint_text="Password", resource_id="i0118", class_name="EditText",
+        clickable=True, enabled=True, is_input=True, label="",
+    )
+
+
+def _intro_el():
+    # The initial suggested-prompt/welcome interruption (actionable: has an X).
+    return _ui_el(
+        text="Let's get started", resource_id="intro_suggestion", clickable=True
+    )
+
+
+def _post_intro_el():
+    # A generic post-onboarding screen: NOT intro, NOT a composer, NOT a
+    # credential field. Belongs to the caller/deeplink test.
+    return _ui_el(text="Some content", resource_id="content_view", clickable=True)
+
+
+def _ask_copilot_el():
+    # An "Ask Copilot" affordance the login agent must NEVER tap after boundary.
+    return _ui_el(text="Ask Copilot", resource_id="ask_copilot_btn", clickable=True)
+
+
+def _composer_home_el():
+    return _ui_el(text="Message Copilot", resource_id="copilot_composer")
+
+
+def _chat_screen_el():
+    # Authenticated Copilot Chat screen (a composer/home) - a login terminal.
+    return _composer_home_el()
+
+
+def _search_screen_el():
+    # Authenticated Search screen: a real search box. Not a sign-in blocker, not
+    # the intro interruption, not a loading screen - a valid login terminal.
+    return _ui_el(
+        text="Search", resource_id="search_box", is_input=True, clickable=True
+    )
+
+
+def _welcome_landing_el():
+    # The fresh-install, logged-OUT welcome screen: "Continue with Microsoft".
+    return _ui_el(
+        text="Continue with Microsoft",
+        resource_id="signin_microsoft",
+        clickable=True,
+    )
+
+
+class LoginBoundaryTests(unittest.TestCase):
+    """The shared login capability is a PREPARATION step: it stops at the
+    authentication + initial-onboarding boundary and returns control. It must not
+    navigate into Copilot to make its own goal true."""
+
+    def _eval(self):
+        return a.SignedInCopilotGoalEvaluator()
+
+    # -- evaluator-level boundary contract ---------------------------------- #
+    def test_not_reached_while_credential_field_present(self):
+        ev = self._eval()
+        self.assertFalse(ev.is_reached("g", a.UIObservation((_cred_el(),))))
+
+    def test_intro_present_is_not_the_goal_but_optional(self):
+        ev = self._eval()
+        # While present, the intro interruption is not the goal (dismiss first).
+        self.assertFalse(ev.is_reached("g", a.UIObservation((_intro_el(),))))
+        # It is OPTIONAL: once gone, a plain authenticated app screen completes -
+        # no memory of "having seen an intro" is required.
+        self.assertTrue(
+            ev.is_reached("g", a.UIObservation((_post_intro_el(),)))
+        )
+
+    def test_boundary_reached_immediately_after_intro_dismissed(self):
+        ev = self._eval()
+        ev.is_reached("g", a.UIObservation((_intro_el(),)))  # intro shown
+        # The very next screen (even without a recognizable composer) is the
+        # boundary - login stops here rather than navigating further.
+        self.assertTrue(
+            ev.is_reached("g", a.UIObservation((_ask_copilot_el(),)))
+        )
+
+    def test_already_signed_in_composer_is_boundary_without_intro(self):
+        ev = self._eval()
+        self.assertTrue(
+            ev.is_reached("g", a.UIObservation((_composer_home_el(),)))
+        )
+
+    def test_chat_screen_is_a_login_terminal(self):
+        # Login terminal state: the authenticated Chat screen completes at once.
+        ev = self._eval()
+        self.assertTrue(
+            ev.is_reached("g", a.UIObservation((_chat_screen_el(),)))
+        )
+
+    def test_search_screen_is_a_login_terminal(self):
+        # Login terminal state: the authenticated Search screen completes at once
+        # (via the generic "authenticated + inside app" rule - no hardcoded
+        # Search/Chat strings, so it can never regress into pressing Back).
+        ev = self._eval()
+        self.assertTrue(
+            ev.is_reached("g", a.UIObservation((_search_screen_el(),)))
+        )
+
+    def test_authenticated_app_screen_is_reached_without_intro(self):
+        # THE MISSING STATE (live bug): authenticated, no sign-in blocker, no
+        # intro, just a normal actionable app screen. This is login-complete
+        # IMMEDIATELY - the evaluator must NOT withhold PASS (which previously let
+        # the Brain choose "press back" to hunt for onboarding).
+        ev = self._eval()
+        self.assertTrue(
+            ev.is_reached("g", a.UIObservation((_post_intro_el(),)))
+        )
+
+    def test_signin_button_screen_is_not_reached(self):
+        # A welcome screen with a tappable "Sign in" (no credential field yet)
+        # is still NOT authenticated -> not reached.
+        ev = self._eval()
+        signin = _ui_el(text="Sign in", resource_id="signin_button", clickable=True)
+        self.assertFalse(ev.is_reached("g", a.UIObservation((signin,))))
+
+    def test_fresh_install_welcome_screen_is_not_reached(self):
+        # Live bug: fresh install lands on the logged-OUT welcome screen
+        # ("Continue with Microsoft"/...). Even the deterministic fallback
+        # recognizes the generic federated "continue with" sign-in affordance, so
+        # login must NOT report already-signed-in here.
+        ev = self._eval()
+        terms = _ui_el(text="Terms of use", resource_id="", clickable=True)
+        obs = a.UIObservation((_welcome_landing_el(), terms))
+        self.assertFalse(ev.is_reached("g", obs))
+
+    def test_transient_loading_screen_is_not_reached(self):
+        # No actionable UI (authenticated but loading/transitioning): withhold
+        # PASS so the agent's generic wait re-observes; do NOT complete here.
+        ev = self._eval()
+        loading = _ui_el(text="please wait")  # non-actionable
+        self.assertFalse(ev.is_reached("g", a.UIObservation((loading,))))
+
+    # -- foreground guard: login can never complete off the target app ------ #
+    def test_not_reached_while_target_app_not_foreground(self):
+        # Live bug: the store window (Google Play) is still foreground after the
+        # Open tap, yet its UI has actionable elements and no sign-in blocker.
+        # With a foreground check reporting "not the target app", login must NOT
+        # complete - regardless of the (store) UI observed.
+        ev = a.SignedInCopilotGoalEvaluator(foreground_check=lambda: False)
+        store_ui = _ui_el(text="Open", resource_id="play_open", clickable=True)
+        self.assertFalse(ev.is_reached("g", a.UIObservation((store_ui,))))
+
+    def test_reached_when_target_app_foreground_and_inside(self):
+        # Same generic "authenticated + inside app" screen, but now the target
+        # app IS foreground -> login completes.
+        ev = a.SignedInCopilotGoalEvaluator(foreground_check=lambda: True)
+        self.assertTrue(
+            ev.is_reached("g", a.UIObservation((_post_intro_el(),)))
+        )
+
+    def test_foreground_guard_does_not_override_signin_blocker(self):
+        # Even when the target app is foreground, a sign-in blocker still means
+        # login is not complete (the guard only ADDS a precondition).
+        ev = a.SignedInCopilotGoalEvaluator(foreground_check=lambda: True)
+        self.assertFalse(ev.is_reached("g", a.UIObservation((_cred_el(),))))
+
+    # -- flow-level: agent STOPS at the boundary ---------------------------- #
+    def _flow(self, observations, provider, executor=None):
+        # Real login agent (real evaluator + loop + SafetyValidator) with no-op
+        # sleep/instant wait so tests incur no real time. Exercises the same
+        # boundary logic build_login_agent wires up in production.
+        agent = a.AppPilotAgent(
+            observer=_SequenceObserver(observations),
+            goal_evaluator=a.SignedInCopilotGoalEvaluator(),
+            decision_provider=provider,
+            safety_validator=a.SafetyValidator(),
+            executor=executor or _NoopRecordingExecutor(),
+            max_actions=30,
+            runtime_context=a.RuntimeContext({}),
+            sleep=lambda seconds: None,
+            nonactionable_wait_seconds=0,
+        )
+        return d.SharedLoginFlow(agent)
+
+    def test_already_signed_in_zero_brain_actions(self):
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        flow = self._flow([a.UIObservation((_composer_home_el(),))], provider,
+                          executor)
+        _capture(flow.ensure_ready)
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(executor.executed, 0)
+
+    def test_authenticated_no_onboarding_completes_without_back(self):
+        # THE LIVE BUG at flow level: the first (and only) screen is an
+        # authenticated app screen with no sign-in blocker and no intro. Login
+        # must complete immediately; the Brain must NEVER be consulted (and thus
+        # can never choose "press back" to hunt for onboarding).
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        flow = self._flow([a.UIObservation((_post_intro_el(),))], provider,
+                          executor)
+        _capture(flow.ensure_ready)
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(executor.executed, 0)
+
+    def test_already_signed_in_search_screen_zero_brain_actions(self):
+        # Already signed in on the Search screen -> immediate completion, no
+        # Brain call and no UI action (login never navigates from here).
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        flow = self._flow([a.UIObservation((_search_screen_el(),))], provider,
+                          executor)
+        _capture(flow.ensure_ready)
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(executor.executed, 0)
+
+    def test_shared_login_state_resets_between_runs(self):
+        # The SAME shared login flow is reused across runs; per-run state must
+        # not leak. Run 1 is already signed in; run 2 (reusing the flow) must
+        # still detect sign-in as required rather than inheriting run 1's verdict.
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        observer = _SequenceObserver(
+            [
+                a.UIObservation((_composer_home_el(),)),  # run 1: already in
+                a.UIObservation((_cred_el(),)),           # run 2: sign-in needed
+                a.UIObservation((_composer_home_el(),)),  # run 2: signed in
+            ]
+        )
+        agent = a.AppPilotAgent(
+            observer=observer,
+            goal_evaluator=a.SignedInCopilotGoalEvaluator(),
+            decision_provider=provider,
+            safety_validator=a.SafetyValidator(),
+            executor=executor,
+            max_actions=30,
+            runtime_context=a.RuntimeContext({}),
+            sleep=lambda seconds: None,
+            nonactionable_wait_seconds=0,
+        )
+        flow = d.SharedLoginFlow(agent)
+
+        _, out1 = _capture(flow.ensure_ready)
+        self.assertIn("[LOGIN] Already signed in", out1)
+        self.assertEqual(provider.calls, 0)
+
+        _, out2 = _capture(flow.ensure_ready)
+        self.assertIn("[LOGIN] Sign-in required", out2)
+        self.assertIn("[LOGIN] Returning control to deeplink test", out2)
+        self.assertGreaterEqual(provider.calls, 1)
+
+    def test_logged_out_takes_authentication_action(self):
+        provider = _RecordingBackProvider()
+        # credential screen -> then composer (auth done). Brain acts once.
+        flow = self._flow(
+            [a.UIObservation((_cred_el(),)),
+             a.UIObservation((_composer_home_el(),))],
+            provider,
+        )
+        _capture(flow.ensure_ready)
+        self.assertGreaterEqual(provider.calls, 1)
+
+    def test_transient_loading_after_auth_waits_without_brain(self):
+        # A non-actionable loading screen then the composer: the generic wait
+        # handles loading (no Brain, no random Back), then boundary is reached.
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        loading = a.UIObservation((_ui_el(text="please wait"),))  # non-actionable
+        flow = self._flow(
+            [loading, a.UIObservation((_composer_home_el(),))], provider, executor
+        )
+        _capture(flow.ensure_ready)
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(executor.executed, 0)
+
+    def test_stops_immediately_after_intro_dismissed_no_further_actions(self):
+        # intro (dismiss) -> post-intro screen (boundary). Exactly ONE action
+        # (the dismissal); the Brain is not consulted on the post-intro screen.
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        flow = self._flow(
+            [a.UIObservation((_intro_el(),)),
+             a.UIObservation((_post_intro_el(),))],
+            provider, executor,
+        )
+        _capture(flow.ensure_ready)
+        self.assertEqual(provider.calls, 1)   # only to dismiss the intro
+        self.assertEqual(executor.executed, 1)
+
+    def test_does_not_tap_ask_copilot_after_boundary(self):
+        # After the intro is dismissed, an "Ask Copilot" screen appears. The
+        # login agent must STOP (boundary reached) and never tap Ask Copilot.
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        flow = self._flow(
+            [a.UIObservation((_intro_el(),)),
+             a.UIObservation((_ask_copilot_el(),))],
+            provider, executor,
+        )
+        _capture(flow.ensure_ready)
+        # Brain asked only for the intro; the Ask Copilot screen is the boundary,
+        # so it is never asked to act there (and thus cannot tap Ask Copilot).
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(executor.executed, 1)
+        # Every observation the Brain saw still contained the intro interruption.
+        self.assertTrue(
+            all(
+                any("get started" in (el.text or "").lower() for el in obs.elements)
+                for obs in provider.observations
+            )
+        )
+
+    def test_installed_and_uninstalled_use_same_login_capability(self):
+        # Both paths call ensure_ready() on the SAME shared login instance.
+        class _CountingLogin:
+            def __init__(self):
+                self.calls = 0
+
+            def ensure_ready(self):
+                self.calls += 1
+                return True  # login preparation succeeded
+
+        login = _CountingLogin()
+        judge = _ScriptedJudge([(True, "ok"), (True, "ok")])
+        runner, _, _ = _make_runner(
+            judge, installer=_FakeInstaller(), login_flow=login
+        )
+        # Installed batch runs login-if-needed via the orchestrator; the
+        # uninstalled case calls the same capability directly.
+        with contextlib.redirect_stdout(io.StringIO()):
+            runner.ensure_logged_in()
+            runner.run_uninstalled_case(_ucase("T1"))
+        self.assertEqual(login.calls, 2)
+
+
+class LLMLoginGoalEvaluatorTests(unittest.TestCase):
+    def _ev(self, reached=True, *, actionable_step=False, foreground_check=None,
+            transport=None):
+        if transport is None:
+            def transport(payload):
+                self._payload = payload
+                self._calls = getattr(self, "_calls", 0) + 1
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "reached": reached,
+                                        "actionable_step": actionable_step,
+                                        "reason": "r",
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+        return a.LLMLoginGoalEvaluator(
+            model="m",
+            api_key="k",
+            base_url="http://x/v1",
+            foreground_check=foreground_check,
+            transport=transport,
+        )
+
+    def _obs(self):
+        return a.UIObservation((_ui_el(text="Chat", resource_id="chat", clickable=True),))
+
+    def test_model_says_reached(self):
+        self.assertTrue(self._ev(reached=True).is_reached("g", self._obs()))
+
+    def test_model_says_not_reached(self):
+        self.assertFalse(self._ev(reached=False).is_reached("g", self._obs()))
+
+    def test_foreground_false_short_circuits_without_model_call(self):
+        calls = []
+
+        def transport(payload):
+            calls.append(payload)
+            return {}
+
+        ev = self._ev(
+            foreground_check=lambda: False, transport=transport
+        )
+        self.assertFalse(ev.is_reached("g", self._obs()))
+        self.assertFalse(ev.has_actionable_step(self._obs()))
+        self.assertEqual(calls, [])
+
+    def test_foreground_true_calls_model(self):
+        ev = self._ev(reached=True, foreground_check=lambda: True)
+        self.assertTrue(ev.is_reached("g", self._obs()))
+
+    def test_transport_failure_returns_false(self):
+        def transport(payload):
+            raise RuntimeError("boom")
+
+        self.assertFalse(self._ev(transport=transport).is_reached("g", self._obs()))
+
+    def test_malformed_content_returns_false(self):
+        def transport(payload):
+            return {"choices": [{"message": {"content": "not json"}}]}
+
+        self.assertFalse(self._ev(transport=transport).is_reached("g", self._obs()))
+
+    def test_prompt_uses_redacted_describe_and_goal(self):
+        ev = self._ev(reached=False)
+        ev.is_reached("MY-GOAL", self._obs())
+        user_msg = self._payload["messages"][1]["content"]
+        self.assertIn("MY-GOAL", user_msg)
+        self.assertIn("chat", user_msg)
+
+    def test_has_actionable_step_reflects_model(self):
+        # A transient loading screen: the model reports no concrete login control.
+        self.assertFalse(
+            self._ev(reached=False, actionable_step=False)
+            .has_actionable_step(self._obs())
+        )
+        # A real sign-in control present.
+        self.assertTrue(
+            self._ev(reached=False, actionable_step=True)
+            .has_actionable_step(self._obs())
+        )
+
+    def test_reached_screen_counts_as_actionable(self):
+        # If the model says we are already inside (reached), the wait-gate should
+        # not trap us: treat it as actionable (is_reached returns PASS anyway).
+        self.assertTrue(
+            self._ev(reached=True, actionable_step=False)
+            .has_actionable_step(self._obs())
+        )
+
+    def test_transport_failure_leaves_step_actionable(self):
+        # Fail-open: a judge/transport failure must not trap a real sign-in screen
+        # in the wait loop - the Brain can still be asked to drive login.
+        def transport(payload):
+            raise RuntimeError("boom")
+
+        self.assertTrue(
+            self._ev(transport=transport).has_actionable_step(self._obs())
+        )
+
+    def test_is_reached_and_step_share_one_model_call(self):
+        # The agent calls both on the SAME observation each step; they must reuse
+        # a single cached verdict (one transport call), not query the model twice.
+        ev = self._ev(reached=True, actionable_step=True)
+        obs = self._obs()
+        ev.is_reached("g", obs)
+        ev.has_actionable_step(obs)
+        self.assertEqual(self._calls, 1)
+
+    def test_from_env_requires_model_and_key(self):
+        self.assertIsNone(a.LLMLoginGoalEvaluator.from_env({}))
+        self.assertIsNone(
+            a.LLMLoginGoalEvaluator.from_env({"APPPILOT_MODEL": "m"})
+        )
+        self.assertIsNone(
+            a.LLMLoginGoalEvaluator.from_env({"APPPILOT_MODEL_API_KEY": "k"})
+        )
+
+    def test_from_env_builds_when_configured(self):
+        ev = a.LLMLoginGoalEvaluator.from_env(
+            {
+                "APPPILOT_MODEL": "m",
+                "APPPILOT_MODEL_API_KEY": "k",
+                "APPPILOT_MODEL_BASE_URL": "http://y/v1",
+            },
+            foreground_check=lambda: True,
+        )
+        self.assertIsInstance(ev, a.LLMLoginGoalEvaluator)
+
+
+class LoginWaitsOnTransientScreenTests(unittest.TestCase):
+    """End-to-end regression for the live bug: with the AI login evaluator wired
+    into the agent, a transient 'looking for accounts' screen (carrying only an
+    incidental 'Terms of use' link) must WAIT via the existing mechanism and must
+    NOT let the Brain press a diagnostic Back."""
+
+    def _loading_obs(self):
+        terms = _ui_el(text="Terms of use", resource_id="terms", clickable=True)
+        return a.UIObservation((_ui_el(text="Looking for accounts"), terms))
+
+    def _ev(self, *, reached, actionable_step):
+        def transport(payload):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "reached": reached,
+                                    "actionable_step": actionable_step,
+                                    "reason": "r",
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+        return a.LLMLoginGoalEvaluator(
+            model="m", api_key="k", base_url="http://x/v1",
+            foreground_check=lambda: True, transport=transport,
+        )
+
+    def test_transient_screen_waits_and_never_presses_back(self):
+        ev = self._ev(reached=False, actionable_step=False)
+        observer = _CountingObserver([self._loading_obs()])
+        would_back = _CapturingProvider(
+            a.ModelDecision(
+                action=a.Action(a.ActionKind.PRESS_BACK),
+                reason="No sign-in or onboarding elements visible; pressing back",
+            )
+        )
+        executor = _NoopRecordingExecutor()
+        agent = _make_agent(
+            observer, would_back, ev, executor=executor,
+            max_nonactionable_waits=3,
+            actionable_step_check=ev.has_actionable_step,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = agent.run("login", None)
+        self.assertFalse(result)              # bounded, controlled blocked
+        self.assertEqual(would_back.calls, 0)      # Brain never consulted
+        self.assertEqual(executor.executed, 0)     # so Back never pressed
+        self.assertGreater(observer.count, 1)      # it waited and re-observed
+
+    def test_real_control_lets_brain_act(self):
+        ev = self._ev(reached=False, actionable_step=True)
+        signin = a.UIObservation(
+            (_ui_el(text="Continue with Microsoft",
+                    resource_id="signin", clickable=True),)
+        )
+        observer = _CountingObserver([signin])
+        provider = _CapturingProvider()  # returns None -> stop after asking
+        agent = _make_agent(
+            observer, provider, ev,
+            actionable_step_check=ev.has_actionable_step,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.run("login", None)
+        self.assertGreaterEqual(provider.calls, 1)  # Brain consulted to sign in
+
+
 class DeeplinkSuiteOrchestratorTests(unittest.TestCase):
     def _orch(self, judge, **kwargs):
         runner, executor, sleeps = _make_runner(judge, **kwargs)
@@ -712,6 +1469,7 @@ class DeeplinkSuiteOrchestratorTests(unittest.TestCase):
         class _OrderLogin:
             def ensure_ready(self_inner):
                 order.append("login")
+                return True  # login preparation succeeded
 
         def warm_up():
             order.append("warm_up")
@@ -723,12 +1481,51 @@ class DeeplinkSuiteOrchestratorTests(unittest.TestCase):
         # Login-if-needed happens before the single warm-up.
         self.assertEqual(order, ["login", "warm_up"])
 
+    def test_installed_batch_launches_app_before_login(self):
+        # Regression: the installed batch only installs the APK (install_fresh);
+        # without an explicit launch, login would run against the launcher home
+        # and fail. The app MUST be foreground before login, mirroring the
+        # uninstalled path's install_and_open.
+        order = []
+
+        class _OrderLogin:
+            def ensure_ready(self_inner):
+                order.append("login")
+                return True
+
+        class _OrderInstaller:
+            def ensure_absent(self_inner):
+                pass
+
+            def install_fresh(self_inner):
+                order.append("install")
+
+            def open(self_inner):
+                order.append("open")
+
+            def install_and_open(self_inner):
+                order.append("install_and_open")
+
+        def warm_up():
+            order.append("warm_up")
+
+        orch, _, _ = self._orch(
+            _ScriptedJudge([]),
+            warm_up=warm_up,
+            login_flow=_OrderLogin(),
+            installer=_OrderInstaller(),
+        )
+        orch.prepare_installed_batch()
+        # Install -> launch app -> login -> warm-up: login sees the APP, not home.
+        self.assertEqual(order, ["install", "open", "login", "warm_up"])
+
     def test_installed_batch_one_warm_up_before_all_cases(self):
         order = []
 
         class _OrderLogin:
             def ensure_ready(self_inner):
                 order.append("login")
+                return True  # login preparation succeeded
 
         def warm_up():
             order.append("warm_up")
@@ -762,7 +1559,7 @@ class DeeplinkSuiteOrchestratorTests(unittest.TestCase):
         orch.run([_ucase()])
         self.assertEqual(warm.n, 0)
         self.assertEqual(login.ready_calls, 1)
-        self.assertEqual(installer.absent_calls, 1)
+        self.assertEqual(installer.absent_calls, 2)  # 1 suite-startup + 1 per-attempt
 
     def test_mixed_shares_one_login_object_and_one_warm_up(self):
         warm = _CountingWarmUp()
@@ -790,19 +1587,34 @@ class DeeplinkSuiteOrchestratorTests(unittest.TestCase):
         self.assertEqual(via_runner, via_orch)
 
 
-def _ui_el(*, text="", resource_id="", is_input=False):
+def _ui_el(*, text="", resource_id="", is_input=False, clickable=False,
+           label="", bounds=None, accessibility_text="", hint_text="",
+           element_id="e"):
     return a.UIElement(
-        element_id="e",
+        element_id=element_id,
         parent_id=None,
         text=text,
-        accessibility_text="",
-        hint_text="",
+        accessibility_text=accessibility_text,
+        hint_text=hint_text,
         resource_id=resource_id,
         class_name="",
-        clickable=False,
+        clickable=clickable,
         enabled=True,
         is_input=is_input,
-        label="",
+        label=label,
+        bounds=bounds,
+    )
+
+
+def _logged_out_observation():
+    """A realistic signed-out screen: a tappable Sign in control.
+
+    A real logged-out screen exposes actionable UI (e.g. a Sign in button), so
+    the generic agent asks the Brain to drive login. An EMPTY observation would
+    instead be a non-actionable loading/transition state, which the generic
+    agent now (correctly) waits on rather than consulting the Brain."""
+    return a.UIObservation(
+        (_ui_el(text="Sign in", resource_id="signin_button", clickable=True),)
     )
 
 
@@ -863,7 +1675,7 @@ class SharedLoginOnlyIfNeededTests(unittest.TestCase):
         import contextlib
         import io as _io
 
-        logged_out = a.UIObservation(())  # not signed in
+        logged_out = _logged_out_observation()  # not signed in
         provider = _RecordingProvider()
         flow = self._login_flow(logged_out, provider)
         with contextlib.redirect_stdout(_io.StringIO()):
@@ -871,6 +1683,1312 @@ class SharedLoginOnlyIfNeededTests(unittest.TestCase):
         # Not signed in -> the existing AppPilotAgent + Brain is asked to drive
         # login/onboarding (decision delegated to the model, not hardcoded).
         self.assertGreaterEqual(provider.calls, 1)
+
+
+# --------------------------------------------------------------------------- #
+# Execution-trace logging (observability only; behavior asserted elsewhere)
+# --------------------------------------------------------------------------- #
+def _capture(fn, *args, **kwargs):
+    """Run ``fn`` capturing stdout; return (result, captured_text)."""
+    import contextlib
+    import io as _io
+
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = fn(*args, **kwargs)
+    return result, buf.getvalue()
+
+
+class _SequenceObserver:
+    """Yields the given observations in order, clamping at the last one."""
+
+    def __init__(self, observations):
+        self._obs = list(observations)
+        self._i = 0
+
+    def observe(self):
+        obs = self._obs[self._i]
+        if self._i < len(self._obs) - 1:
+            self._i += 1
+        return obs
+
+
+class _BackProvider:
+    """Always proposes a safe PRESS_BACK so the agent takes exactly one action."""
+
+    def decide(self, request):
+        return a.ModelDecision(
+            action=a.Action(a.ActionKind.PRESS_BACK), reason="advance"
+        )
+
+
+class _NoopRecordingExecutor:
+    def __init__(self):
+        self.executed = 0
+
+    def execute(self, *args, **kwargs):
+        self.executed += 1
+
+
+class TapCommandResolutionTests(unittest.TestCase):
+    """The live bug: a Compose 'Continue with Microsoft' button has NO resource
+    id and NO own text (its caption lives on a child), so tapping by the merged
+    label resolved to the child text node - which reports zero/opaque bounds -
+    and the touch landed nowhere, so nothing advanced. Taps must instead land on
+    the clickable node itself."""
+
+    def _tap(self, el):
+        return a.MaestroExecutor._tap_command(el)
+
+    def test_prefers_resource_id(self):
+        el = _ui_el(resource_id="signin_btn", text="Sign in", clickable=True,
+                    bounds=(0, 0, 100, 50))
+        self.assertEqual(
+            self._tap(el), ("flow", '- tapOn:\n    id: "signin_btn"\n')
+        )
+
+    def test_uses_own_text_when_no_id(self):
+        el = _ui_el(text="Sign in", clickable=True, bounds=(0, 0, 100, 50))
+        self.assertEqual(
+            self._tap(el), ("flow", '- tapOn:\n    text: "Sign in"\n')
+        )
+
+    def test_clickable_without_id_or_own_text_taps_own_center_point(self):
+        # Caption lives on a child -> only a merged label, no own text. Must tap
+        # the node's own centre as a coordinate, delivered via adb.
+        el = _ui_el(label="Continue with Microsoft", clickable=True,
+                    bounds=(40, 100, 240, 200))
+        self.assertEqual(self._tap(el), ("point", (140, 150)))
+
+    def test_falls_back_to_label_text_when_no_bounds(self):
+        el = _ui_el(label="Continue with Microsoft", clickable=True)
+        self.assertEqual(
+            self._tap(el),
+            ("flow", '- tapOn:\n    text: "Continue with Microsoft"\n'),
+        )
+
+    def test_no_selector_raises(self):
+        with self.assertRaises(ValueError):
+            self._tap(_ui_el(clickable=True))
+
+    def test_parse_bounds_reads_uiautomator_format(self):
+        parse = a.MaestroHierarchyObserver._parse_bounds
+        self.assertEqual(parse("[40,100][240,200]"), (40, 100, 240, 200))
+        self.assertIsNone(parse(None))
+        self.assertIsNone(parse("garbage"))
+        self.assertIsNone(parse("[240,200][40,100]"))  # inverted -> rejected
+
+    def test_element_center(self):
+        el = _ui_el(bounds=(10, 20, 30, 60))
+        self.assertEqual(el.center, (20, 40))
+        self.assertIsNone(_ui_el().center)
+
+
+class TapDeliveryTests(unittest.TestCase):
+    """Coordinate taps must be delivered through adb's input pipeline, not
+    Maestro's ``point`` tap - which reports COMPLETED but silently no-ops on
+    Compose surfaces so nothing advances."""
+
+    def _executor(self):
+        ex = a.MaestroExecutor("com.example.app", "emulator-5554")
+        adb_calls = []
+        flow_calls = []
+        ex._run_adb = lambda args, **kw: adb_calls.append(list(args))
+        ex._run_flow = lambda commands, **kw: flow_calls.append(commands)
+        return ex, adb_calls, flow_calls
+
+    def test_coordinate_tap_uses_adb_input_tap(self):
+        ex, adb_calls, flow_calls = self._executor()
+        el = _ui_el(element_id="e:0", label="Continue with Microsoft",
+                    clickable=True, bounds=(72, 1992, 1208, 2136))
+        obs = a.UIObservation((el,))
+        ex.execute(a.Action(a.ActionKind.TAP, target_id="e:0"), obs)
+        self.assertEqual(adb_calls, [["shell", "input", "tap", "640", "2064"]])
+        self.assertEqual(flow_calls, [])
+
+    def test_text_tap_uses_maestro_flow(self):
+        ex, adb_calls, flow_calls = self._executor()
+        el = _ui_el(element_id="e:0", text="Sign in", clickable=True,
+                    bounds=(0, 0, 100, 50))
+        obs = a.UIObservation((el,))
+        ex.execute(a.Action(a.ActionKind.TAP, target_id="e:0"), obs)
+        self.assertEqual(flow_calls, ['- tapOn:\n    text: "Sign in"\n'])
+        self.assertEqual(adb_calls, [])
+
+    def test_coordinate_input_taps_via_adb_then_types_via_flow(self):
+        ex, adb_calls, flow_calls = self._executor()
+        el = _ui_el(element_id="e:0", label="Field", clickable=True,
+                    is_input=True, bounds=(0, 0, 200, 100))
+        obs = a.UIObservation((el,))
+        ex.execute(
+            a.Action(a.ActionKind.INPUT_TEXT, target_id="e:0", input_text="hi"),
+            obs,
+        )
+        self.assertEqual(adb_calls, [["shell", "input", "tap", "100", "50"]])
+        self.assertEqual(flow_calls, ['- inputText: "hi"\n'])
+
+
+class KeyboardFilteringTests(unittest.TestCase):
+    """The live bug: after typing a password the on-screen keyboard adds 100+
+    key nodes that crowd the real sign-in controls (incl. the 'Sign in' button)
+    out of the truncated observation, so the login evaluator wrongly concluded
+    'reached' before sign-in was submitted. The on-screen keyboard (the active
+    IME package) must be excluded from observations, like the system UI."""
+
+    def _observer(self, ime="com.google.android.inputmethod.latin"):
+        obs = a.MaestroHierarchyObserver("device", ime_package_provider=lambda: ime)
+        obs._ensure_excluded_prefixes()
+        return obs
+
+    def _node(self, rid="", text="", clickable=False, children=None):
+        attrs = {}
+        if rid:
+            attrs["resource-id"] = rid
+        if text:
+            attrs["text"] = text
+        if clickable:
+            attrs["clickable"] = "true"
+        return {"attributes": attrs, "children": children or []}
+
+    def test_keyboard_nodes_excluded_real_controls_remain(self):
+        obs = self._observer()
+        hierarchy = self._node(children=[
+            self._node(rid="app:id/signin", text="Sign in", clickable=True),
+            self._node(rid="app:id/pwd", text="Enter password", clickable=True),
+            self._node(
+                rid="com.google.android.inputmethod.latin:id/key_q",
+                text="q", clickable=True,
+            ),
+            self._node(
+                rid="com.google.android.inputmethod.latin:id/key_w",
+                text="w", clickable=True,
+            ),
+        ])
+        elements = []
+        obs._collect(hierarchy, (), None, False, elements)
+        labels = [e.label for e in elements]
+        self.assertIn("Sign in", labels)
+        self.assertIn("Enter password", labels)
+        self.assertNotIn("q", labels)
+        self.assertNotIn("w", labels)
+
+    def test_active_ime_package_is_resolved_and_excluded(self):
+        obs = self._observer("com.samsung.android.honeyboard")
+        self.assertIn("com.samsung.android.honeyboard:", obs._excluded_prefixes)
+        self.assertIn("com.android.systemui:", obs._excluded_prefixes)
+
+    def test_ime_lookup_failure_falls_back_to_system_ui_only(self):
+        def boom():
+            raise RuntimeError("no adb")
+
+        obs = a.MaestroHierarchyObserver("device", ime_package_provider=boom)
+        obs._ensure_excluded_prefixes()
+        self.assertEqual(obs._excluded_prefixes, ("com.android.systemui:",))
+
+    def test_keyboard_labels_do_not_bubble_into_ancestor_container(self):
+        obs = self._observer()
+        # A keyboard toolbar container with no id but IME-package children: its
+        # label must not inherit the keyboard's text.
+        hierarchy = self._node(children=[
+            self._node(clickable=True, children=[
+                self._node(
+                    rid="com.google.android.inputmethod.latin:id/voice",
+                    text="Use voice typing", clickable=True,
+                ),
+            ]),
+        ])
+        elements = []
+        obs._collect(hierarchy, (), None, False, elements)
+        joined = " ".join(e.label for e in elements)
+        self.assertNotIn("Use voice typing", joined)
+
+    def test_query_ime_package_parses_component(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(
+                stdout="com.google.android.inputmethod.latin/.LatinIME\n"
+            )
+
+        obs = a.MaestroHierarchyObserver("emulator-5554")
+        android_module = sys.modules[a.MaestroHierarchyObserver.__module__]
+        with mock.patch.object(android_module.subprocess, "run", fake_run):
+            self.assertEqual(
+                obs._query_ime_package(), "com.google.android.inputmethod.latin"
+            )
+        self.assertIn("default_input_method", captured["cmd"])
+
+
+class BlankScreenUnblockTests(unittest.TestCase):
+    """A screen whose content is hosted in a separate focused window (e.g. the
+    notification opt-in) returns a blank hierarchy dump, so the login agent sees
+    ``<no relevant UI elements>`` and stalls. The observer must deterministically
+    recover: on a blank observation with a focused pop-up window, press BACK to
+    return focus to the app window and re-capture - no AI/OCR/coords/screenshots.
+    """
+
+    _BLANK = json.dumps({
+        "attributes": {},
+        "children": [{"attributes": {"class": "android.view.View"}, "children": []}],
+    })
+    _CONTENT = json.dumps({
+        "attributes": {},
+        "children": [{
+            "attributes": {"text": "Not now", "clickable": "true"},
+            "children": [],
+        }],
+    })
+    _POPUP_FOCUS = "  mCurrentFocus=Window{6a u0 Pop-Up Window}\n"
+    _APP_FOCUS = (
+        "  mCurrentFocus=Window{6a u0 com.microsoft.office.officehubrow/"
+        "com.microsoft.office.officesuite.OfficeSuiteActivity}\n"
+    )
+
+    def _observer(self):
+        # Provide the IME so _ensure_excluded_prefixes never shells out.
+        return a.MaestroHierarchyObserver("device", ime_package_provider=lambda: None)
+
+    def _run_observe(self, obs, *, hierarchies, focus):
+        """Drive obs.observe() with scripted maestro/adb subprocess results.
+
+        ``hierarchies`` is consumed one per hierarchy capture; ``focus`` is the
+        dumpsys window body. Returns (observation, calls)."""
+        calls = []
+        pending = list(hierarchies)
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "hierarchy" in cmd:
+                return types.SimpleNamespace(returncode=0, stdout=pending.pop(0), stderr="")
+            if "dumpsys" in cmd and "window" in cmd:
+                return types.SimpleNamespace(returncode=0, stdout=focus, stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        module = sys.modules[a.MaestroHierarchyObserver.__module__]
+        with mock.patch.object(module.subprocess, "run", fake_run), \
+                mock.patch.object(module.time, "sleep", lambda *_: None):
+            observation = obs.observe()
+        return observation, calls
+
+    def test_blank_popup_screen_is_unblocked_with_back(self):
+        obs = self._observer()
+        observation, calls = self._run_observe(
+            obs,
+            hierarchies=[self._BLANK, self._CONTENT],
+            focus=self._POPUP_FOCUS,
+        )
+        # Recovered: the underlying "Not now" control is now visible.
+        self.assertIn("Not now", observation.describe())
+        self.assertFalse(a.MaestroHierarchyObserver._is_blank(observation))
+        # BACK was delivered exactly once via adb keyevent.
+        back_calls = [c for c in calls if "keyevent" in c]
+        self.assertEqual(len(back_calls), 1)
+        self.assertIn("KEYCODE_BACK", back_calls[0])
+        # Two hierarchy captures: the blank one and the recovered one.
+        self.assertEqual(sum("hierarchy" in c for c in calls), 2)
+
+    def test_blank_without_popup_focus_does_not_press_back(self):
+        obs = self._observer()
+        observation, calls = self._run_observe(
+            obs,
+            hierarchies=[self._BLANK],
+            focus=self._APP_FOCUS,
+        )
+        self.assertTrue(a.MaestroHierarchyObserver._is_blank(observation))
+        self.assertEqual([c for c in calls if "keyevent" in c], [])
+        self.assertEqual(sum("hierarchy" in c for c in calls), 1)
+
+    def test_unblock_budget_is_bounded(self):
+        obs = self._observer()
+        obs._popup_unblock_budget = 0
+        observation, calls = self._run_observe(
+            obs,
+            hierarchies=[self._BLANK],
+            focus=self._POPUP_FOCUS,
+        )
+        # Budget exhausted: no dumpsys focus check and no BACK.
+        self.assertTrue(a.MaestroHierarchyObserver._is_blank(observation))
+        self.assertEqual([c for c in calls if "keyevent" in c], [])
+        self.assertEqual(
+            [c for c in calls if "dumpsys" in c], []
+        )
+
+    def test_non_blank_screen_is_never_touched(self):
+        obs = self._observer()
+        observation, calls = self._run_observe(
+            obs,
+            hierarchies=[self._CONTENT],
+            focus=self._POPUP_FOCUS,
+        )
+        self.assertIn("Not now", observation.describe())
+        self.assertEqual(sum("hierarchy" in c for c in calls), 1)
+        self.assertEqual([c for c in calls if "keyevent" in c], [])
+
+    def test_focused_window_is_popup_parses_current_focus(self):
+        obs = self._observer()
+        module = sys.modules[a.MaestroHierarchyObserver.__module__]
+        with mock.patch.object(
+            module.subprocess, "run",
+            lambda *a_, **k: types.SimpleNamespace(
+                returncode=0, stdout=self._POPUP_FOCUS, stderr=""
+            ),
+        ):
+            self.assertTrue(obs._focused_window_is_popup())
+        with mock.patch.object(
+            module.subprocess, "run",
+            lambda *a_, **k: types.SimpleNamespace(
+                returncode=0, stdout=self._APP_FOCUS, stderr=""
+            ),
+        ):
+            self.assertFalse(obs._focused_window_is_popup())
+
+
+class MaestroDriverStartupRetryTests(unittest.TestCase):
+    """The Maestro on-device driver can miss its startup window on a busy
+    emulator. That infra flake must be retried a bounded number of times, while
+    genuine action failures still raise on the first attempt."""
+
+    def _executor(self):
+        return a.MaestroExecutor("com.example.app", "emulator-5554")
+
+    def _module(self):
+        return sys.modules[a.MaestroExecutor.__module__]
+
+    def _run_with(self, results):
+        """Drive _run_flow with scripted maestro results (one per maestro call).
+
+        adb commands (from the driver-reset recovery) return benign results and
+        do not consume the maestro-result queue."""
+        pending = list(results)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "maestro" in cmd:
+                return pending.pop(0)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        module = self._module()
+        with mock.patch.object(module.subprocess, "run", fake_run), \
+                mock.patch.object(module.time, "sleep", lambda *_: None):
+            self._executor()._run_flow("- pressKey: BACK\n")
+        return calls
+
+    _TIMEOUT_ERR = types.SimpleNamespace(
+        returncode=1,
+        stdout="",
+        stderr="Maestro Android driver did not start up in time on emulator",
+    )
+    _OK = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def test_driver_startup_timeout_is_retried_then_succeeds(self):
+        calls = self._run_with([self._TIMEOUT_ERR, self._OK])
+        # Two maestro invocations: the flaky one and the successful retry.
+        self.assertEqual(sum("maestro" in c for c in calls), 2)
+        # Recovery reset the adb server before retrying.
+        self.assertTrue(any("kill-server" in c for c in calls))
+        self.assertTrue(any("start-server" in c for c in calls))
+
+    def test_driver_startup_budget_env_is_passed_to_maestro(self):
+        module = self._module()
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            if "maestro" in cmd:
+                captured["env"] = kwargs.get("env")
+                return self._OK
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(module.subprocess, "run", fake_run):
+            self._executor()._run_flow("- pressKey: BACK\n")
+        self.assertEqual(
+            captured["env"].get(module._DRIVER_STARTUP_TIMEOUT_ENV),
+            module._DRIVER_STARTUP_TIMEOUT_MS,
+        )
+
+    def test_driver_startup_timeout_exhausts_and_raises(self):
+        module = self._module()
+        pending = [self._TIMEOUT_ERR] * 5
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "maestro" in cmd:
+                return pending.pop(0)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(module.subprocess, "run", fake_run), \
+                mock.patch.object(module.time, "sleep", lambda *_: None):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._executor()._run_flow("- pressKey: BACK\n")
+        self.assertIn("did not start up in time", str(ctx.exception))
+        # Bounded: exactly the max number of attempts, no more.
+        self.assertEqual(
+            sum("maestro" in c for c in calls), module._DRIVER_STARTUP_MAX_ATTEMPTS
+        )
+
+    def test_real_action_failure_raises_immediately_without_retry(self):
+        module = self._module()
+        real_err = types.SimpleNamespace(
+            returncode=1, stdout="", stderr="Element not found: Accept"
+        )
+        pending = [real_err, self._OK]
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if "maestro" in cmd:
+                return pending.pop(0)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(module.subprocess, "run", fake_run), \
+                mock.patch.object(module.time, "sleep", lambda *_: None):
+            with self.assertRaises(RuntimeError):
+                self._executor()._run_flow("- pressKey: BACK\n")
+        # No retry for a genuine failure: only one invocation.
+        self.assertEqual(sum("maestro" in c for c in calls), 1)
+
+
+class ExecutionTraceLoggingTests(unittest.TestCase):
+    def test_suite_start_and_completion_logging(self):
+        judge = _ScriptedJudge([(True, "installed ok"), (True, "fresh ok")])
+        orch, _, _ = d.DeeplinkSuiteOrchestrator(
+            _make_runner(
+                judge, installer=_FakeInstaller(), login_flow=_FakeLogin()
+            )[0]
+        ), None, None
+        _, out = _capture(orch.run, [_icase("T1"), _ucase("T2")])
+        self.assertIn("[SUITE] Starting deeplink test suite", out)
+        self.assertIn("[SUITE] Loaded 2 test cases", out)
+        self.assertIn("[SUITE] Installed cases: 1", out)
+        self.assertIn("[SUITE] Uninstalled cases: 1", out)
+        self.assertIn("[INSTALLED BATCH] Starting", out)
+        self.assertIn("[INSTALLED BATCH] Ensuring login", out)
+        self.assertIn("[SUITE] Completed", out)
+
+    def test_suite_completed_not_logged_when_setup_raises(self):
+        class _BoomLogin:
+            def ensure_ready(self):
+                raise RuntimeError("boom")
+
+        judge = _ScriptedJudge([(True, "ok")])
+        runner, _, _ = _make_runner(judge, login_flow=_BoomLogin())
+        orch = d.DeeplinkSuiteOrchestrator(runner)
+        import contextlib
+        import io as _io
+
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(RuntimeError):
+                orch.run([_icase("T1")])
+        # A raised setup failure must NOT print a misleading completion line.
+        self.assertNotIn("[SUITE] Completed", buf.getvalue())
+
+    def test_warm_up_cycle_logging_matches_real_cycles(self):
+        warm = d.MaestroWarmUp(
+            _RecordingExecutor(), launches=2, settle_seconds=3, sleep=lambda s: None
+        )
+        _, out = _capture(warm)
+        self.assertIn("[WARM-UP] Starting installed-app preparation: 2 cycles", out)
+        for cycle in (1, 2):
+            self.assertIn(f"[WARM-UP] Cycle {cycle}/2: launch app", out)
+            self.assertIn(f"[WARM-UP] Cycle {cycle}/2: waiting 3s", out)
+            self.assertIn(f"[WARM-UP] Cycle {cycle}/2: stop app", out)
+            self.assertIn(f"[WARM-UP] Cycle {cycle}/2 complete", out)
+        self.assertIn("[WARM-UP] Installed-app preparation complete", out)
+
+    def test_installed_case_logging(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        runner, _, _ = _make_runner(judge)
+        _, out = _capture(runner.run, [_icase("T1")])
+        self.assertIn("[INSTALLED] T1 starting", out)
+        self.assertIn("[INSTALLED] T1 attempt 1/2", out)
+        self.assertIn("[INSTALLED] T1 opening deeplink", out)
+        self.assertIn("[INSTALLED] T1 deeplink test case result: PASS", out)
+        # No warm-up log between/around a case when no warm-up is configured.
+        self.assertNotIn("[WARM-UP]", out)
+
+    def test_installed_retry_logging(self):
+        judge = _ScriptedJudge([(False, "no"), (True, "ok")])
+        runner, _, _ = _make_runner(judge)
+        _, out = _capture(runner.run, [_icase("T1")])
+        self.assertIn("[INSTALLED] T1 attempt 1/2: MISMATCH", out)
+        self.assertIn("[INSTALLED] T1 retry: stopping app", out)
+        self.assertIn("[INSTALLED] T1 retry: waiting 2s", out)
+        self.assertIn("[INSTALLED] T1 retry: reopening same deeplink", out)
+        self.assertIn("[INSTALLED] T1 attempt 2/2", out)
+        self.assertIn("[INSTALLED] T1 deeplink test case result: PASS", out)
+
+    def test_uninstalled_case_logging(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        runner, _, _ = _make_runner(
+            judge, installer=_FakeInstaller(), login_flow=_FakeLogin()
+        )
+        _, out = _capture(runner.run, [_ucase("T9")])
+        for expected in (
+            "[UNINSTALLED] T9 starting",
+            "[UNINSTALLED] T9 first-open flow - warm-up not applicable",
+            "[UNINSTALLED] T9 attempt 1/2",
+            "[UNINSTALLED] T9 ensuring app is uninstalled",
+            "[UNINSTALLED] T9 app is uninstalled",
+            "[UNINSTALLED] T9 opening deeplink",
+            "[INSTALL] T9 installing local build and launching app",
+            "[INSTALL] T9 app opened",
+            "[UNINSTALLED] T9 ensuring login",
+            "[UNINSTALLED] T9 login ready",
+            "[UNINSTALLED] T9 verifying deeplink expected result",
+            "[UNINSTALLED] T9 deeplink test case result: PASS",
+        ):
+            self.assertIn(expected, out)
+        # The uninstalled path must never emit a warm-up trace.
+        self.assertNotIn("[WARM-UP]", out)
+
+    def test_uninstalled_retry_logging(self):
+        judge = _ScriptedJudge([(False, "no"), (True, "ok")])
+        runner, _, _ = _make_runner(
+            judge, installer=_FakeInstaller(), login_flow=_FakeLogin()
+        )
+        _, out = _capture(runner.run, [_ucase("T9")])
+        self.assertIn("[UNINSTALLED] T9 attempt 1/2: MISMATCH", out)
+        self.assertIn("[UNINSTALLED] T9 retry: recreating fresh-install state", out)
+        self.assertIn("[UNINSTALLED] T9 attempt 2/2", out)
+
+    def test_local_apk_internal_launch_logging(self):
+        exe = LocalApkInstallerTests._FakeExec()
+        installer = d.LocalApkInstaller(
+            exe,
+            "/tmp/officemobile.apk",
+            foreground_poll_seconds=0,
+        )
+        _, out = _capture(installer.install_and_open)
+        self.assertIn("[INSTALL] installing local build", out)
+        self.assertIn("[INSTALL] launching app via adb", out)
+        # "app opened" is only truthful after the foreground check passes.
+        self.assertIn("[INSTALL] waiting for target app to become foreground", out)
+        self.assertIn("[INSTALL] target app is foreground", out)
+
+    def test_local_apk_never_foreground_logging(self):
+        # When the app never becomes foreground the installer reports the timeout
+        # and raises - it must NOT log that the app became foreground.
+        exe = LocalApkInstallerTests._FakeExec(foreground_after=10_000)
+        installer = d.LocalApkInstaller(
+            exe,
+            "/tmp/officemobile.apk",
+            foreground_timeout_seconds=0,
+            foreground_poll_seconds=0,
+        )
+        with self.assertRaises(RuntimeError):
+            _capture(installer.install_and_open)
+
+    def _login_flow(self, observations, provider, executor=None):
+        import flows.login as login_mod
+
+        agent = login_mod.build_login_agent(
+            provider=provider,
+            observer=_SequenceObserver(observations),
+            executor=executor or _NoopExecutor(),
+        )
+        return d.SharedLoginFlow(agent)
+
+    def test_login_already_signed_in_logging(self):
+        signed_in = a.UIObservation((_ui_el(text="Message Copilot"),))
+        flow = self._login_flow([signed_in], _RecordingProvider())
+        _, out = _capture(flow.ensure_ready)
+        self.assertIn("[LOGIN] Already signed in - no login actions required", out)
+        self.assertNotIn("[LOGIN] Sign-in required", out)
+        self.assertNotIn("[LOGIN] Returning control to deeplink test", out)
+
+    def test_login_sign_in_required_logging(self):
+        logged_out = _logged_out_observation()
+        flow = self._login_flow([logged_out], _RecordingProvider())
+        _, out = _capture(flow.ensure_ready)
+        self.assertIn("[LOGIN] Sign-in required - starting shared login flow", out)
+        self.assertNotIn("[LOGIN] Already signed in", out)
+
+    def test_login_completed_logging(self):
+        logged_out = _logged_out_observation()
+        signed_in = a.UIObservation((_ui_el(text="Message Copilot"),))
+        flow = self._login_flow(
+            [logged_out, signed_in], _BackProvider(), executor=_NoopRecordingExecutor()
+        )
+        _, out = _capture(flow.ensure_ready)
+        self.assertIn("[LOGIN] Sign-in required - starting shared login flow", out)
+        self.assertIn("[LOGIN] Returning control to deeplink test", out)
+
+
+# --------------------------------------------------------------------------- #
+# PART 1 - generic AppPilot no-actionable-UI wait handling
+# --------------------------------------------------------------------------- #
+class _CountingObserver:
+    """Yields observations in order (clamping at last) and counts observe()."""
+
+    def __init__(self, observations):
+        self._obs = list(observations)
+        self._i = 0
+        self.count = 0
+
+    def observe(self):
+        self.count += 1
+        obs = self._obs[min(self._i, len(self._obs) - 1)]
+        if self._i < len(self._obs) - 1:
+            self._i += 1
+        return obs
+
+
+class _CapturingProvider:
+    """Records each Brain call and the observation it was asked to decide on."""
+
+    def __init__(self, decision=None):
+        self.calls = 0
+        self.requests = []
+        self._decision = decision
+
+    def decide(self, request):
+        self.calls += 1
+        self.requests.append(request)
+        return self._decision or a.ModelDecision(action=None, reason="test stop")
+
+
+class _MarkerGoal:
+    """Goal reached iff some element's text contains the marker (generic)."""
+
+    def __init__(self, marker):
+        self._marker = marker
+
+    def is_reached(self, goal, observation):
+        return any(self._marker in (el.text or "") for el in observation.elements)
+
+
+def _actionable_el(text="Continue"):
+    # Clickable + resource id => SafetyValidator yields a TAP (actionable UI).
+    return _ui_el(text=text, resource_id="btn_continue", clickable=True)
+
+
+def _loading_el(text="please wait"):
+    # No resource id / not clickable / not input => only PRESS_BACK is available,
+    # i.e. NO actionable UI (a transient loading/transition screen).
+    return _ui_el(text=text)
+
+
+def _make_agent(observer, provider, goal, *, executor=None, max_actions=30,
+                max_stuck_actions=5, max_nonactionable_waits=10,
+                actionable_step_check=None, log_tag=""):
+    return a.AppPilotAgent(
+        observer=observer,
+        goal_evaluator=goal,
+        decision_provider=provider,
+        safety_validator=a.SafetyValidator(),
+        executor=executor or _NoopRecordingExecutor(),
+        max_actions=max_actions,
+        runtime_context=a.RuntimeContext({}),
+        max_stuck_actions=max_stuck_actions,
+        sleep=lambda seconds: None,
+        nonactionable_wait_seconds=0,
+        max_nonactionable_waits=max_nonactionable_waits,
+        actionable_step_check=actionable_step_check,
+        log_tag=log_tag,
+    )
+
+
+class AgentLogTagTests(unittest.TestCase):
+    """Logging-only: the optional ``log_tag`` prefixes EVERY line the agent emits
+    with a subsystem tag (e.g. ``[LOGIN]``) so the whole verbose trace is
+    greppable and a login PASS cannot be mistaken for the whole deeplink test
+    case passing. It must not change verdicts or control flow - only add the
+    bracketed prefix."""
+
+    def _reached_agent(self, tag):
+        # Goal already reached on first observation => single PASS with no action.
+        observer = _CountingObserver([a.UIObservation((_ui_el(text="Message Copilot"),))])
+        goal = _MarkerGoal("Message Copilot")
+        return _make_agent(observer, _CapturingProvider(), goal, log_tag=tag)
+
+    def _run(self, agent):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            result = agent.run("reach chat", None)
+        return result, buffer.getvalue()
+
+    def test_default_keeps_untagged_lines(self):
+        result, out = self._run(self._reached_agent(""))
+        self.assertTrue(result)
+        self.assertIn("GOAL:\n", out)
+        self.assertIn("GOAL REACHED:\ntrue", out)
+        self.assertIn("RESULT:\nPASS", out)
+        self.assertNotIn("[LOGIN]", out)
+
+    def test_tag_prefixes_every_emitted_line(self):
+        result, out = self._run(self._reached_agent("LOGIN"))
+        self.assertTrue(result)  # same verdict as the untagged case
+        # Every logical entry the agent printed starts with the subsystem tag.
+        printed = [ln for ln in out.splitlines() if ln.strip()]
+        self.assertTrue(any(ln.startswith("[LOGIN] GOAL:") for ln in printed))
+        self.assertIn("[LOGIN] GOAL REACHED:", out)
+        self.assertIn("[LOGIN] RESULT:\nPASS", out)
+        # No bare, untagged header may leak through for a tagged run.
+        self.assertNotIn("\nGOAL REACHED:", "\n" + out)
+        self.assertNotIn("\nRESULT:\nPASS", "\n" + out)
+
+    def test_tagged_fail_is_attributed_to_subsystem(self):
+        # Never reaches the goal and no actionable step => bounded wait then FAIL.
+        observer = _CountingObserver([a.UIObservation((_loading_el(),))])
+        goal = _MarkerGoal("never appears")
+        agent = _make_agent(
+            observer, _CapturingProvider(), goal,
+            max_nonactionable_waits=0, log_tag="LOGIN",
+        )
+        result, out = self._run(agent)
+        self.assertFalse(result)
+        self.assertIn("[LOGIN] RESULT:\nFAIL -", out)
+        self.assertNotIn("\nRESULT:\nFAIL", "\n" + out)
+
+    def test_build_login_agent_tags_output_as_login(self):
+        import flows.login as login_mod
+
+        agent = login_mod.build_login_agent(
+            "device",
+            observer=_CountingObserver(
+                [a.UIObservation((_ui_el(text="Message Copilot"),))]
+            ),
+            executor=_NoopRecordingExecutor(),
+            provider=_CapturingProvider(),
+        )
+        _, out = self._run(agent)
+        self.assertIn("[LOGIN] RESULT:\nPASS", out)
+
+
+class GenericAgentLoadingTests(unittest.TestCase):
+    """Part 1: when goal not reached AND no actionable UI, wait/re-observe -
+    never ask the Brain to invent an action against a blank/loading screen."""
+
+    def _run(self, agent):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return agent.run("reach chat", None)
+
+    def test_goal_reached_no_actionable_ui_finishes_without_brain(self):
+        # Goal marker present but the only element is non-actionable text.
+        obs = a.UIObservation((_loading_el(text="Chat screen with prompt"),))
+        provider = _CapturingProvider()
+        agent = self._make(obs, provider)
+        self.assertTrue(self._run(agent))
+        self.assertEqual(provider.calls, 0)
+
+    def test_goal_not_reached_actionable_ui_calls_brain(self):
+        obs = a.UIObservation((_actionable_el(),))
+        provider = _CapturingProvider()  # returns None -> stop after asking
+        agent = self._make(obs, provider)
+        self.assertFalse(self._run(agent))
+        self.assertGreaterEqual(provider.calls, 1)
+
+    def test_goal_not_reached_no_actionable_ui_does_not_call_brain(self):
+        observer = _CountingObserver([a.UIObservation((_loading_el(),))])
+        provider = _CapturingProvider()
+        agent = self._make_obs(observer, provider, max_nonactionable_waits=3)
+        self.assertFalse(self._run(agent))  # bounded, no infinite loop
+        self.assertEqual(provider.calls, 0)  # Brain never consulted
+        self.assertGreater(observer.count, 1)  # it re-observed while waiting
+
+    def test_loading_then_actionable_calls_brain_with_second_observation(self):
+        actionable = a.UIObservation((_actionable_el(text="Sign in"),))
+        observer = _CountingObserver(
+            [a.UIObservation((_loading_el(),)), actionable]
+        )
+        provider = _CapturingProvider()
+        agent = self._make_obs(observer, provider)
+        self.assertFalse(self._run(agent))
+        self.assertEqual(provider.calls, 1)
+        # The Brain was asked to decide on the SECOND (actionable) observation.
+        decided = provider.requests[0].observation
+        self.assertTrue(any(el.clickable for el in decided.elements))
+
+    def test_loading_then_goal_finishes_without_brain(self):
+        observer = _CountingObserver(
+            [
+                a.UIObservation((_loading_el(),)),
+                a.UIObservation((_loading_el(text="Chat screen with prompt"),)),
+            ]
+        )
+        provider = _CapturingProvider()
+        agent = self._make_obs(observer, provider)
+        self.assertTrue(self._run(agent))
+        self.assertEqual(provider.calls, 0)
+
+    def test_persistent_non_actionable_is_bounded(self):
+        observer = _CountingObserver([a.UIObservation((_loading_el(),))])
+        provider = _CapturingProvider()
+        agent = self._make_obs(observer, provider, max_nonactionable_waits=2)
+        # Must return (no hang) and never consult the Brain.
+        self.assertFalse(self._run(agent))
+        self.assertEqual(provider.calls, 0)
+        # 1 initial observe + exactly max_nonactionable_waits re-observes.
+        self.assertEqual(observer.count, 3)
+
+    def test_stuck_detection_still_works(self):
+        # Unchanging actionable screen + an action every step => stuck FAIL.
+        obs = a.UIObservation((_actionable_el(),))
+        provider = _BackProvider()
+        executor = _NoopRecordingExecutor()
+        agent = self._make(obs, provider, executor=executor, max_stuck_actions=2)
+        self.assertFalse(self._run(agent))
+        self.assertGreaterEqual(executor.executed, 1)
+
+    # -- domain actionable_step gate ----------------------------------------- #
+    def test_incidental_control_without_step_waits_instead_of_back(self):
+        # The live bug, generically: a transient "looking for accounts" screen
+        # with only an incidental clickable "Terms of use" link. Generic
+        # classification would consult the Brain, which presses a diagnostic
+        # Back. With a domain actionable_step_check reporting NO genuine step, the
+        # agent must wait/re-observe instead: never the Brain, never Back.
+        terms = _ui_el(text="Terms of use", resource_id="terms", clickable=True)
+        loading = a.UIObservation((_ui_el(text="Looking for accounts"), terms))
+        observer = _CountingObserver([loading])
+        would_back = _CapturingProvider(
+            a.ModelDecision(action=a.Action(a.ActionKind.PRESS_BACK), reason="back")
+        )
+        executor = _NoopRecordingExecutor()
+        agent = _make_agent(
+            observer, would_back, _MarkerGoal("Chat screen"),
+            executor=executor, max_nonactionable_waits=3,
+            actionable_step_check=lambda obs: False,
+        )
+        self.assertFalse(self._run(agent))   # bounded, controlled blocked
+        self.assertEqual(would_back.calls, 0)     # Brain never consulted
+        self.assertEqual(executor.executed, 0)    # so Back never pressed
+        self.assertGreater(observer.count, 1)     # it waited and re-observed
+
+    def test_step_gate_true_consults_brain_normally(self):
+        # When the domain gate confirms a genuine step, behaviour is unchanged:
+        # the Brain is consulted on the actionable screen.
+        obs = a.UIObservation((_actionable_el(text="Sign in"),))
+        provider = _CapturingProvider()  # returns None -> stop after asking
+        agent = _make_agent(
+            _FixedObserver(obs), provider, _MarkerGoal("Chat screen"),
+            actionable_step_check=lambda o: True,
+        )
+        self.assertFalse(self._run(agent))
+        self.assertGreaterEqual(provider.calls, 1)
+
+    def test_step_gate_waits_until_real_control_then_consults_brain(self):
+        # First the transient screen (gate False) -> wait; then a real sign-in
+        # control appears (gate True) -> Brain consulted on the SETTLED screen.
+        terms = _ui_el(text="Terms of use", resource_id="terms", clickable=True)
+        loading = a.UIObservation((_ui_el(text="Looking for accounts"), terms))
+        signin = a.UIObservation((_actionable_el(text="Sign in"),))
+        observer = _CountingObserver([loading, signin])
+        provider = _CapturingProvider()
+
+        def gate(obs):
+            return any("Sign in" in (el.text or "") for el in obs.elements)
+
+        agent = _make_agent(
+            observer, provider, _MarkerGoal("Chat screen"),
+            actionable_step_check=gate,
+        )
+        self.assertFalse(self._run(agent))
+        self.assertEqual(provider.calls, 1)
+        decided = provider.requests[0].observation
+        self.assertTrue(any("Sign in" in (el.text or "") for el in decided.elements))
+
+    # -- construction helpers ------------------------------------------------ #
+    def _make(self, observation, provider, *, executor=None,
+              max_stuck_actions=5):
+        return _make_agent(
+            _FixedObserver(observation), provider, _MarkerGoal("Chat screen"),
+            executor=executor, max_stuck_actions=max_stuck_actions,
+        )
+
+    def _make_obs(self, observer, provider, *, max_nonactionable_waits=10):
+        return _make_agent(
+            observer, provider, _MarkerGoal("Chat screen"),
+            max_nonactionable_waits=max_nonactionable_waits,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# PART 2 - shared bounded deeplink verification polling (installed == uninstalled)
+# --------------------------------------------------------------------------- #
+class _FakeClock:
+    """Injectable monotonic clock; sleep() advances it (no real waiting)."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+
+class _MarkerJudge:
+    """Semantic-judge stand-in: match iff observation text contains the marker."""
+
+    def __init__(self, marker):
+        self._marker = marker
+        self.calls = 0
+
+    def evaluate(self, expected_result, observation):
+        self.calls += 1
+        matched = any(self._marker in (el.text or "") for el in observation.elements)
+        return d.ExpectationVerdict(
+            matched=matched, reason="matched" if matched else "not yet"
+        )
+
+
+_LOADING = a.UIObservation((_ui_el(text="loading"),))
+_CHAT = a.UIObservation((_ui_el(text="Chat screen with prompt"),))
+_MARKER = "Chat screen"
+
+
+def _make_verify_runner(observer, judge, clock, *, timeout, interval,
+                        executor=None, installer=None, login_flow=None,
+                        warm_up=None, max_attempts=d.DEFAULT_MAX_ATTEMPTS):
+    return d.DeeplinkTestRunner(
+        observer=observer,
+        executor=executor or _RecordingExecutor(),
+        judge=judge,
+        warm_up=warm_up,
+        sleep=clock.sleep,
+        settle_seconds=0,
+        verify_timeout_seconds=timeout,
+        verify_poll_interval_seconds=interval,
+        monotonic=clock.monotonic,
+        installer=installer,
+        login_flow=login_flow,
+        max_attempts=max_attempts,
+    )
+
+
+class DeeplinkVerificationPollingTests(unittest.TestCase):
+    def test_immediate_match_no_unnecessary_wait(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        runner = _make_verify_runner(
+            _CountingObserver([_CHAT]), judge, clock, timeout=10, interval=2
+        )
+        result = runner.run_installed_case(_icase("TC001", _MARKER))
+        self.assertTrue(result.passed)
+        self.assertEqual(judge.calls, 1)  # one observe/judge, no polling
+        self.assertEqual(clock.t, 0.0)  # never slept in the verify window
+
+    def test_match_after_several_polls(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        runner = _make_verify_runner(
+            _CountingObserver([_LOADING, _LOADING, _CHAT]), judge, clock,
+            timeout=10, interval=2,
+        )
+        result = runner.run_installed_case(_icase("TC002", _MARKER))
+        self.assertTrue(result.passed)
+        self.assertEqual(judge.calls, 3)
+        self.assertEqual(clock.t, 4.0)  # two 2s poll intervals
+
+    def test_match_near_end_of_window(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        runner = _make_verify_runner(
+            _CountingObserver([_LOADING, _LOADING, _LOADING, _CHAT]), judge,
+            clock, timeout=6, interval=2,
+        )
+        result = runner.run_installed_case(_icase("TC003", _MARKER))
+        self.assertTrue(result.passed)
+        self.assertEqual(judge.calls, 4)
+        self.assertEqual(clock.t, 6.0)  # matched right at the window edge
+
+    def test_never_matches_times_out_then_retries(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        executor = _RecordingExecutor()
+        runner = _make_verify_runner(
+            _CountingObserver([_LOADING]), judge, clock, timeout=4, interval=2,
+            executor=executor,
+        )
+        _, out = _capture(runner.run_installed_case, _icase("TC004", _MARKER))
+        # A first non-matching observation is NOT a failure; only a mismatch
+        # after the bounded window, which drives the existing retry (one retry).
+        self.assertIn("[VERIFY] TC004: verification timeout reached", out)
+        self.assertIn("[INSTALLED] TC004 attempt 1/2: MISMATCH", out)
+        opens = [c for c in executor.calls if c[0] == "open_link"]
+        self.assertEqual(len(opens), 2)  # retried the deeplink once
+
+    def test_installed_case_uses_polling(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        runner = _make_verify_runner(
+            _CountingObserver([_LOADING, _CHAT]), judge, clock,
+            timeout=10, interval=2,
+        )
+        result = runner.run_installed_case(_icase("TC005", _MARKER))
+        self.assertTrue(result.passed)
+        self.assertGreater(judge.calls, 1)  # polled, did not fail on first obs
+
+    def test_uninstalled_case_uses_same_polling(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        runner = _make_verify_runner(
+            _CountingObserver([_LOADING, _CHAT]), judge, clock,
+            timeout=10, interval=2,
+            installer=_FakeInstaller(), login_flow=_FakeLogin(),
+        )
+        result = runner.run_uninstalled_case(_ucase("TC006", _MARKER))
+        self.assertTrue(result.passed)
+        # SAME shared _verify polling: matched only after re-observing.
+        self.assertGreater(judge.calls, 1)
+
+
+# --------------------------------------------------------------------------- #
+# Login -> deeplink handoff: login PREPARES; the deeplink JUDGE owns PASS/FAIL
+# --------------------------------------------------------------------------- #
+class LoginToDeeplinkHandoffTests(unittest.TestCase):
+    """After login completes, the CURRENT screen is handed to the deeplink
+    verifier/judge. Login completion is NOT a deeplink pass: the judge - not the
+    login evaluator - determines PASS/FAIL from the observed UI."""
+
+    def test_login_completion_hands_current_ui_to_judge_which_passes(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        login = _FakeLogin()
+        runner = _make_verify_runner(
+            _CountingObserver([_CHAT]), judge, clock, timeout=10, interval=2,
+            installer=_FakeInstaller(), login_flow=login,
+        )
+        result = runner.run_uninstalled_case(_ucase("TC010", _MARKER))
+        self.assertTrue(result.passed)
+        # Login ran (preparation), THEN the judge decided from the observed UI.
+        self.assertEqual(login.ready_calls, 1)
+        self.assertGreaterEqual(judge.calls, 1)
+
+    def test_login_completion_does_not_imply_deeplink_pass(self):
+        # Login completes every attempt, but the expected result never appears:
+        # the judge (not login) owns the verdict, so the case FAILS after the
+        # bounded verification window on all 3 attempts.
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)  # never matches _LOADING
+        login = _FakeLogin()
+        runner = _make_verify_runner(
+            _CountingObserver([_LOADING]), judge, clock, timeout=0, interval=0,
+            installer=_FakeInstaller(), login_flow=login, max_attempts=3,
+        )
+        result, _ = _capture(runner.run_uninstalled_case, _ucase("TC011", _MARKER))
+        self.assertFalse(result.passed)
+        self.assertEqual(login.ready_calls, 3)  # login completed each attempt
+        self.assertEqual(judge.calls, 3)        # judge still owned the verdict
+
+
+class _FailingLogin:
+    """Login capability whose preparation FAILS (returns False)."""
+
+    def __init__(self):
+        self.ready_calls = 0
+
+    def ensure_ready(self):
+        self.ready_calls += 1
+        return False  # login preparation failed
+
+
+class LoginFailurePropagationTests(unittest.TestCase):
+    """Login preparation success/failure and deeplink verification are two
+    separate states. A login failure must NOT be reported as ready, must NOT
+    reach the deeplink judge (_verify), and must fail the test case (retrying
+    per the existing scenario-specific path); a login success must hand the
+    CURRENT UI straight to the judge without implying a deeplink pass."""
+
+    def test_uninstalled_login_failure_skips_verify_and_is_not_ready(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        login = _FailingLogin()
+        installer = _FakeInstaller()
+        runner = _make_verify_runner(
+            _CountingObserver([_CHAT]), judge, clock, timeout=10, interval=2,
+            installer=installer, login_flow=login, max_attempts=1,
+        )
+        result, out = _capture(runner.run_uninstalled_case, _ucase("TC020", _MARKER))
+        self.assertFalse(result.passed)                 # final login failure -> FAIL
+        self.assertEqual(judge.calls, 0)                # _verify() never called
+        self.assertNotIn("login ready", out)            # never claims ready
+        self.assertIn("[UNINSTALLED] TC020 login failed", out)
+        self.assertIn("[UNINSTALLED] TC020 skipping deeplink verification", out)
+        self.assertNotIn("verifying deeplink expected result", out)
+
+    def test_uninstalled_login_failure_retries_with_fresh_install_state(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        login = _FailingLogin()
+        installer = _FakeInstaller()
+        runner = _make_verify_runner(
+            _CountingObserver([_CHAT]), judge, clock, timeout=10, interval=2,
+            installer=installer, login_flow=login, max_attempts=2,
+        )
+        result, out = _capture(runner.run_uninstalled_case, _ucase("TC021", _MARKER))
+        self.assertFalse(result.passed)
+        self.assertEqual(login.ready_calls, 2)          # retried once
+        self.assertEqual(judge.calls, 0)                # never verified on either attempt
+        # The retry recreated genuine fresh-install state (uninstall + install)
+        # exactly as the existing scenario-specific path does.
+        self.assertEqual(installer.absent_calls, 2)
+        self.assertEqual(installer.install_calls, 2)
+        self.assertIn("recreating fresh-install state", out)
+        self.assertEqual(len(result.attempts), 2)
+        self.assertTrue(all(not att.matched for att in result.attempts))
+
+    def test_installed_login_failure_skips_verify_and_fails(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        login = _FailingLogin()
+        runner = _make_verify_runner(
+            _CountingObserver([_CHAT]), judge, clock, timeout=10, interval=2,
+            installer=_FakeInstaller(), login_flow=login,
+        )
+        orch = d.DeeplinkSuiteOrchestrator(runner)
+        report, out = _capture(orch.run, [_icase("TC022", _MARKER)])
+        self.assertEqual(report.passed, 0)              # overall test case FAIL
+        self.assertEqual(judge.calls, 0)                # _verify() never called
+        self.assertNotIn("login ready", out)
+        self.assertIn("[INSTALLED] TC022 login failed", out)
+        self.assertIn("[INSTALLED] TC022 skipping deeplink verification", out)
+        self.assertNotIn("verifying deeplink expected result", out)
+
+    def test_login_success_calls_verify_and_hands_current_ui_to_judge(self):
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        login = _FakeLogin()
+        installer = _FakeInstaller()
+        runner = _make_verify_runner(
+            _CountingObserver([_CHAT]), judge, clock, timeout=10, interval=2,
+            installer=installer, login_flow=login, max_attempts=1,
+        )
+        result, out = _capture(runner.run_uninstalled_case, _ucase("TC023", _MARKER))
+        self.assertTrue(result.passed)
+        self.assertEqual(login.ready_calls, 1)
+        self.assertGreaterEqual(judge.calls, 1)         # _verify() ran on success
+        self.assertIn("[UNINSTALLED] TC023 login ready", out)
+        self.assertIn("verifying deeplink expected result", out)
+
+    def test_login_success_does_not_imply_deeplink_pass(self):
+        # Login succeeds but the CURRENT UI never matches: the judge owns the
+        # verdict, so the deeplink test FAILS despite login success.
+        clock = _FakeClock()
+        judge = _MarkerJudge(_MARKER)
+        login = _FakeLogin()
+        runner = _make_verify_runner(
+            _CountingObserver([_LOADING]), judge, clock, timeout=0, interval=0,
+            installer=_FakeInstaller(), login_flow=login, max_attempts=1,
+        )
+        result, out = _capture(runner.run_uninstalled_case, _ucase("TC024", _MARKER))
+        self.assertEqual(login.ready_calls, 1)          # login PASSed
+        self.assertFalse(result.passed)                 # deeplink still FAILed
+        self.assertIn("[UNINSTALLED] TC024 login ready", out)
+
+    def test_access_restricted_screen_is_valid_login_completion(self):
+        # The "Copilot access restricted" dialog is a valid login-completion
+        # state: login returns success and the current UI is handed to the judge
+        # (which owns the deeplink verdict); login is not failed and no navigation
+        # is performed.
+        clock = _FakeClock()
+        restricted = a.UIObservation(
+            (_ui_el(text="You're not eligible to access Copilot"),)
+        )
+        judge = _MarkerJudge(_MARKER)  # restricted screen won't match the marker
+        login = _FakeLogin()           # login completes on the restricted screen
+        runner = _make_verify_runner(
+            _CountingObserver([restricted]), judge, clock, timeout=0, interval=0,
+            installer=_FakeInstaller(), login_flow=login, max_attempts=1,
+        )
+        result, out = _capture(runner.run_uninstalled_case, _ucase("TC025", _MARKER))
+        self.assertEqual(login.ready_calls, 1)          # treated as login completion
+        self.assertIn("[UNINSTALLED] TC025 login ready", out)
+        self.assertGreaterEqual(judge.calls, 1)         # UI handed to the judge
+        self.assertFalse(result.passed)                 # judge owns the FAIL verdict
+
+
+def _icase_link(test_id, deep_link, expected="Chat screen"):
+    """An INSTALLED=True case with an explicit (distinct) deeplink."""
+    return d.DeeplinkTestCase(
+        test_id=test_id,
+        deep_link=deep_link,
+        user_type="Premium",
+        expected_result=expected,
+        installed=True,
+    )
+
+
+class InstalledCaseIsolationTests(unittest.TestCase):
+    """Each installed case is process-isolated: batch prep (install+login+warm-up)
+    happens exactly once, then every case is triggered by its OWN deeplink (which
+    launches the app) and the app is ALWAYS stopped when the case finishes -
+    including on failure or an unexpected error - so the next case starts fresh.
+    The uninstalled flow is untouched."""
+
+    def test_batch_prep_once_then_each_case_deeplink_then_stop(self):
+        judge = _ScriptedJudge([(True, "ok"), (True, "ok")])
+        warm = _CountingWarmUp()
+        login = _FakeLogin()
+        runner, executor, _ = _make_runner(judge, warm_up=warm, login_flow=login)
+        ic1 = _icase_link("TC001", "myapp://open/one")
+        ic2 = _icase_link("TC002", "myapp://open/two")
+        report = runner.run([ic1, ic2])
+        # Batch preparation happened exactly once for the whole batch.
+        self.assertEqual(warm.n, 1)          # warm-up once, not per case
+        self.assertEqual(login.ready_calls, 1)  # login once, not per case
+        self.assertEqual(report.passed, 2)
+        # Each case: its OWN deeplink launches the app (no explicit launch), then
+        # the app is stopped when the case finishes, before the next case.
+        self.assertEqual(
+            executor.calls,
+            [
+                ("open_link", "myapp://open/one"),
+                ("stop_app", None),
+                ("open_link", "myapp://open/two"),
+                ("stop_app", None),
+            ],
+        )
+
+    def test_second_case_starts_with_deeplink_not_explicit_launch(self):
+        judge = _ScriptedJudge([(True, "ok"), (True, "ok")])
+        runner, executor, _ = _make_runner(judge)
+        ic1 = _icase_link("TC001", "myapp://open/one")
+        ic2 = _icase_link("TC002", "myapp://open/two")
+        runner.run([ic1, ic2])
+        # The action that begins TC002 (right after TC001's cleanup stop) is its
+        # deeplink - NOT a launch_app/open call.
+        idx_second_open = executor.calls.index(("open_link", "myapp://open/two"))
+        self.assertEqual(
+            executor.calls[idx_second_open - 1], ("stop_app", None)
+        )
+        self.assertNotIn(("launch_app", None), executor.calls)
+
+    def test_failed_installed_case_still_stops_app(self):
+        judge = _ScriptedJudge([(False, "no")])
+        runner, executor, _ = _make_runner(judge, max_attempts=1)
+        result = runner.run_installed_case(_icase("TCF"))
+        self.assertFalse(result.passed)
+        self.assertEqual(executor.calls[-1], ("stop_app", None))  # cleanup on FAIL
+
+    def test_installed_case_stops_app_even_when_verify_raises(self):
+        class _BoomJudge:
+            def evaluate(self, expected_result, observation):
+                raise RuntimeError("verify boom")
+
+        runner, executor, _ = _make_runner(_BoomJudge(), max_attempts=1)
+        with self.assertRaises(RuntimeError):
+            runner.run_installed_case(_icase("TCR"))
+        # The finally boundary guarantees cleanup even on an unexpected error.
+        self.assertIn(("stop_app", None), executor.calls)
+        self.assertEqual(executor.calls[-1], ("stop_app", None))
+
+    def test_uninstalled_case_not_stopped_by_installed_cleanup(self):
+        # The installed per-case stop is installed-only: the uninstalled flow's
+        # executor calls contain no case-cleanup stop_app (it re-establishes
+        # fresh state per attempt instead).
+        judge = _ScriptedJudge([(True, "ok")])
+        installer = _FakeInstaller()
+        login = _FakeLogin()
+        runner, executor, _ = _make_runner(
+            judge, installer=installer, login_flow=login
+        )
+        runner.run_uninstalled_case(_ucase("TCU"))
+        self.assertNotIn(("stop_app", None), executor.calls)
 
 
 if __name__ == "__main__":

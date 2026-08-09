@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -15,23 +17,65 @@ from .safety import infer_credential_kind
 APP_ID = "com.microsoft.office.officehubrow"
 
 
-# Env var used to hand a resolved secret to the Maestro subprocess. The
-# MAESTRO_ prefix lets Maestro read it from the process environment via
-# ${...} interpolation, so the value never appears in the flow YAML, in argv,
-# or in logs.
+# Env var carrying a resolved secret to Maestro. The MAESTRO_ prefix lets Maestro
+# read it via ${...} interpolation, so the value never enters the YAML, argv, or logs.
 MAESTRO_SECRET_ENV = "MAESTRO_APPPILOT_INPUT_SECRET"
 
-# How many characters to erase from a credential field before entering the
-# secret, so repeated entries replace rather than append. Generous upper bound.
+# Characters to erase from a credential field before entry so repeats replace
+# rather than append. Generous upper bound.
 CREDENTIAL_FIELD_ERASE_CHARS = 128
+
+# Maestro spins up an on-device driver app per invocation; on a busy/slow
+# emulator it can miss its startup window. This is an infra flake, not a real
+# action failure, so give the driver a longer startup budget and, on timeout,
+# reset the adb connection and retry a bounded number of times.
+_DRIVER_STARTUP_TIMEOUT_MARKER = "driver did not start up in time"
+_DRIVER_STARTUP_MAX_ATTEMPTS = 3
+_DRIVER_STARTUP_RETRY_DELAY = 3.0
+# Maestro reads this (milliseconds) to size its driver-startup wait; the default
+# is often too short on a loaded emulator right after install/uninstall/build.
+_DRIVER_STARTUP_TIMEOUT_ENV = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
+_DRIVER_STARTUP_TIMEOUT_MS = "120000"
 
 
 class MaestroHierarchyObserver:
-    def __init__(self, device_id: str, max_elements: int = 100) -> None:
+    # System-UI prefix always excluded from observations. The active IME package
+    # is resolved per device and appended in ``observe`` - an open keyboard adds
+    # 100+ key nodes that would crowd real controls out of the truncated tree.
+    _BASE_EXCLUDED_PREFIXES = ("com.android.systemui:",)
+
+    def __init__(
+        self,
+        device_id: str,
+        max_elements: int = 100,
+        *,
+        ime_package_provider=None,
+    ) -> None:
         self._device_id = device_id
         self._max_elements = max_elements
+        self._ime_provider = ime_package_provider
+        self._excluded_prefixes = self._BASE_EXCLUDED_PREFIXES
+        self._ime_resolved = False
+        # Bounded budget of blank-screen unblock attempts (BACK presses) per
+        # observer lifetime, so a persistently blank screen can never trigger a
+        # runaway sequence of BACK presses that would navigate out of the app.
+        self._popup_unblock_budget = int(
+            os.environ.get("APPPILOT_POPUP_UNBLOCK_BUDGET", "3")
+        )
+        self._popup_unblock_settle_seconds = float(
+            os.environ.get("APPPILOT_POPUP_UNBLOCK_SETTLE", "1.0")
+        )
 
     def observe(self) -> UIObservation:
+        self._ensure_excluded_prefixes()
+        observation = self._capture()
+        if self._is_blank(observation):
+            recovered = self._unblock_blank_screen()
+            if recovered is not None:
+                observation = recovered
+        return observation
+
+    def _capture(self) -> UIObservation:
         command = [
             "maestro",
             "--no-ansi",
@@ -59,6 +103,98 @@ class MaestroHierarchyObserver:
         self._collect(hierarchy, (), None, False, elements)
         return UIObservation(tuple(elements[: self._max_elements]))
 
+    @staticmethod
+    def _is_blank(observation: UIObservation) -> bool:
+        """True when no observed element carries any usable semantics.
+
+        Mirrors the label/id/clickable/input filter used everywhere else, so a
+        "blank" observation is exactly what the evaluator would see as
+        ``<no relevant UI elements>``."""
+        return not any(
+            e.label or e.resource_id or e.clickable or e.is_input
+            for e in observation.elements
+        )
+
+    def _unblock_blank_screen(self) -> "UIObservation | None":
+        """Recover a blank observation caused by a separate focused window.
+
+        Some app screens (e.g. the notification opt-in) fill the display yet host
+        their content in a separate window that grabs input focus. The hierarchy
+        dump only returns the focused window's tree, so it comes back blank and
+        the controls are invisible. When such a window is focused, press BACK to
+        return focus to the app's own window and re-capture. Deterministic - no
+        AI/OCR/coordinates/screenshots. Returns the recovered observation, or
+        None when the guard does not apply."""
+        if self._popup_unblock_budget <= 0:
+            return None
+        if not self._focused_window_is_popup():
+            return None
+        self._popup_unblock_budget -= 1
+        self._press_back()
+        time.sleep(self._popup_unblock_settle_seconds)
+        return self._capture()
+
+    def _focused_window_is_popup(self) -> bool:
+        """True when the focused window is a separate pop-up window not covered
+        by the hierarchy dump (read from ``dumpsys window`` mCurrentFocus)."""
+        try:
+            result = subprocess.run(
+                ["adb", "-s", self._device_id, "shell", "dumpsys", "window"],
+                check=False, capture_output=True, text=True, timeout=15,
+            )
+        except Exception:
+            return False
+        for line in (result.stdout or "").splitlines():
+            if "mCurrentFocus" in line and "pop-up window" in line.lower():
+                return True
+        return False
+
+    def _press_back(self) -> None:
+        subprocess.run(
+            ["adb", "-s", self._device_id, "shell", "input", "keyevent",
+             "KEYCODE_BACK"],
+            check=False, capture_output=True, text=True, timeout=15,
+        )
+
+    def _ensure_excluded_prefixes(self) -> None:
+        """Resolve the active IME package once and add it to the excluded set.
+
+        Generic across keyboards: the current input method is read from the
+        device rather than assuming a specific keyboard app. Best-effort - if the
+        lookup fails, only the system UI is excluded."""
+        if self._ime_resolved:
+            return
+        self._ime_resolved = True
+        try:
+            package = (self._ime_provider or self._query_ime_package)()
+        except Exception:
+            package = None
+        if package:
+            self._excluded_prefixes = self._excluded_prefixes + (f"{package}:",)
+
+    def _query_ime_package(self) -> "str | None":
+        result = subprocess.run(
+            [
+                "adb",
+                "-s",
+                self._device_id,
+                "shell",
+                "settings",
+                "get",
+                "secure",
+                "default_input_method",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        value = (result.stdout or "").strip()
+        if not value or value == "null":
+            return None
+        # e.g. "com.google.android.inputmethod.latin/com.android...LatinIME".
+        return value.split("/", 1)[0]
+
     def _collect(
         self,
         node: dict,
@@ -70,7 +206,7 @@ class MaestroHierarchyObserver:
         attributes = node.get("attributes", {})
         element_id = "e:" + (".".join(map(str, path)) if path else "root")
         resource_id = self._clean(attributes.get("resource-id"), limit=200)
-        system_ui = in_system_ui or resource_id.startswith("com.android.systemui:")
+        system_ui = in_system_ui or resource_id.startswith(self._excluded_prefixes)
         text = self._clean(attributes.get("text"))
         accessibility_text = self._clean(attributes.get("accessibilityText"))
         hint_text = self._clean(attributes.get("hintText"))
@@ -79,11 +215,9 @@ class MaestroHierarchyObserver:
         enabled = self._as_bool(attributes.get("enabled", node.get("enabled")), True)
         is_input = class_name.endswith("EditText") or "TextInput" in class_name
 
-        # Redact credential fields: once a secret (e.g. a password) is typed, it
-        # appears as this field's live text/accessibility value in the hierarchy.
-        # Drop those value-bearing fields so the secret never reaches the
-        # observation, label, model prompt, or execution trace. The stable hint
-        # (e.g. "Password") is kept as a safe descriptor.
+        # Safety: drop the live text/accessibility value of a credential field so
+        # a typed secret never reaches the observation, prompt, or trace. The
+        # stable hint (e.g. "Password") is kept as a safe descriptor.
         field_credential_kind = (
             infer_credential_kind(resource_id, hint_text, class_name, accessibility_text)
             if is_input
@@ -127,10 +261,28 @@ class MaestroHierarchyObserver:
                     enabled=enabled,
                     is_input=is_input,
                     label=label,
+                    bounds=self._parse_bounds(attributes.get("bounds")),
                 )
             )
 
-        return self._unique(own_labels + child_labels)[:8]
+        return [] if system_ui else self._unique(own_labels + child_labels)[:8]
+
+    @staticmethod
+    def _parse_bounds(value: object) -> "tuple[int, int, int, int] | None":
+        """Parse Maestro/UIAutomator bounds ("[left,top][right,bottom]").
+
+        Used to tap a clickable node by its own centre point when it has no
+        stable id/text selector, so the touch lands on the element itself rather
+        than a merged descendant that may report zero bounds."""
+        if not isinstance(value, str):
+            return None
+        numbers = re.findall(r"-?\d+", value)
+        if len(numbers) != 4:
+            return None
+        left, top, right, bottom = (int(n) for n in numbers)
+        if right < left or bottom < top:
+            return None
+        return (left, top, right, bottom)
 
     @staticmethod
     def _clean(value: object, limit: int = 240) -> str:
@@ -163,8 +315,21 @@ class MaestroExecutor:
         observation: UIObservation,
         secret: str | None = None,
     ) -> None:
-        commands = self._commands_for(action, observation, secret is not None)
-        self._run_flow(commands, secret=secret)
+        if action.kind == ActionKind.PRESS_BACK:
+            self._run_flow("- pressKey: BACK\n")
+            return
+
+        target = observation.find(action.target_id)
+        if target is None:
+            raise ValueError("Cannot execute an action without an observed target")
+
+        if action.kind == ActionKind.TAP:
+            self._tap(target)
+            return
+        if action.kind == ActionKind.INPUT_TEXT:
+            self._input_text(action, target, secret)
+            return
+        raise ValueError(f"Unsupported action kind: {action.kind}")
 
     def open_link(self, deep_link: str) -> None:
         """Launch an exact deep link deterministically via Maestro ``openLink``.
@@ -179,35 +344,92 @@ class MaestroExecutor:
         """Launch the app (used e.g. by first-install warm-up)."""
         self._run_flow(f"- launchApp: {json.dumps(self._app_id)}\n")
 
+    def launch_app_via_adb(self, timeout: float = 30) -> None:
+        """Launch the freshly installed app directly via adb (monkey LAUNCHER).
+
+        Deterministic CLI launch - NOT the Play Store "Open" button (whose
+        Maestro tap can silently no-op) and NOT re-firing the deeplink. The app
+        recovers the pending (deferred) deeplink itself on this launch, so no
+        deeplink intent needs to be re-sent. Uses the package's default launcher
+        activity, so no activity name needs to be known in advance.
+        """
+        result = self._run_adb(
+            [
+                "shell",
+                "monkey",
+                "-p",
+                self._app_id,
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "1",
+            ],
+            timeout=timeout,
+        )
+        combined = f"{result.stdout or ''}{result.stderr or ''}"
+        # monkey exits 0 and prints an error line when it cannot find a launchable
+        # activity, so treat that as a genuine failure rather than a launch.
+        if result.returncode != 0 or "No activities found" in combined:
+            raise RuntimeError(
+                f"adb launch failed for {self._app_id}: {combined.strip()}"
+            )
+
     def stop_app(self) -> None:
         """Force-stop (kill) the app."""
         self._run_flow(f"- stopApp: {json.dumps(self._app_id)}\n")
-
-    def tap_text(self, text: str, timeout: float = 180) -> None:
-        """Deterministically tap a control by its visible text via Maestro.
-
-        Used for best-effort Play Store buttons (e.g. "Install"/"Open"). This is
-        a deterministic text selector - NOT a coordinate tap and NOT AI-driven.
-        """
-        self._run_flow(f"- tapOn:\n    text: {json.dumps(text)}\n", timeout=timeout)
 
     def is_installed(self) -> bool:
         """Return whether the app package is currently installed (via adb)."""
         result = self._run_adb(["shell", "pm", "list", "packages", self._app_id])
         return f"package:{self._app_id}" in (result.stdout or "")
 
+    def is_foreground(self, timeout: float = 15) -> bool:
+        """Return whether the target app package is the foreground (resumed) app.
+
+        Deterministic Android state check via adb ``dumpsys`` - NOT a UI heuristic
+        and NOT AI-driven. Used to confirm the app actually came to the foreground
+        after the store window's "Open" button is tapped, so a successful tap is
+        never mistaken for the app actually launching. A tap can report success
+        while the store window (e.g. Google Play) is still foreground; only the
+        resumed-activity package proves the app is really open.
+        """
+        result = self._run_adb(
+            ["shell", "dumpsys", "activity", "activities"], timeout=timeout
+        )
+        for line in (result.stdout or "").splitlines():
+            stripped = line.strip()
+            # `mResumedActivity` / `topResumedActivity` name the currently
+            # foreground activity; the app is foreground only if its package owns
+            # that resumed activity.
+            if "ResumedActivity" in stripped and self._app_id in stripped:
+                return True
+        return False
+
     def uninstall_app(self) -> None:
         """Uninstall the app package via adb (best-effort; no-op if absent)."""
         self._run_adb(["uninstall", self._app_id])
 
-    def ensure_uninstalled(self) -> None:
+    def ensure_uninstalled(self) -> bool:
         """Guarantee a genuinely fresh (uninstalled) app before a first-open test.
 
-        Clearing app data is not sufficient for a true first-install scenario, so
-        this removes the APK entirely when present.
+        Clearing app data is not enough for a true first-install, so this removes
+        the APK entirely when present. Returns True iff an app was actually
+        uninstalled (False if already absent).
         """
         if self.is_installed():
             self.uninstall_app()
+            return True
+        return False
+
+    def install_apk(self, apk_path: str, timeout: float = 300) -> None:
+        """Install a local APK via adb (reinstall if already present).
+
+        Deterministic replacement for tapping the Play Store "Install" button: we
+        install the locally built app directly onto the device.
+        """
+        result = self._run_adb(["install", "-r", apk_path], timeout=timeout)
+        combined = f"{result.stdout or ''}{result.stderr or ''}"
+        if result.returncode != 0 or "Success" not in combined:
+            raise RuntimeError(f"adb install failed for {apk_path}: {combined.strip()}")
 
     def _run_adb(
         self, args: Sequence[str], timeout: float = 180
@@ -220,6 +442,26 @@ class MaestroExecutor:
             timeout=timeout,
         )
 
+    def _reset_adb_connection(self, timeout: float = 60) -> None:
+        """Restart the adb server and wait for the device to reattach.
+
+        The reliable recovery for a stuck Maestro driver: a fresh adb server
+        clears the wedged driver connection so the next attempt starts clean.
+        Best-effort - failures here are swallowed so the caller can still retry.
+        """
+        for args in (["kill-server"], ["start-server"]):
+            try:
+                subprocess.run(
+                    ["adb", *args], check=False,
+                    capture_output=True, text=True, timeout=timeout,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
+        try:
+            self._run_adb(["wait-for-device"], timeout=timeout)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
     def _run_flow(
         self,
         commands: str,
@@ -227,12 +469,16 @@ class MaestroExecutor:
         timeout: float = 60,
     ) -> None:
         flow = f"appId: {self._app_id}\n---\n{commands}"
+        # Give the Maestro driver a longer startup budget on loaded emulators.
         # For credential inputs the secret is never written to the flow file; it
-        # is passed to Maestro through a MAESTRO_-prefixed environment variable
-        # and interpolated as ${...}. This keeps it out of the YAML, argv and logs.
-        run_env: dict[str, str] | None = None
+        # is passed via a MAESTRO_-prefixed env var and interpolated as ${...},
+        # keeping it out of the YAML, argv and logs.
+        run_env: dict[str, str] = {
+            **os.environ,
+            _DRIVER_STARTUP_TIMEOUT_ENV: _DRIVER_STARTUP_TIMEOUT_MS,
+        }
         if secret is not None:
-            run_env = {**os.environ, MAESTRO_SECRET_ENV: secret}
+            run_env[MAESTRO_SECRET_ENV] = secret
         flow_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -244,67 +490,120 @@ class MaestroExecutor:
                 flow_file.write(flow)
                 flow_path = Path(flow_file.name)
 
-            result = subprocess.run(
-                [
-                    "maestro",
-                    "--no-ansi",
-                    "--udid",
-                    self._device_id,
-                    "test",
-                    str(flow_path),
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=run_env,
-            )
-            if result.returncode != 0:
-                error = result.stderr.strip() or result.stdout.strip()
-                # Never let a resolved secret surface via an error message, even
-                # if Maestro echoes the interpolated value in its output.
-                if secret:
-                    error = error.replace(secret, "***")
-                raise RuntimeError(f"Maestro action execution failed: {error}")
+            for attempt in range(1, _DRIVER_STARTUP_MAX_ATTEMPTS + 1):
+                result = subprocess.run(
+                    [
+                        "maestro",
+                        "--no-ansi",
+                        "--udid",
+                        self._device_id,
+                        "test",
+                        str(flow_path),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=run_env,
+                )
+                if result.returncode != 0:
+                    error = result.stderr.strip() or result.stdout.strip()
+                    # Never let a resolved secret surface via an error message,
+                    # even if Maestro echoes the interpolated value in its output.
+                    if secret:
+                        error = error.replace(secret, "***")
+                    # Retry only the Maestro driver-startup flake; real action
+                    # failures still raise on the first attempt.
+                    if (
+                        _DRIVER_STARTUP_TIMEOUT_MARKER in error.lower()
+                        and attempt < _DRIVER_STARTUP_MAX_ATTEMPTS
+                    ):
+                        print(
+                            f"[MAESTRO] driver startup timeout "
+                            f"(attempt {attempt}/{_DRIVER_STARTUP_MAX_ATTEMPTS}); "
+                            "resetting adb and retrying"
+                        )
+                        self._reset_adb_connection()
+                        time.sleep(_DRIVER_STARTUP_RETRY_DELAY)
+                        continue
+                    raise RuntimeError(f"Maestro action execution failed: {error}")
+                return
         finally:
             if flow_path:
                 flow_path.unlink(missing_ok=True)
 
-    def _commands_for(
-        self,
-        action: Action,
-        observation: UIObservation,
-        use_secret: bool,
-    ) -> str:
-        if action.kind == ActionKind.PRESS_BACK:
-            return "- pressKey: BACK\n"
+    def _tap(self, target: UIElement) -> None:
+        kind, payload = self._tap_command(target)
+        if kind == "point":
+            self._tap_point(*payload)
+        else:
+            self._run_flow(payload)
 
-        target = observation.find(action.target_id)
-        if target is None:
-            raise ValueError("Cannot execute an action without an observed target")
-        selector = self._selector(target)
+    def _input_text(
+        self, action: Action, target: UIElement, secret: str | None
+    ) -> None:
+        use_secret = secret is not None
+        if action.credential_kind is not None or use_secret:
+            # Clear any existing/accumulated content first so repeated entry
+            # replaces rather than appends, then inject the secret via the
+            # environment placeholder (never the literal value in the YAML).
+            follow = (
+                f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n"
+                f"- inputText: ${{{MAESTRO_SECRET_ENV}}}\n"
+            )
+        else:
+            follow = f"- inputText: {json.dumps(action.input_text)}\n"
 
-        if action.kind == ActionKind.TAP:
-            return f"- tapOn:\n{selector}"
-        if action.kind == ActionKind.INPUT_TEXT:
-            if action.credential_kind is not None or use_secret:
-                # Clear any existing/accumulated content first so repeated entry
-                # replaces rather than appends, then inject the secret via the
-                # environment placeholder (never the literal value in the YAML).
-                return (
-                    f"- tapOn:\n{selector}"
-                    f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n"
-                    f"- inputText: ${{{MAESTRO_SECRET_ENV}}}\n"
-                )
-            value = json.dumps(action.input_text)
-            return f"- tapOn:\n{selector}- inputText: {value}\n"
-        raise ValueError(f"Unsupported action kind: {action.kind}")
+        kind, payload = self._tap_command(target)
+        if kind == "point":
+            # The field is focused by the coordinate tap, then typed into by a
+            # separate Maestro flow (eraseText/inputText act on the focused
+            # field, so no in-flow tapOn is required).
+            self._tap_point(*payload)
+            self._run_flow(follow, secret=secret)
+        else:
+            self._run_flow(payload + follow, secret=secret)
 
-    @staticmethod
-    def _selector(target: UIElement) -> str:
+    def _tap_point(self, x: int, y: int) -> None:
+        """Deliver a coordinate tap through adb's input pipeline.
+
+        Maestro's ``tapOn: point`` can silently no-op on Compose surfaces: it
+        reports COMPLETED but the synthesized gesture is never registered by the
+        app, so nothing advances (observed on the sign-in "Continue with
+        Microsoft" button and the store "Open" button). ``adb shell input tap``
+        injects a real tap that the app receives, so it is used for every
+        coordinate tap.
+        """
+        self._run_adb(["shell", "input", "tap", str(x), str(y)])
+
+    @classmethod
+    def _tap_command(cls, target: UIElement) -> "tuple[str, object]":
+        """Resolve the most reliable tap for a target.
+
+        Returns ``("flow", yaml)`` for a Maestro selector-based tap or
+        ``("point", (x, y))`` for a coordinate tap delivered via adb.
+
+        Preference order:
+        1. ``id`` - a stable resource id is the safest, visibility-checked match.
+        2. own ``text`` - only text that belongs to THIS node (see
+           UIElement.own_text); a merged descendant label is NOT used here
+           because Maestro would resolve it to the child node.
+        3. ``point`` - the node's own centre (tapped via adb), so a clickable
+           element with no id and no own text (a Compose button whose caption
+           lives on a child) is tapped exactly on itself. Maestro's own point
+           tap is unreliable on Compose, so this goes through adb.
+        4. label ``text`` - last-resort match by the merged label, used only when
+           the node has no bounds to compute a centre from.
+        """
         if target.resource_id:
-            return f"    id: {json.dumps(target.resource_id)}\n"
-        if target.selector_text:
-            return f"    text: {json.dumps(target.selector_text)}\n"
+            return ("flow", f"- tapOn:\n    id: {json.dumps(target.resource_id)}\n")
+        own_text = target.own_text
+        if own_text:
+            return ("flow", f"- tapOn:\n    text: {json.dumps(own_text)}\n")
+        center = target.center
+        if center is not None:
+            return ("point", center)
+        if target.label:
+            return ("flow", f"- tapOn:\n    text: {json.dumps(target.label)}\n")
         raise ValueError("Observed target has no safe Maestro selector")
 

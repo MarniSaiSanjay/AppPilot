@@ -13,10 +13,8 @@ def infer_credential_kind(
 ) -> CredentialKind | None:
     """Infer whether an input field is a username/email or password field.
 
-    Inference uses only stable, non-secret UI signals (resource id, hint,
-    class name, and any caller-supplied extra identifiers) and never the field's
-    live text value. Shared by the observer (to redact secrets) and the safety
-    validator (to build/validate credential actions).
+    Uses only stable non-secret signals (resource id, hint, class, extra), never
+    the live text. Shared by the observer (redaction) and the safety validator.
     """
     haystack = " ".join((resource_id, hint_text, class_name, extra)).casefold()
     password_markers = ("password", "passwd", "textpassword", "i0118")
@@ -112,9 +110,9 @@ class SafetyValidator:
             if not target.is_input:
                 raise ValueError("Text input target is not an observed input field")
             if action.credential_kind is not None:
-                # The secret is resolved locally after validation, so input_text
-                # is intentionally empty here; verify the field really is that
-                # kind of credential field so the model cannot redirect it.
+                # Secret is resolved locally after validation (input_text empty
+                # here); verify the field really is that credential kind so the
+                # model cannot redirect it.
                 if self.credential_kind(target) != action.credential_kind:
                     raise ValueError(
                         "Credential input kind does not match the observed field"
@@ -126,10 +124,8 @@ class SafetyValidator:
     def credential_kind(element: UIElement) -> CredentialKind | None:
         """Safely infer whether an input is a username/email or password field.
 
-        Delegates to :func:`infer_credential_kind`, which uses only non-secret
-        UI signals. Detection relies on resource id / hint / class, all of which
-        survive the observer's redaction of credential-field values.
-        """
+        Delegates to :func:`infer_credential_kind` (non-secret signals only,
+        which survive the observer's redaction)."""
         if not element.is_input:
             return None
         return infer_credential_kind(

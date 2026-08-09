@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
+from typing import Callable
 
 from .android import MaestroExecutor, MaestroHierarchyObserver
 from .brain import DecisionRequest, ModelDecisionProvider
-from .models import ExecutionContext, GoalEvaluator, RuntimeContext
+from . import logtags
+from .models import (
+    ActionKind,
+    ExecutionContext,
+    GoalEvaluator,
+    RuntimeContext,
+    UIObservation,
+)
 from .safety import SafetyValidator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -18,6 +27,13 @@ DEFAULT_MAX_ACTIONS = 30
 # Stop with a controlled FAIL after this many actions without a meaningful UI
 # change. Configurable via --max-stuck-actions or APPPILOT_MAX_STUCK_ACTIONS.
 DEFAULT_MAX_STUCK_ACTIONS = 5
+# Generic loading/transition handling: when the goal is not reached AND the
+# screen exposes no actionable UI (a transient loading/sync state), the agent
+# waits this long and re-observes instead of asking the Brain to invent an
+# action. Bounded by DEFAULT_MAX_NONACTIONABLE_WAITS so it can never loop
+# forever. These are deliberately generic (no string/coordinate detection).
+DEFAULT_NONACTIONABLE_WAIT_SECONDS = 2.0
+DEFAULT_MAX_NONACTIONABLE_WAITS = 10
 
 
 class AppPilotAgent:
@@ -31,6 +47,11 @@ class AppPilotAgent:
         max_actions: int,
         runtime_context: RuntimeContext,
         max_stuck_actions: int = DEFAULT_MAX_STUCK_ACTIONS,
+        sleep: "Callable[[float], None]" = time.sleep,
+        nonactionable_wait_seconds: float = DEFAULT_NONACTIONABLE_WAIT_SECONDS,
+        max_nonactionable_waits: int = DEFAULT_MAX_NONACTIONABLE_WAITS,
+        actionable_step_check: "Callable[[object], bool] | None" = None,
+        log_tag: str = "",
     ) -> None:
         self._observer = observer
         self._goal_evaluator = goal_evaluator
@@ -40,13 +61,38 @@ class AppPilotAgent:
         self._max_actions = max_actions
         self._runtime_context = runtime_context
         self._max_stuck_actions = max_stuck_actions
+        self._sleep = sleep
+        self._nonactionable_wait_seconds = nonactionable_wait_seconds
+        self._max_nonactionable_waits = max_nonactionable_waits
+        # Optional domain gate: returns True only when the observation presents a
+        # genuine actionable step for THIS flow, so an incidental control (e.g. a
+        # "Terms of use" link on a loading splash) is not mistaken for one. When
+        # None, any non-Back action counts as actionable.
+        self._actionable_step_check = actionable_step_check
+        # Optional subsystem tag (e.g. "LOGIN") prefixed to every emitted line so
+        # the trace is greppable and this run's PASS is never read as a whole test
+        # case passing. Empty => untagged lines (generic reuse).
+        self._log_tag = log_tag
+
+    def _emit(self, text: str) -> None:
+        """Print one log entry, prefixed with the subsystem tag when set."""
+        print(logtags.prefix(self._log_tag, text))
+
+    def _log_goal_reached(self, reached: bool) -> None:
+        self._emit(f"GOAL REACHED:\n{str(reached).lower()}\n")
+
+    def _log_pass(self) -> None:
+        self._emit("RESULT:\nPASS")
+
+    def _log_fail(self, detail: str) -> None:
+        self._emit(f"RESULT:\nFAIL - {detail}")
 
     def run(self, goal: str, guidance: str | None = None) -> bool:
-        print(f"GOAL:\n{goal}\n")
+        self._emit(f"GOAL:\n{goal}\n")
         if guidance:
-            print(f"GUIDANCE:\n{guidance}\n")
-        print(f"MAX ACTIONS:\n{self._max_actions}\n")
-        print(f"MAX STUCK ACTIONS:\n{self._max_stuck_actions}\n")
+            self._emit(f"GUIDANCE:\n{guidance}\n")
+        self._emit(f"MAX ACTIONS:\n{self._max_actions}\n")
+        self._emit(f"MAX STUCK ACTIONS:\n{self._max_stuck_actions}\n")
 
         history: list[str] = []
         # Track the last credential we entered and the screen it was entered on,
@@ -58,13 +104,44 @@ class AppPilotAgent:
         consecutive_stuck = 0
         for step in range(self._max_actions + 1):
             observation = self._observer.observe()
-            print(f"OBSERVE:\n{observation.describe()}\n")
+            self._emit(f"OBSERVE:\n{observation.describe()}\n")
 
             reached = self._goal_evaluator.is_reached(goal, observation)
-            print(f"GOAL REACHED:\n{str(reached).lower()}\n")
+            self._log_goal_reached(reached)
             if reached:
-                print("RESULT:\nPASS")
+                self._log_pass()
                 return True
+
+            # Loading/transition invariant: when the goal is not reached and no
+            # actionable step exists, wait and re-observe (never invent an action
+            # or a diagnostic Back) until a step appears, the goal is reached, or
+            # the wait budget is exhausted.
+            available_actions = self._safety_validator.available_actions(observation)
+            waits = 0
+            while not self._has_actionable_step(observation, available_actions):
+                if waits >= self._max_nonactionable_waits:
+                    self._log_fail(
+                        f"no actionable step appeared after {waits} wait(s); app "
+                        "stayed in a loading/transition state with no "
+                        "login/onboarding action to take"
+                    )
+                    return False
+                waits += 1
+                self._emit(
+                    "WAIT:\nno actionable step; re-observing "
+                    f"({waits}/{self._max_nonactionable_waits})\n"
+                )
+                self._sleep(self._nonactionable_wait_seconds)
+                observation = self._observer.observe()
+                self._emit(f"OBSERVE:\n{observation.describe()}\n")
+                reached = self._goal_evaluator.is_reached(goal, observation)
+                self._log_goal_reached(reached)
+                if reached:
+                    self._log_pass()
+                    return True
+                available_actions = self._safety_validator.available_actions(
+                    observation
+                )
 
             # Advance the stuck counter when the last action left the meaningful
             # UI unchanged; a meaningful change resets it. Only counts once an
@@ -75,19 +152,18 @@ class AppPilotAgent:
                     consecutive_stuck += 1
                 else:
                     consecutive_stuck = 0
-            print(f"PROGRESS:\nstuck {consecutive_stuck}/{self._max_stuck_actions}\n")
+            self._emit(f"PROGRESS:\nstuck {consecutive_stuck}/{self._max_stuck_actions}\n")
             if consecutive_stuck >= self._max_stuck_actions:
-                print(
-                    "RESULT:\nFAIL - agent appears stuck: no meaningful UI change "
-                    f"for {consecutive_stuck} consecutive actions"
+                self._log_fail(
+                    "agent appears stuck: no meaningful UI change for "
+                    f"{consecutive_stuck} consecutive actions"
                 )
                 return False
 
             if step == self._max_actions:
-                print(f"RESULT:\nFAIL - action/step limit reached ({self._max_actions})")
+                self._log_fail(f"action/step limit reached ({self._max_actions})")
                 return False
 
-            available_actions = self._safety_validator.available_actions(observation)
             request = DecisionRequest(
                 goal=goal,
                 guidance=guidance,
@@ -101,14 +177,14 @@ class AppPilotAgent:
             decision = self._decision_provider.decide(request)
 
             if decision.action is None:
-                print(
+                self._emit(
                     "MODEL DECISION:\ncannot safely proceed\n"
                     f"Reason: {decision.reason}\n"
                 )
-                print("RESULT:\nFAIL - model cannot safely proceed")
+                self._log_fail("model cannot safely proceed")
                 return False
 
-            print(
+            self._emit(
                 f"MODEL DECISION:\n{decision.action.describe(observation)}\n"
                 f"Reason: {decision.reason}\n"
             )
@@ -116,10 +192,10 @@ class AppPilotAgent:
             try:
                 self._safety_validator.validate(decision.action, observation)
             except ValueError as error:
-                print(f"SAFETY VALIDATION:\nrejected - {error}\n")
-                print("RESULT:\nFAIL - model proposed an unsafe or invalid action")
+                self._emit(f"SAFETY VALIDATION:\nrejected - {error}\n")
+                self._log_fail("model proposed an unsafe or invalid action")
                 return False
-            print("SAFETY VALIDATION:\npassed\n")
+            self._emit("SAFETY VALIDATION:\npassed\n")
 
             # Resolve any requested credential locally, after safety validation.
             # The secret value is never printed and never leaves this scope
@@ -128,12 +204,12 @@ class AppPilotAgent:
             action = decision.action
             if action.credential_kind is not None:
                 if not self._runtime_context.has(action.credential_kind):
-                    print(
+                    self._emit(
                         "CREDENTIAL:\nrequired "
                         f"{action.credential_kind.value} is not configured\n"
                     )
-                    print(
-                        "RESULT:\nFAIL - required credential is not configured "
+                    self._log_fail(
+                        "required credential is not configured "
                         f"({action.credential_kind.value})"
                     )
                     return False
@@ -153,14 +229,13 @@ class AppPilotAgent:
                     credential_key == last_credential_key
                     and fingerprint == last_credential_fingerprint
                 ):
-                    print(
+                    self._emit(
                         "CREDENTIAL:\n"
                         f"{action.credential_kind.value} already entered on this "
                         "screen; UI unchanged\n"
                     )
-                    print(
-                        "RESULT:\nFAIL - repeated credential entry with no UI "
-                        "change (possible loop)"
+                    self._log_fail(
+                        "repeated credential entry with no UI change (possible loop)"
                     )
                     return False
 
@@ -168,13 +243,47 @@ class AppPilotAgent:
                 last_credential_key = credential_key
                 last_credential_fingerprint = fingerprint
 
-            print(f"ACTION:\n{action.describe(observation)}\n")
+            self._emit(f"ACTION:\n{action.describe(observation)}\n")
             self._executor.execute(action, observation, secret=secret)
             history.append(action.describe(observation))
             # Remember the state we just acted on, to detect progress next step.
             last_acted_fingerprint = meaningful_fingerprint
 
         raise AssertionError("Agent loop exited unexpectedly")
+
+    def _has_actionable_step(self, observation, available_actions) -> bool:
+        """Whether the agent should act now, or wait/re-observe instead.
+
+        Two conditions must hold:
+
+        1. The observation exposes at least one non-Back action (otherwise the
+           screen is a blank/loading state - only the global Back is available).
+        2. If a domain ``actionable_step_check`` was injected, it must also agree
+           this screen presents a genuine step for the current flow. This is what
+           stops a transient "loading accounts" splash - which happens to carry an
+           incidental clickable "Terms of use" link - from being treated as
+           actionable and handed to the Brain, where the model would otherwise
+           choose a diagnostic Back because no login/onboarding control is visible
+           yet. When the check is absent, behaviour is the purely generic rule.
+        """
+        if not self._has_actionable_ui(available_actions):
+            return False
+        if self._actionable_step_check is not None:
+            return bool(self._actionable_step_check(observation))
+        return True
+
+    @staticmethod
+    def _has_actionable_ui(available_actions) -> bool:
+        """True if any available action targets a UI element (not just Back).
+
+        SafetyValidator.available_actions always appends a single global
+        PRESS_BACK. A result containing ONLY that means the observation exposed
+        no actionable element - a blank/loading/transition screen - and the
+        Brain must not be asked to invent an action against it.
+        """
+        return any(
+            action.kind != ActionKind.PRESS_BACK for action in available_actions
+        )
 
     @staticmethod
     def _observation_fingerprint(observation: UIObservation) -> tuple:
