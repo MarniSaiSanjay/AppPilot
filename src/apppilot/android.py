@@ -354,6 +354,42 @@ class MaestroExecutor:
         """
         self._run_flow('- tapOn:\n    text: "Open"\n', timeout=timeout)
 
+    def open_store_page(self, timeout: float = 60) -> None:
+        """Open the app's Play Store details page via a deterministic adb intent.
+
+        Fires ``market://details?id=<package>`` with ``am start`` so the store
+        lands on this app's page ready for the Install button. Pure adb intent -
+        no coordinates, OCR, screenshots, or model.
+        """
+        result = self._run_adb(
+            [
+                "shell",
+                "am",
+                "start",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                f"market://details?id={self._app_id}",
+            ],
+            timeout=timeout,
+        )
+        combined = f"{result.stdout or ''}{result.stderr or ''}"
+        if result.returncode != 0 or "Error" in combined:
+            raise RuntimeError(
+                f"adb could not open Play Store page for {self._app_id}: "
+                f"{combined.strip()}"
+            )
+
+    def tap_store_install_button(self, timeout: float = 120) -> None:
+        """Tap the Play Store "Install" button via Maestro (deterministic text tap).
+
+        Mirrors the "Open" button tap: a text-based Maestro tap that waits for the
+        button to appear. No coordinates, OCR, screenshots, or model. The caller
+        confirms the install actually completed via a deterministic
+        ``pm list packages`` poll (``is_installed``).
+        """
+        self._run_flow('- tapOn:\n    text: "Install"\n', timeout=timeout)
+
     def launch_app_via_adb(self, timeout: float = 30) -> None:
         """Launch the app via its default launcher activity (adb monkey LAUNCHER).
 

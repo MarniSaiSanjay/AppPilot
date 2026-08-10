@@ -55,6 +55,40 @@ design principles.
 The prototype targets the Office hub app id
 `com.microsoft.office.officehubrow`.
 
+### Automatic preflight
+
+Every run starts with a single preflight gate that verifies the prerequisites
+up front and fails fast (with an actionable message) instead of crashing
+mid-run. In order, it checks: Python 3.11+, the Maestro CLI, the evaluation
+model config, the deeplink test-cases workbook, the chosen **APK source** (see
+below) and its prerequisites, and a usable device — **auto-starting an emulator
+when none is connected**.
+
+**APK source** — AppPilot asks how to get the officemobile app onto the device,
+so a local build is optional:
+
+- `build` — build a fresh local APK from the Office Mobile enlistment (needs the
+  enlistment path **and** the build toolchain: JDK 17 + the `omrdroid` CLI).
+- `existing` — install a prebuilt APK you already have (you provide the path;
+  no enlistment or build tools required).
+- `playstore` — install the app **from the Play Store** when it is missing
+  (AppPilot opens the store page and taps Install, then waits until the package
+  is really installed); if it is already installed it is left as-is. It never
+  uninstalls a store app, so it cannot reproduce the genuine uninstalled
+  first-open flow — UNINSTALLED cases run against the installed app (AppPilot
+  warns when it sees them). No enlistment or build tools required.
+
+The choice is remembered but **re-confirmed on every interactive run** (the saved
+value is shown as the default — just press Enter to keep it), so you can switch
+sources at any time.
+
+The paths it cannot auto-detect — the **test-cases workbook**, the **Office
+Mobile enlistment** (build only), and the **prebuilt APK** (existing only) — are
+only prompted for when they are not found at their saved/default location, and
+your answer is **remembered** in `~/.apppilot/config.json` so you are never asked
+again (delete that file, or the relevant key, to be re-prompted). You can also
+point at a non-default enlistment directly with `APPPILOT_OM_ENLISTMENT`.
+
 ## Configuration
 
 AppPilot reads all configuration from environment variables. A local, **git-

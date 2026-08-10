@@ -25,6 +25,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import apppilot_agent as a  # noqa: E402
 import deeplink_runner as d  # noqa: E402
 from apppilot import email_report  # noqa: E402
+from apppilot.preflight import device_check  # noqa: E402
+from apppilot.preflight import emulator_autostart as emulator_node  # noqa: E402
+from apppilot.preflight import maestro_check  # noqa: E402
+from apppilot.preflight import build_tools_check  # noqa: E402
+from apppilot.preflight import apk_source  # noqa: E402
+from apppilot.preflight import results  # noqa: E402
+from apppilot.preflight import model_check  # noqa: E402
+from apppilot.preflight import credentials_check  # noqa: E402
+from apppilot.preflight import python_check  # noqa: E402
+from apppilot.preflight import path_setup  # noqa: E402
+from apppilot.preflight.config_store import ConfigStore  # noqa: E402
+from apppilot import preflight as preflight_node  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_XLSX = REPO_ROOT / "testcases" / "deeplinks" / "deeplink_tests.xlsx"
@@ -905,6 +917,118 @@ class LocalApkInstallerTests(unittest.TestCase):
         exe = self._FakeExec()
         self._installer(exe).install_fresh()
         self.assertEqual(exe.events, [("install_apk", "/tmp/officemobile.apk")])
+
+
+class PlayStoreInstallerTests(unittest.TestCase):
+    class _FakeExec:
+        def __init__(self, *, installed_after=0, foreground_after=0):
+            self.events = []
+            # is_installed() returns False until this many calls have been made
+            # (0 = already installed on the very first check).
+            self._installed_after = installed_after
+            self._installed_calls = 0
+            self._foreground_after = foreground_after
+            self._foreground_calls = 0
+
+        def is_installed(self):
+            self.events.append("is_installed")
+            self._installed_calls += 1
+            return self._installed_calls > self._installed_after
+
+        def open_store_page(self, timeout=60):
+            self.events.append("open_store_page")
+
+        def tap_store_install_button(self, timeout=120):
+            self.events.append("tap_store_install_button")
+
+        def launch_app_via_adb(self, timeout=30):
+            self.events.append("launch_app_via_adb")
+
+        def launch_app_via_open_btn_click(self, timeout=60):
+            self.events.append("launch_app_via_open_btn_click")
+
+        def is_foreground(self, timeout=15):
+            self.events.append("is_foreground")
+            self._foreground_calls += 1
+            return self._foreground_calls > self._foreground_after
+
+    def _installer(self, exe, **kw):
+        kw.setdefault("foreground_poll_seconds", 0)
+        kw.setdefault("install_poll_seconds", 0)
+        return d.PlayStoreInstaller(exe, **kw)
+
+    def test_install_fresh_installs_from_store_when_missing(self):
+        # App absent -> open the store page -> tap Install -> poll pm until the
+        # package is really installed. No adb install, no local APK.
+        exe = self._FakeExec(installed_after=1)
+        self._installer(exe).install_fresh()
+        self.assertEqual(
+            exe.events,
+            [
+                "is_installed",  # guard: not installed yet
+                "open_store_page",
+                "tap_store_install_button",
+                "is_installed",  # poll: now installed
+            ],
+        )
+
+    def test_install_fresh_is_noop_when_already_installed(self):
+        # Idempotent: an already-installed app is left as-is (no store tap).
+        exe = self._FakeExec(installed_after=0)
+        self._installer(exe).install_fresh()
+        self.assertEqual(exe.events, ["is_installed"])
+
+    def test_install_fresh_polls_until_installed(self):
+        # The Install tap returning is NOT proof the install finished: poll pm
+        # until the package appears.
+        exe = self._FakeExec(installed_after=3)
+        self._installer(exe).install_fresh()
+        self.assertEqual(
+            exe.events,
+            [
+                "is_installed",
+                "open_store_page",
+                "tap_store_install_button",
+                "is_installed",
+                "is_installed",
+                "is_installed",
+            ],
+        )
+
+    def test_install_fresh_fails_if_never_installs(self):
+        # If the package never appears within the bounded window, fail cleanly.
+        exe = self._FakeExec(installed_after=10_000)
+        installer = self._installer(
+            exe, install_timeout_seconds=0, install_poll_seconds=0
+        )
+        with self.assertRaises(RuntimeError):
+            installer.install_fresh()
+
+    def test_ensure_absent_never_uninstalls(self):
+        # A store app is never uninstalled (no local APK to put it back).
+        exe = self._FakeExec()
+        self.assertFalse(self._installer(exe).ensure_absent())
+        self.assertEqual(exe.events, [])
+
+    def test_install_and_open_installs_then_launches(self):
+        exe = self._FakeExec(installed_after=0)
+        self._installer(exe).install_and_open()
+        self.assertEqual(
+            exe.events,
+            ["is_installed", "launch_app_via_adb", "is_foreground"],
+        )
+
+    def test_open_never_taps_store_button(self):
+        # Even when the uninstalled batch asks for the store "Open" button, the
+        # store app is already installed (no store window), so we always launch
+        # via adb - never stall tapping a button that will never appear.
+        exe = self._FakeExec(installed_after=0)
+        self._installer(exe).install_and_open(via_store_button=True)
+        self.assertNotIn("launch_app_via_open_btn_click", exe.events)
+        self.assertEqual(
+            exe.events,
+            ["is_installed", "launch_app_via_adb", "is_foreground"],
+        )
 
 
 class SuggestedPromptGuardTests(unittest.TestCase):
@@ -3721,6 +3845,755 @@ class EmailRecipientPromptTests(unittest.TestCase):
         self.assertTrue(sent)
         payload = json.loads(relay.requests[0].data.decode("utf-8"))
         self.assertEqual(payload["to"], "after@example.com")
+
+
+class DeviceCheckTests(unittest.TestCase):
+    """The preflight device-check node: deterministic verdict from adb output."""
+
+    def _proc(self, stdout="", returncode=0, stderr=""):
+        return types.SimpleNamespace(
+            stdout=stdout, stderr=stderr, returncode=returncode
+        )
+
+    def _runner(self, proc=None, *, raises=None):
+        calls = []
+
+        def runner(args):
+            calls.append(list(args))
+            if raises is not None:
+                raise raises
+            return proc
+
+        runner.calls = calls
+        return runner
+
+    def test_target_device_ready(self):
+        runner = self._runner(self._proc(
+            "List of devices attached\nemulator-5554\tdevice\n"
+        ))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertTrue(result.ok)
+        self.assertIn("emulator-5554", result.message)
+        self.assertEqual(runner.calls, [["adb", "devices"]])  # read-only query
+
+    def test_no_devices_connected(self):
+        runner = self._runner(self._proc("List of devices attached\n\n"))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertFalse(result.ok)
+        self.assertIn("no Android device or emulator is connected", result.message)
+
+    def test_unauthorized_device_is_actionable(self):
+        runner = self._runner(self._proc(
+            "List of devices attached\nemulator-5554\tunauthorized\n"
+        ))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertFalse(result.ok)
+        self.assertIn("unauthorized", result.message)
+        self.assertIn("prompt", result.message)
+
+    def test_offline_device_is_actionable(self):
+        runner = self._runner(self._proc(
+            "List of devices attached\nemulator-5554\toffline\n"
+        ))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertFalse(result.ok)
+        self.assertIn("offline", result.message)
+
+    def test_wrong_target_falls_back_to_the_single_ready_device(self):
+        # Requested serial absent, exactly one other ready -> auto-use it.
+        runner = self._runner(self._proc(
+            "List of devices attached\nR58NABCDEF\tdevice\n"
+        ))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.device_id, "R58NABCDEF")
+        self.assertIn("using the only connected device R58NABCDEF", result.message)
+        self.assertTrue(result.any_device_present)
+
+    def test_wrong_target_lists_multiple_ready_devices(self):
+        # Several ready, none requested -> ambiguous, do NOT guess.
+        runner = self._runner(self._proc(
+            "List of devices attached\ndev-a\tdevice\ndev-b\tdevice\n"
+        ))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.device_id)
+        self.assertIn("dev-a", result.message)
+        self.assertIn("dev-b", result.message)
+        self.assertTrue(result.any_device_present)
+
+    def test_ready_target_reports_resolved_id_and_presence(self):
+        runner = self._runner(self._proc(
+            "List of devices attached\nemulator-5554\tdevice\n"
+        ))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertEqual(result.device_id, "emulator-5554")
+        self.assertTrue(result.any_device_present)
+
+    def test_no_devices_sets_any_present_false(self):
+        # This False signal is what lets the orchestrator try an emulator start.
+        runner = self._runner(self._proc("List of devices attached\n\n"))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertFalse(result.ok)
+        self.assertFalse(result.any_device_present)
+
+    def test_adb_missing_from_path(self):
+        runner = self._runner(raises=FileNotFoundError())
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertFalse(result.ok)
+        self.assertIn("adb not found", result.message)
+        self.assertIn(
+            "https://developer.android.com/tools/releases/platform-tools",
+            result.message,
+        )
+
+    def test_adb_nonzero_exit_is_reported(self):
+        runner = self._runner(self._proc(
+            "", returncode=1, stderr="cannot connect to daemon"
+        ))
+        result = device_check.check_device_ready("emulator-5554", runner)
+        self.assertFalse(result.ok)
+        self.assertIn("adb devices failed", result.message)
+        self.assertIn("cannot connect to daemon", result.message)
+
+
+class EmulatorAutostartTests(unittest.TestCase):
+    """The emulator node: start an existing AVD and wait for boot (all seams faked)."""
+
+    def _proc(self, stdout="", returncode=0, stderr=""):
+        return types.SimpleNamespace(
+            stdout=stdout, stderr=stderr, returncode=returncode
+        )
+
+    def test_starts_first_avd_and_returns_booted_serial(self):
+        launched = []
+        # adb responses: -list-avds, then devices (empty), then devices (new),
+        # then boot_completed=1.
+        responses = iter([
+            self._proc("Pixel_9_Pro\nMedium_Phone_API_36.1\n"),  # -list-avds
+            self._proc("List of devices attached\n"),            # before-launch
+            self._proc("List of devices attached\nemulator-5554\tdevice\n"),
+            self._proc("1\n"),                                    # boot_completed
+        ])
+
+        def runner(args):
+            return next(responses)
+
+        with mock.patch.object(emulator_node, "emulator_binary",
+                               return_value="/sdk/emulator/emulator"):
+            result = emulator_node.ensure_emulator_running(
+                runner=runner,
+                launcher=lambda args: launched.append(list(args)),
+                sleeper=lambda _s: None,
+                boot_timeout=30, poll_interval=0.01,
+            )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.serial, "emulator-5554")
+        # Deterministically starts the FIRST sorted AVD.
+        self.assertEqual(
+            launched, [["/sdk/emulator/emulator", "-avd", "Medium_Phone_API_36.1"]]
+        )
+
+    def test_no_binary_cannot_help(self):
+        with mock.patch.object(emulator_node, "emulator_binary",
+                               return_value=None):
+            result = emulator_node.ensure_emulator_running(
+                runner=lambda args: self._proc(""),
+                launcher=lambda args: None,
+                sleeper=lambda _s: None,
+            )
+        self.assertFalse(result.ok)
+        self.assertIsNone(result.serial)
+        self.assertIn("emulator", result.message.lower())
+
+    def test_no_avds_cannot_help(self):
+        with mock.patch.object(emulator_node, "emulator_binary",
+                               return_value="/sdk/emulator/emulator"):
+            result = emulator_node.ensure_emulator_running(
+                runner=lambda args: self._proc(""),  # -list-avds -> empty
+                launcher=lambda args: None,
+                sleeper=lambda _s: None,
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("no emulators (AVDs) are defined", result.message)
+
+    def test_requested_avd_missing_is_reported(self):
+        with mock.patch.object(emulator_node, "emulator_binary",
+                               return_value="/sdk/emulator/emulator"):
+            result = emulator_node.ensure_emulator_running(
+                avd="Nonexistent",
+                runner=lambda args: self._proc("Pixel_9_Pro\n"),
+                launcher=lambda args: None,
+                sleeper=lambda _s: None,
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("Nonexistent", result.message)
+        self.assertIn("Pixel_9_Pro", result.message)
+
+    def test_boot_timeout_reports_failure(self):
+        responses = {
+            "-list-avds": self._proc("Pixel_9_Pro\n"),
+            "devices": self._proc("List of devices attached\n"),  # never ready
+        }
+
+        def runner(args):
+            if "-list-avds" in args:
+                return responses["-list-avds"]
+            return responses["devices"]
+
+        with mock.patch.object(emulator_node, "emulator_binary",
+                               return_value="/sdk/emulator/emulator"):
+            result = emulator_node.ensure_emulator_running(
+                runner=runner,
+                launcher=lambda args: None,
+                sleeper=lambda _s: None,
+                boot_timeout=0.05, poll_interval=0.01,
+            )
+        self.assertFalse(result.ok)
+        self.assertIn("did not become ready", result.message)
+
+
+class MaestroCheckTests(unittest.TestCase):
+    """The Maestro availability node."""
+
+    def _proc(self, stdout="", returncode=0, stderr=""):
+        return types.SimpleNamespace(
+            stdout=stdout, stderr=stderr, returncode=returncode
+        )
+
+    def test_maestro_present(self):
+        result = maestro_check.check_maestro_ready(
+            lambda args: self._proc("1.39.0\n")
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.version, "1.39.0")
+
+    def test_maestro_missing_gives_install_hint(self):
+        def runner(args):
+            raise FileNotFoundError()
+
+        result = maestro_check.check_maestro_ready(runner)
+        self.assertFalse(result.ok)
+        self.assertIn("Maestro is not installed", result.message)
+        self.assertIn("maestro.mobile.dev", result.message)
+
+    def test_maestro_nonzero_exit(self):
+        result = maestro_check.check_maestro_ready(
+            lambda args: self._proc("", returncode=1, stderr="boom")
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("maestro --version failed", result.message)
+
+
+class ModelCheckTests(unittest.TestCase):
+    """The evaluation-model configuration node."""
+
+    def test_all_vars_present(self):
+        result = model_check.check_model_configured(
+            {"APPPILOT_MODEL": "gpt", "APPPILOT_MODEL_API_KEY": "key"}
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("configured", result.message)
+
+    def test_missing_var_reported(self):
+        result = model_check.check_model_configured({"APPPILOT_MODEL": "gpt"})
+        self.assertFalse(result.ok)
+        self.assertIn("APPPILOT_MODEL_API_KEY", result.message)
+
+    def test_empty_var_treated_as_missing(self):
+        result = model_check.check_model_configured(
+            {"APPPILOT_MODEL": "gpt", "APPPILOT_MODEL_API_KEY": ""}
+        )
+        self.assertFalse(result.ok)
+
+
+class CredentialsCheckTests(unittest.TestCase):
+    """The sign-in credentials advisory node."""
+
+    def test_both_present(self):
+        result = credentials_check.check_credentials_configured(
+            {"APPPILOT_USERNAME": "u", "APPPILOT_PASSWORD": "p"}
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(result.configured)
+
+    def test_missing_reported_but_not_fatal(self):
+        result = credentials_check.check_credentials_configured({})
+        self.assertTrue(result.ok)
+        self.assertFalse(result.configured)
+        self.assertIn("APPPILOT_USERNAME", result.message)
+        self.assertIn("APPPILOT_PASSWORD", result.message)
+
+    def test_empty_value_treated_as_missing(self):
+        result = credentials_check.check_credentials_configured(
+            {"APPPILOT_USERNAME": "u", "APPPILOT_PASSWORD": ""}
+        )
+        self.assertFalse(result.configured)
+        self.assertIn("APPPILOT_PASSWORD", result.message)
+
+
+class PythonCheckTests(unittest.TestCase):
+    """The interpreter-version node."""
+
+    def test_current_interpreter_ok(self):
+        result = python_check.check_python_version()
+        self.assertTrue(result.ok)
+
+    def test_new_enough_boundary(self):
+        result = python_check.check_python_version((3, 11, 0))
+        self.assertTrue(result.ok)
+
+    def test_too_old_fails(self):
+        result = python_check.check_python_version((3, 9, 18))
+        self.assertFalse(result.ok)
+        self.assertIn("3.11+", result.message)
+        self.assertIn("3.9", result.message)
+
+
+class ConfigStoreTests(unittest.TestCase):
+    """The persistent key/value setup store."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "nested" / "config.json"
+
+    def test_set_then_get_roundtrip(self):
+        store = ConfigStore(self.path)
+        store.set("k", "/some/path")
+        self.assertEqual(ConfigStore(self.path).get("k"), "/some/path")
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(ConfigStore(self.path).get("k"))
+
+    def test_corrupt_file_returns_none(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(ConfigStore(self.path).get("k"))
+
+    def test_non_string_values_ignored(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text('{"a": 5, "b": "ok"}', encoding="utf-8")
+        store = ConfigStore(self.path)
+        self.assertIsNone(store.get("a"))
+        self.assertEqual(store.get("b"), "ok")
+
+
+class PathSetupTests(unittest.TestCase):
+    """Resolving a required path via saved -> default -> prompt (+persist)."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+        self.store = ConfigStore(self.root / "config.json")
+        self.real_dir = self.root / "enlist"
+        self.real_dir.mkdir()
+        self.real_file = self.root / "cases.xlsx"
+        self.real_file.write_text("x", encoding="utf-8")
+
+    def test_saved_value_used_first(self):
+        self.store.set("k", str(self.real_dir))
+        result = path_setup.resolve_required_path(
+            key="k", label="thing", default=None, kind="dir", store=self.store,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.path, str(self.real_dir))
+
+    def test_default_used_when_valid(self):
+        result = path_setup.resolve_required_path(
+            key="k", label="workbook", default=str(self.real_file),
+            kind="file", store=self.store,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.path, str(self.real_file))
+        # Defaults are not persisted.
+        self.assertIsNone(self.store.get("k"))
+
+    def test_non_interactive_missing_fails(self):
+        result = path_setup.resolve_required_path(
+            key="k", label="thing", default=str(self.root / "nope"),
+            kind="dir", store=self.store, interactive=False,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("thing", result.message)
+
+    def test_prompt_persists_answer(self):
+        replies = iter([str(self.real_dir)])
+        result = path_setup.resolve_required_path(
+            key="k", label="thing", default=None, kind="dir", store=self.store,
+            interactive=True, prompter=lambda _: next(replies),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.path, str(self.real_dir))
+        self.assertEqual(self.store.get("k"), str(self.real_dir))
+
+    def test_prompt_retries_until_valid(self):
+        replies = iter(["/does/not/exist", str(self.real_file)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = path_setup.resolve_required_path(
+                key="k", label="workbook", default=None, kind="file",
+                store=self.store, interactive=True,
+                prompter=lambda _: next(replies),
+            )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.path, str(self.real_file))
+
+    def test_invalid_saved_falls_back_to_default(self):
+        self.store.set("k", str(self.root / "gone"))
+        result = path_setup.resolve_required_path(
+            key="k", label="workbook", default=str(self.real_file),
+            kind="file", store=self.store,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.path, str(self.real_file))
+
+    def test_override_wins_over_saved_and_updates_it(self):
+        # A stale saved value must be replaced by an explicitly-provided path.
+        old = self.root / "old"
+        old.mkdir()
+        self.store.set("k", str(old))
+        result = path_setup.resolve_required_path(
+            key="k", label="thing", default=str(old), override=str(self.real_dir),
+            kind="dir", store=self.store,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.path, str(self.real_dir))
+        self.assertIn("updated", result.message)
+        # The new path is persisted so later runs remember it.
+        self.assertEqual(self.store.get("k"), str(self.real_dir))
+
+    def test_invalid_override_fails_without_using_saved(self):
+        self.store.set("k", str(self.real_dir))
+        result = path_setup.resolve_required_path(
+            key="k", label="thing", default=None,
+            override=str(self.root / "missing"), kind="dir", store=self.store,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("missing", result.message)
+        # The stale saved value is left untouched (not silently used).
+        self.assertEqual(self.store.get("k"), str(self.real_dir))
+
+    def test_keyboard_interrupt_at_prompt_does_not_raise(self):
+        def abort(_prompt):
+            raise KeyboardInterrupt
+
+        result = path_setup.resolve_required_path(
+            key="k", label="thing", default=None, kind="dir", store=self.store,
+            interactive=True, prompter=abort,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("thing", result.message)
+
+
+class BuildToolsCheckTests(unittest.TestCase):
+    """JDK 17 + omrdroid availability node."""
+
+    def _java_home(self):
+        # A temp dir with a real bin/java file stands in for a JDK 17 home.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        (home / "bin").mkdir()
+        (home / "bin" / "java").write_text("", encoding="utf-8")
+        return str(home)
+
+    def test_ready_when_jdk_and_omrdroid_present(self):
+        result = build_tools_check.check_build_tools(
+            java_home=self._java_home(),
+            which=lambda name: "/usr/local/bin/omrdroid",
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("Build tools ready", result.message)
+
+    def test_missing_jdk_reported(self):
+        result = build_tools_check.check_build_tools(
+            java_home="/nonexistent/jdk",
+            which=lambda name: "/usr/local/bin/omrdroid",
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("JDK 17 not found", result.message)
+
+    def test_missing_omrdroid_reported(self):
+        result = build_tools_check.check_build_tools(
+            java_home=self._java_home(),
+            which=lambda name: None,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("omrdroid", result.message)
+
+
+class ApkSourceTests(unittest.TestCase):
+    """APK source selection node (choose once, confirm every run)."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.store = ConfigStore(Path(self._dir.name) / "config.json")
+
+    def test_non_interactive_uses_default_when_nothing_saved(self):
+        result = apk_source.select_apk_source(
+            store=self.store, default=apk_source.PLAYSTORE, interactive=False
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "playstore")
+
+    def test_non_interactive_prefers_saved_over_default(self):
+        self.store.set(apk_source.APK_SOURCE_KEY, apk_source.EXISTING)
+        result = apk_source.select_apk_source(
+            store=self.store, default=apk_source.BUILD, interactive=False
+        )
+        self.assertEqual(result.source, "existing")
+
+    def test_number_choice_selected_and_persisted(self):
+        result = apk_source.select_apk_source(
+            store=self.store, interactive=True,
+            prompter=lambda _prompt: "3", output=lambda _line: None,
+        )
+        self.assertEqual(result.source, "playstore")
+        # Persisted so a later run can offer it as the default.
+        self.assertEqual(self.store.get(apk_source.APK_SOURCE_KEY), "playstore")
+
+    def test_name_choice_accepted(self):
+        result = apk_source.select_apk_source(
+            store=self.store, interactive=True,
+            prompter=lambda _prompt: "Existing", output=lambda _line: None,
+        )
+        self.assertEqual(result.source, "existing")
+
+    def test_empty_answer_keeps_current(self):
+        self.store.set(apk_source.APK_SOURCE_KEY, apk_source.EXISTING)
+        result = apk_source.select_apk_source(
+            store=self.store, interactive=True,
+            prompter=lambda _prompt: "", output=lambda _line: None,
+        )
+        self.assertEqual(result.source, "existing")
+
+    def test_invalid_then_valid_reprompts(self):
+        answers = iter(["nope", "1"])
+        lines = []
+        result = apk_source.select_apk_source(
+            store=self.store, interactive=True,
+            prompter=lambda _prompt: next(answers), output=lines.append,
+        )
+        self.assertEqual(result.source, "build")
+        self.assertTrue(any("1, 2, or 3" in line for line in lines))
+
+    def test_aborted_prompt_keeps_current(self):
+        def abort(_prompt):
+            raise KeyboardInterrupt
+
+        result = apk_source.select_apk_source(
+            store=self.store, default=apk_source.PLAYSTORE, interactive=True,
+            prompter=abort, output=lambda _line: None,
+        )
+        self.assertEqual(result.source, "playstore")
+
+
+class PreflightTests(unittest.TestCase):
+    """The single preflight gate composing every prerequisite check."""
+
+    _ENV = {"APPPILOT_MODEL": "gpt", "APPPILOT_MODEL_API_KEY": "key"}
+
+    def setUp(self):
+        # Real, valid default paths + an isolated store so the path-setup steps
+        # pass without prompting or touching the operator's real config.
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        root = Path(self._dir.name)
+        self.store = ConfigStore(root / "config.json")
+        self.enlist = root / "enlist"
+        self.enlist.mkdir()
+        self.cases = root / "cases.xlsx"
+        self.cases.write_text("x", encoding="utf-8")
+
+    def _run(self, **overrides):
+        kwargs = dict(
+            device="emulator-5554",
+            env=self._ENV,
+            test_cases_default=str(self.cases),
+            enlistment_default=str(self.enlist),
+            store=self.store,
+            maestro_checker=self._ok_maestro(),
+            build_tools_checker=lambda: results.CheckResult(True, "Build tools ready."),
+            apk_source_selector=self._source(apk_source.BUILD),
+            device_checker=self._device_ready(),
+        )
+        kwargs.update(overrides)
+        return preflight_node.run_preflight(**kwargs)
+
+    def _ok_maestro(self):
+        return lambda: maestro_check.ToolCheckResult(True, "Maestro 1.0.", "1.0")
+
+    def _source(self, source):
+        return lambda **_: apk_source.ApkSourceResult(True, source, f"APK source: {source}.")
+
+    def _device_ready(self, serial="emulator-5554"):
+        return lambda requested: device_check.DeviceCheckResult(
+            True, f"using device {serial}.", device_id=serial,
+            any_device_present=True,
+        )
+
+    def test_all_prerequisites_ready(self):
+        result = self._run()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.device_id, "emulator-5554")
+        self.assertEqual(result.test_cases_path, str(self.cases))
+        self.assertEqual(result.apk_source, "build")
+        self.assertEqual(result.enlistment_root, str(self.enlist))
+        self.assertIsNone(result.apk_path)
+
+    def test_missing_credentials_warns_but_passes(self):
+        # No credential env vars: the run still succeeds (login is a no-op when
+        # already signed in), so credentials are advisory, never a hard gate.
+        result = self._run(
+            credentials_checker=(
+                lambda env: credentials_check.CredentialsCheckResult(
+                    True, False, "sign-in credentials not set (missing X)."
+                )
+            )
+        )
+        self.assertTrue(result.ok)
+
+    def test_test_cases_override_wins_over_saved(self):
+        # A saved workbook is overridden (and updated) by an explicit override.
+        self.store.set(preflight_node.preflight_check.TEST_CASES_KEY, str(self.cases))
+        other = Path(self._dir.name) / "other.xlsx"
+        other.write_text("y", encoding="utf-8")
+        result = self._run(test_cases_override=str(other))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.test_cases_path, str(other))
+        self.assertEqual(
+            self.store.get(preflight_node.preflight_check.TEST_CASES_KEY),
+            str(other),
+        )
+
+    def test_maestro_missing_fails_first(self):
+        # The device checker must NOT be consulted when Maestro is missing.
+        def boom(requested):  # pragma: no cover - must never run
+            raise AssertionError("device check should not run")
+
+        result = self._run(
+            maestro_checker=lambda: maestro_check.ToolCheckResult(
+                False, "Maestro is not installed"
+            ),
+            device_checker=boom,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Maestro is not installed", result.message)
+
+    def test_missing_model_config_reported(self):
+        result = self._run(env={})
+        self.assertFalse(result.ok)
+        self.assertIn("no evaluation model configured", result.message)
+
+    def test_missing_build_tools_fails_build_branch(self):
+        # In the build branch, build-tools failure short-circuits before device.
+        def boom(requested):  # pragma: no cover - must never run
+            raise AssertionError("device check should not run")
+
+        result = self._run(
+            build_tools_checker=lambda: results.CheckResult(
+                False, "JDK 17 not found"
+            ),
+            device_checker=boom,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("JDK 17 not found", result.message)
+
+    def test_existing_source_uses_prebuilt_and_skips_build(self):
+        # 'existing' resolves a prebuilt APK and needs neither enlistment nor
+        # build tools.
+        apk = Path(self._dir.name) / "prebuilt.apk"
+        apk.write_text("x", encoding="utf-8")
+        self.store.set(preflight_node.preflight_check.EXISTING_APK_KEY, str(apk))
+
+        def boom():  # pragma: no cover - build tools must not run
+            raise AssertionError("build tools should not run")
+
+        result = self._run(
+            apk_source_selector=self._source(apk_source.EXISTING),
+            build_tools_checker=boom,
+            enlistment_default=str(Path(self._dir.name) / "no-enlist"),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.apk_source, "existing")
+        self.assertEqual(result.apk_path, str(apk))
+        self.assertIsNone(result.enlistment_root)
+
+    def test_playstore_source_skips_build_and_enlistment(self):
+        # 'playstore' installs nothing: no enlistment, no build tools, no APK.
+        def boom():  # pragma: no cover - build tools must not run
+            raise AssertionError("build tools should not run")
+
+        result = self._run(
+            apk_source_selector=self._source(apk_source.PLAYSTORE),
+            build_tools_checker=boom,
+            enlistment_default=str(Path(self._dir.name) / "no-enlist"),
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.apk_source, "playstore")
+        self.assertIsNone(result.apk_path)
+        self.assertIsNone(result.enlistment_root)
+
+    def test_missing_test_cases_non_interactive_fails(self):
+        result = self._run(
+            test_cases_default=str(Path(self._dir.name) / "missing.xlsx"),
+            interactive=False,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("test-cases workbook", result.message)
+
+    def test_missing_enlistment_non_interactive_fails(self):
+        result = self._run(
+            enlistment_default=str(Path(self._dir.name) / "no-enlist"),
+            interactive=False,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("enlistment", result.message)
+
+    def test_no_device_and_no_autostart_fails(self):
+        def no_device(requested):
+            return device_check.DeviceCheckResult(
+                False, "no Android device or emulator is connected.",
+                any_device_present=False,
+            )
+
+        def boom(**kwargs):  # pragma: no cover - autostart disabled
+            raise AssertionError("emulator start should not run")
+
+        result = self._run(
+            autostart_emulator=False, device_checker=no_device,
+            emulator_starter=boom,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("no Android device or emulator is connected", result.message)
+
+    def test_no_device_triggers_emulator_autostart(self):
+        # First device check finds nothing; after the emulator "starts", the
+        # re-check reports it ready. The starter is the injected fake.
+        checks = [
+            device_check.DeviceCheckResult(
+                False, "no Android device or emulator is connected.",
+                any_device_present=False,
+            ),
+            device_check.DeviceCheckResult(
+                True, "using device emulator-5554.",
+                device_id="emulator-5554", any_device_present=True,
+            ),
+        ]
+
+        def device_checker(requested):
+            return checks.pop(0)
+
+        def starter(**kwargs):
+            return emulator_node.EmulatorStartResult(
+                True, "emulator-5554", "started emulator."
+            )
+
+        result = self._run(device_checker=device_checker, emulator_starter=starter)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.device_id, "emulator-5554")
 
 
 if __name__ == "__main__":

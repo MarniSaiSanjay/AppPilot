@@ -58,6 +58,7 @@ try:
     from ..apppilot.models import UIObservation  # noqa: E402
     from ..apppilot import officemobile_build  # noqa: E402
     from ..apppilot import email_report  # noqa: E402
+    from ..apppilot import preflight as preflight_node  # noqa: E402
 except ImportError:
     from apppilot.android import (  # noqa: E402
         APP_ID,
@@ -68,6 +69,7 @@ except ImportError:
     from apppilot.models import UIObservation  # noqa: E402
     from apppilot import officemobile_build  # noqa: E402
     from apppilot import email_report  # noqa: E402
+    from apppilot import preflight as preflight_node  # noqa: E402
 
 # The SHARED login capability (same generic AppPilotAgent + Brain) - reused, not
 # duplicated. Sibling import works whether this module is loaded as
@@ -618,23 +620,18 @@ class AppInstaller(Protocol):
         ...
 
 
-class LocalApkInstaller:
-    """Deterministic install of the locally built APK via adb, then open.
+class _ForegroundLauncher:
+    """Shared launch + foreground-confirm behaviour for the installers.
 
-    Replaces installing from the Play Store: we ``adb install`` the local build
-    directly. ``open`` has two modes, neither re-fires the deeplink (the app
-    recovers the pending deeplink itself on launch): the default launches via a
-    deterministic adb LAUNCHER intent (installed batch, no store window);
-    ``via_store_button=True`` taps the store's Open button via Maestro
-    (uninstalled flow, which lands on the store window from the deeplink). Both
-    confirm the app is foreground via a deterministic adb check before handing
-    on. No coordinate taps, no LLM.
+    Holds the deterministic ``open`` (adb LAUNCHER intent, or the store's Open
+    button via Maestro) and the ``is_foreground`` polling both concrete
+    installers reuse. Subclasses supply ``ensure_absent`` and ``install_fresh``.
+    No coordinate taps, OCR, screenshots, or model.
     """
 
     def __init__(
         self,
         executor: MaestroExecutor,
-        apk_path: str,
         *,
         foreground_timeout_seconds: float = DEFAULT_FOREGROUND_TIMEOUT_SECONDS,
         foreground_poll_seconds: float = DEFAULT_FOREGROUND_POLL_SECONDS,
@@ -642,18 +639,10 @@ class LocalApkInstaller:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._executor = executor
-        self._apk_path = apk_path
         self._foreground_timeout_seconds = max(0.0, foreground_timeout_seconds)
         self._foreground_poll_seconds = max(0.0, foreground_poll_seconds)
         self._sleep = sleep
         self._monotonic = monotonic
-
-    def ensure_absent(self) -> bool:
-        return self._executor.ensure_uninstalled()
-
-    def install_fresh(self) -> None:
-        _trace(f"[INSTALL] installing local build: {self._apk_path}")
-        self._executor.install_apk(self._apk_path)
 
     def install_and_open(self, via_store_button: bool = False) -> None:
         self.install_fresh()
@@ -690,6 +679,124 @@ class LocalApkInstaller:
                 relaunch()
             except RuntimeError:
                 pass
+
+
+class LocalApkInstaller(_ForegroundLauncher):
+    """Deterministic install of the locally built APK via adb, then open.
+
+    Replaces installing from the Play Store: we ``adb install`` the local build
+    directly. ``open`` has two modes, neither re-fires the deeplink (the app
+    recovers the pending deeplink itself on launch): the default launches via a
+    deterministic adb LAUNCHER intent (installed batch, no store window);
+    ``via_store_button=True`` taps the store's Open button via Maestro
+    (uninstalled flow, which lands on the store window from the deeplink). Both
+    confirm the app is foreground via a deterministic adb check before handing
+    on. No coordinate taps, no LLM.
+    """
+
+    def __init__(
+        self,
+        executor: MaestroExecutor,
+        apk_path: str,
+        *,
+        foreground_timeout_seconds: float = DEFAULT_FOREGROUND_TIMEOUT_SECONDS,
+        foreground_poll_seconds: float = DEFAULT_FOREGROUND_POLL_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(
+            executor,
+            foreground_timeout_seconds=foreground_timeout_seconds,
+            foreground_poll_seconds=foreground_poll_seconds,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+        self._apk_path = apk_path
+
+    def ensure_absent(self) -> bool:
+        return self._executor.ensure_uninstalled()
+
+    def install_fresh(self) -> None:
+        _trace(f"[INSTALL] installing local build: {self._apk_path}")
+        self._executor.install_apk(self._apk_path)
+
+
+class PlayStoreInstaller(_ForegroundLauncher):
+    """Ensure the app is present by installing it FROM the Play Store, then open.
+
+    Used for the ``playstore`` APK source. Instead of adb-installing a local
+    build, ``install_fresh`` puts the app on the device the way a user would:
+    open its Play Store page (adb ``market://`` intent) and tap the Install
+    button (Maestro text tap), then wait until a deterministic
+    ``pm list packages`` poll confirms the package is really installed.
+
+    Idempotent - if the app is already installed it is left as-is, so every batch
+    (installed and uninstalled alike) can call ``install_fresh`` and be sure the
+    app is present before a case runs. ``ensure_absent`` is a deliberate no-op:
+    we never uninstall a store app (we have no local APK to reinstall it with),
+    so clean-state startup leaves an existing install in place. No coordinate
+    taps, OCR, screenshots, or model.
+    """
+
+    def __init__(
+        self,
+        executor: MaestroExecutor,
+        *,
+        install_timeout_seconds: float = 600.0,
+        install_poll_seconds: float = 3.0,
+        foreground_timeout_seconds: float = DEFAULT_FOREGROUND_TIMEOUT_SECONDS,
+        foreground_poll_seconds: float = DEFAULT_FOREGROUND_POLL_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(
+            executor,
+            foreground_timeout_seconds=foreground_timeout_seconds,
+            foreground_poll_seconds=foreground_poll_seconds,
+            sleep=sleep,
+            monotonic=monotonic,
+        )
+        self._install_timeout_seconds = max(0.0, install_timeout_seconds)
+        self._install_poll_seconds = max(0.0, install_poll_seconds)
+
+    def ensure_absent(self) -> bool:
+        # Never uninstall a store app: we have no local APK to put it back, so a
+        # clean-state startup leaves an existing install in place.
+        return False
+
+    def open(self, via_store_button: bool = False) -> None:
+        # The store app is already installed, so a deeplink opens the app
+        # directly - there is never a store "Open" button to tap (that button
+        # only exists on the store window an UNINSTALLED local-build flow lands
+        # on). Always launch via the deterministic adb intent, ignoring the
+        # caller's store-button hint, so the uninstalled batch does not stall
+        # waiting on a button that will never appear.
+        super().open(via_store_button=False)
+
+    def install_fresh(self) -> None:
+        if self._executor.is_installed():
+            _trace("[INSTALL] app already installed from Play Store")
+            return
+        _trace("[INSTALL] installing from Play Store")
+        self._executor.open_store_page()
+        self._executor.tap_store_install_button()
+        self._wait_until_installed()
+
+    def _wait_until_installed(self) -> None:
+        _trace("[INSTALL] waiting for Play Store install to complete")
+        deadline = self._monotonic() + self._install_timeout_seconds
+        while True:
+            if self._executor.is_installed():
+                _trace("[INSTALL] Play Store install complete")
+                return
+            if self._monotonic() >= deadline:
+                raise RuntimeError(
+                    "[INSTALL] app was not installed from the Play Store within "
+                    f"{self._install_timeout_seconds:.0f}s - check the device is "
+                    "signed in to the store, the package is available in this "
+                    "region, and the download completed."
+                )
+            self._sleep(self._install_poll_seconds)
 
 
 # --------------------------------------------------------------------------- #
@@ -1129,10 +1236,38 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--excel",
-        default=str(_default_excel_path()),
-        help="Path to the deeplink test-case Excel (default: bundled workbook).",
+        default=None,
+        help=(
+            "Path to the deeplink test-case Excel. When given it overrides (and "
+            "updates) any remembered path; otherwise the remembered or bundled "
+            "workbook is used."
+        ),
     )
-    parser.add_argument("--device", default="emulator-5554")
+    parser.add_argument(
+        "--device", default="emulator-5554",
+        help=(
+            "Target adb serial. Default 'emulator-5554' is the standard serial "
+            "of the first Android emulator on any machine. If it is not present "
+            "but exactly one other device/emulator is connected, that one is "
+            "used automatically; pass this only to disambiguate multiple devices."
+        ),
+    )
+    parser.add_argument(
+        "--avd", default=None,
+        help=(
+            "Name of the AVD to auto-start when no device is connected. "
+            "Defaults to the first available AVD (see 'emulator -list-avds')."
+        ),
+    )
+    parser.add_argument(
+        "--no-emulator-autostart", dest="emulator_autostart",
+        action="store_false",
+        help=(
+            "Do not auto-start an emulator when no device is connected; "
+            "fail fast instead."
+        ),
+    )
+    parser.set_defaults(emulator_autostart=True)
     parser.add_argument(
         "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
         help="Maximum attempts per deeplink test case (default 2: 1 try + 1 retry).",
@@ -1165,48 +1300,113 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("ERROR: --verify-timeout must not be negative", file=sys.stderr)
         return 2
 
+    # Single preflight gate: interpreter, Maestro, model config, the test-cases
+    # workbook, the chosen APK source (and its prerequisites - the enlistment +
+    # build toolchain only when building locally), and a usable device
+    # (auto-starting an emulator when nothing is connected). Missing paths are
+    # prompted for once and remembered; the APK source is confirmed each run.
+    # Fails fast with one actionable message vs crashing mid-run.
+    interactive = getattr(sys.stdin, "isatty", lambda: False)()
+    # An explicitly-provided path (via --excel or APPPILOT_OM_ENLISTMENT) is an
+    # override: it wins over the remembered value and updates it. Absent that,
+    # the remembered-or-default resolution applies.
+    enlistment_override = (os.environ.get(officemobile_build.ENLISTMENT_ENV_VAR) or "").strip() or None
+    ready = preflight_node.run_preflight(
+        device=args.device,
+        avd=args.avd,
+        autostart_emulator=args.emulator_autostart,
+        env=os.environ,
+        test_cases_default=args.excel or str(_default_excel_path()),
+        test_cases_override=args.excel,
+        enlistment_default=str(officemobile_build.enlistment_root()),
+        enlistment_override=enlistment_override,
+        interactive=interactive,
+    )
+    if not ready.ok:
+        print(f"ERROR: {ready.message}", file=sys.stderr)
+        return 2
+    device_id = ready.device_id
+
     try:
-        cases = load_deeplink_cases(args.excel)
+        cases = load_deeplink_cases(ready.test_cases_path)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         print(f"ERROR: could not load deeplink test cases: {error}", file=sys.stderr)
         return 2
 
-    judge = LLMExpectationJudge.from_env()
-    if judge is None:
-        print(
-            "ERROR: no evaluation model configured. Set APPPILOT_MODEL and "
-            "APPPILOT_MODEL_API_KEY (and optionally APPPILOT_MODEL_BASE_URL).",
-            file=sys.stderr,
-        )
-        return 2
+    # The 'playstore' source installs the app from the store when missing, but it
+    # never uninstalls a store app (there is no local APK to put it back). So it
+    # cannot reproduce the genuine uninstalled first-open-after-install scenario -
+    # UNINSTALLED cases will run against the already-installed app. Warn loudly so
+    # the operator isn't fooled.
+    if ready.apk_source == preflight_node.apk_source.PLAYSTORE:
+        uninstalled = sum(1 for case in cases if not case.installed)
+        if uninstalled:
+            print(
+                f"WARNING: {uninstalled} UNINSTALLED test case(s) cannot be "
+                "reproduced with the 'playstore' APK source (it installs the app "
+                "but never uninstalls it); they will run against the installed "
+                "app and their verdicts may be misleading. Choose the 'build' or "
+                "'existing' APK source to test the uninstalled flow.",
+                file=sys.stderr,
+            )
 
-    executor = MaestroExecutor(APP_ID, args.device)
-    observer = MaestroHierarchyObserver(args.device)
+    # Preflight already confirmed the model env vars, so this cannot be None.
+    judge = LLMExpectationJudge.from_env()
+
+    executor = MaestroExecutor(APP_ID, device_id)
+    observer = MaestroHierarchyObserver(device_id)
     warm_up = None if args.no_warm_up else MaestroWarmUp(executor)
 
     # Shared login capability: the same generic AppPilotAgent + Brain, reusing
     # the device's executor/observer (DRY). The executor's foreground check is
     # injected so login never completes while the app is not foreground.
     login_agent = build_login_agent(
-        args.device,
+        device_id,
         executor=executor,
         observer=observer,
         foreground_check=executor.is_foreground,
     )
     login_flow: LoginCapability = SharedLoginFlow(login_agent)
 
-    # Build (or reuse) the local officemobile APK and install it via adb - never
-    # from the actual Play Store.
+    # Ask UP FRONT (before the potentially multi-minute build/install) whether to
+    # email the report and to whom, so the operator answers every interactive
+    # question in one go and can then walk away; delivery happens automatically
+    # once the run finishes. Prompting is isolated and must never affect the
+    # suite result, so any failure here is swallowed.
     try:
-        apk_path = officemobile_build.APK_PATH
-        if args.rebuild or not apk_path.exists():
-            _trace("[BUILD] building local officemobile APK")
-            apk_path = officemobile_build.build_apk()
-        _trace(f"[BUILD] using local APK: {apk_path}")
-    except officemobile_build.BuildError as error:
-        print(f"ERROR: could not build local APK: {error}", file=sys.stderr)
-        return 2
-    installer = LocalApkInstaller(executor, str(apk_path))
+        email_recipient = email_report.prompt_email_recipient(
+            env=os.environ, interactive=interactive
+        )
+    except Exception as error:  # pragma: no cover - defensive; prompt never raises
+        print(f"[EMAIL] email prompt failed - continuing without email: {error}")
+        email_recipient = None
+
+    # Put the officemobile app on the device according to the preflight-chosen
+    # APK source:
+    #   * build     - build (or reuse) a fresh local APK and adb-install it.
+    #   * existing  - adb-install the prebuilt APK the operator pointed us at.
+    #   * playstore - install the app FROM the Play Store when it is missing
+    #                 (idempotent - left as-is if already installed).
+    installer: AppInstaller | None
+    if ready.apk_source == preflight_node.apk_source.EXISTING:
+        _trace(f"[BUILD] using prebuilt APK: {ready.apk_path}")
+        installer = LocalApkInstaller(executor, ready.apk_path)
+    elif ready.apk_source == preflight_node.apk_source.PLAYSTORE:
+        _trace("[BUILD] using Play Store install - installing from the store if missing")
+        installer = PlayStoreInstaller(executor)
+    else:
+        # Point the APK build at the resolved enlistment for the rest of this run.
+        os.environ[officemobile_build.ENLISTMENT_ENV_VAR] = ready.enlistment_root
+        try:
+            apk_path = officemobile_build.apk_path()
+            if args.rebuild or not apk_path.exists():
+                _trace("[BUILD] building local officemobile APK")
+                apk_path = officemobile_build.build_apk()
+            _trace(f"[BUILD] using local APK: {apk_path}")
+        except officemobile_build.BuildError as error:
+            print(f"ERROR: could not build local APK: {error}", file=sys.stderr)
+            return 2
+        installer = LocalApkInstaller(executor, str(apk_path))
     runner = DeeplinkTestRunner(
         observer=observer,
         executor=executor,
@@ -1217,19 +1417,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         login_flow=login_flow,
         installer=installer,
     )
-    # Ask UP FRONT whether to email the report and to whom, so the operator can
-    # start the (long) suite and walk away; delivery happens automatically once
-    # the run finishes. Prompting is isolated and must never affect the suite
-    # result, so any failure here is swallowed.
-    try:
-        interactive = getattr(sys.stdin, "isatty", lambda: False)()
-        email_recipient = email_report.prompt_email_recipient(
-            env=os.environ, interactive=interactive
-        )
-    except Exception as error:  # pragma: no cover - defensive; prompt never raises
-        print(f"[EMAIL] email prompt failed - continuing without email: {error}")
-        email_recipient = None
-
     # The orchestrator owns the explicit top-level lifecycle and composes the
     # runner for per-case execution, judging, retry and reporting.
     report = DeeplinkSuiteOrchestrator(runner).run(cases)

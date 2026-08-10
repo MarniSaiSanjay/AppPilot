@@ -14,24 +14,43 @@ The build runs under zsh with init.sh sourced (bash is unsupported).
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
 
-ENLISTMENT_ROOT = Path("/Volumes/Office/omr1")
-SRC_ROOT = ENLISTMENT_ROOT / "src"
-JAVAKOTLIN_DIR = SRC_ROOT / "officemobile/android/JavaKotlin"
+# The enlistment root is resolved at call time from the environment so preflight
+# (or the operator) can point AppPilot at a non-default checkout. Falls back to
+# the standard omr location. All other paths are derived from it.
+_DEFAULT_ENLISTMENT_ROOT = Path("/Volumes/Office/omr1")
+ENLISTMENT_ENV_VAR = "APPPILOT_OM_ENLISTMENT"
 LKG_BRANCH = "lkg/main/android"
-
-APK_PATH = (
-    ENLISTMENT_ROOT
-    / "Target/droidarm64/debug/officemobile/x-none/apk/debug/officemobile.apk"
-)
 
 JAVA_HOME = "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
 NUGET_ROOT = "/Volumes/Office/NugetCache"
 
 TEMP_COMMIT_MESSAGE = "temp - reset later"
+
+
+def enlistment_root() -> Path:
+    """The omr enlistment root (``APPPILOT_OM_ENLISTMENT`` or the default)."""
+    configured = os.environ.get(ENLISTMENT_ENV_VAR, "").strip()
+    return Path(configured) if configured else _DEFAULT_ENLISTMENT_ROOT
+
+
+def src_root() -> Path:
+    return enlistment_root() / "src"
+
+
+def javakotlin_dir() -> Path:
+    return src_root() / "officemobile/android/JavaKotlin"
+
+
+def apk_path() -> Path:
+    return (
+        enlistment_root()
+        / "Target/droidarm64/debug/officemobile/x-none/apk/debug/officemobile.apk"
+    )
 
 
 class BuildError(RuntimeError):
@@ -40,7 +59,7 @@ class BuildError(RuntimeError):
 
 def _git(*args: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(SRC_ROOT), *args],
+        ["git", "-C", str(src_root()), *args],
         capture_output=True,
         text=True,
         check=True,
@@ -66,9 +85,9 @@ def _run_omrdroid_build() -> str:
         [
             f"export JAVA_HOME={JAVA_HOME}",
             f"export NUGETMACHINEINSTALLROOT={NUGET_ROOT}",
-            f"cd {SRC_ROOT}",
+            f"cd {src_root()}",
             "source ./init.sh >/dev/null 2>&1",
-            f"cd {JAVAKOTLIN_DIR}",
+            f"cd {javakotlin_dir()}",
             "omrdroid build",
         ]
     )
@@ -98,8 +117,9 @@ def build_apk() -> Path:
     omrdroid's exit code is unreliable, success requires no failure markers in
     the output AND an APK mtime newer than the build start (guards against a
     stale reuse)."""
-    if not SRC_ROOT.exists():
-        raise BuildError(f"Enlistment not found at {SRC_ROOT}")
+    src = src_root()
+    if not src.exists():
+        raise BuildError(f"Enlistment not found at {src}")
     print("[BUILD] preparing enlistment (checkout LKG branch, pull)")
     _prepare_branch()
     print("[BUILD] compiling APK via omrdroid (this can take several minutes)")
@@ -113,14 +133,15 @@ def build_apk() -> Path:
             "omrdroid reported build/step failure(s): "
             + "; ".join(sorted(set(failures)))
         )
-    if not APK_PATH.exists():
-        raise BuildError(f"Build produced no APK at {APK_PATH}")
-    if APK_PATH.stat().st_mtime < started:
+    apk = apk_path()
+    if not apk.exists():
+        raise BuildError(f"Build produced no APK at {apk}")
+    if apk.stat().st_mtime < started:
         raise BuildError(
-            f"APK at {APK_PATH} was not rebuilt (stale); the build did not "
+            f"APK at {apk} was not rebuilt (stale); the build did not "
             "produce a fresh artifact"
         )
-    return APK_PATH
+    return apk
 
 
 def main() -> int:
