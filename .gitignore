@@ -14,3 +14,6 @@ venv/
 
 # Regression workbook contains local test credentials; keep it out of git
 testcases/regressions/*.xlsx
+
+# Locally remembered email recipient (never commit)
+.apppilot_recipient

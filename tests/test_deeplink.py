@@ -10,9 +10,12 @@ one-time warm-up.
 import contextlib
 import io
 import json
+import socket
 import sys
+import tempfile
 import types
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -21,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import apppilot_agent as a  # noqa: E402
 import deeplink_runner as d  # noqa: E402
+from apppilot import email_report  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_XLSX = REPO_ROOT / "testcases" / "deeplinks" / "deeplink_tests.xlsx"
@@ -1851,7 +1855,42 @@ class TapDeliveryTests(unittest.TestCase):
         self.assertEqual(flow_calls, ['- tapOn:\n    text: "Sign in"\n'])
         self.assertEqual(adb_calls, [])
 
-    def test_coordinate_input_taps_via_adb_then_types_via_flow(self):
+    def test_selector_tap_falls_back_to_coordinate_when_not_found(self):
+        # Regression: a visible element present in our a11y snapshot can be
+        # missed by Maestro's own id/text lookup (Compose/loading race). One
+        # flaky selector tap must NOT crash the suite - fall back to a coordinate
+        # tap on the element's known centre via adb.
+        ex, adb_calls, _ = self._executor()
+        flow_calls = []
+
+        def failing_flow(commands, **kw):
+            flow_calls.append(commands)
+            raise RuntimeError(
+                "Maestro action execution failed: Element not found: "
+                "Id matching regex: nextButton"
+            )
+
+        ex._run_flow = failing_flow
+        el = _ui_el(element_id="e:0", resource_id="nextButton", clickable=True,
+                    bounds=(0, 0, 200, 100))
+        obs = a.UIObservation((el,))
+        ex.execute(a.Action(a.ActionKind.TAP, target_id="e:0"), obs)
+        # Attempted the id selector, then fell back to an adb tap on the centre.
+        self.assertEqual(flow_calls, ['- tapOn:\n    id: "nextButton"\n'])
+        self.assertEqual(adb_calls, [["shell", "input", "tap", "100", "50"]])
+
+    def test_selector_tap_without_bounds_reraises(self):
+        # No bounds -> no safe coordinate fallback, so the failure propagates.
+        ex, _, _ = self._executor()
+
+        def failing_flow(commands, **kw):
+            raise RuntimeError("Element not found")
+
+        ex._run_flow = failing_flow
+        el = _ui_el(element_id="e:0", resource_id="nextButton", clickable=True)
+        obs = a.UIObservation((el,))
+        with self.assertRaises(RuntimeError):
+            ex.execute(a.Action(a.ActionKind.TAP, target_id="e:0"), obs)
         ex, adb_calls, flow_calls = self._executor()
         el = _ui_el(element_id="e:0", label="Field", clickable=True,
                     is_input=True, bounds=(0, 0, 200, 100))
@@ -1863,6 +1902,64 @@ class TapDeliveryTests(unittest.TestCase):
         self.assertEqual(adb_calls, [["shell", "input", "tap", "100", "50"]])
         self.assertEqual(flow_calls, ['- inputText: "hi"\n'])
 
+    def test_credential_coordinate_input_moves_caret_to_end_before_clearing(self):
+        # Regression: eraseText only backspaces LEFT of the caret, so a focus tap
+        # landing mid-text left the right portion behind (garbled email field).
+        # The caret must be moved to the end (MOVE_END) before the erase.
+        ex, adb_calls, flow_calls = self._executor()
+        el = _ui_el(element_id="e:0", label="Email", clickable=True,
+                    is_input=True, bounds=(0, 0, 200, 100))
+        obs = a.UIObservation((el,))
+        ex.execute(
+            a.Action(
+                a.ActionKind.INPUT_TEXT, target_id="e:0",
+                credential_kind=a.CredentialKind.USERNAME,
+            ),
+            obs,
+            secret="user@example.com",
+        )
+        # Focus tap, THEN caret-to-end (KEYCODE_MOVE_END = 123) before erasing.
+        self.assertEqual(
+            adb_calls,
+            [
+                ["shell", "input", "tap", "100", "50"],
+                ["shell", "input", "keyevent", "123"],
+            ],
+        )
+        # Whole field erased (from the end), then the secret typed via the env
+        # placeholder - never the literal value in the flow.
+        self.assertEqual(
+            flow_calls,
+            [
+                f"- eraseText: {a.CREDENTIAL_FIELD_ERASE_CHARS}\n",
+                f"- inputText: ${{{a.MAESTRO_SECRET_ENV}}}\n",
+            ],
+        )
+
+    def test_credential_text_input_focuses_then_moves_caret_and_clears(self):
+        # Same reliable clear on the text-match (Maestro tapOn) focus path.
+        ex, adb_calls, flow_calls = self._executor()
+        el = _ui_el(element_id="e:0", text="Email or phone number",
+                    clickable=True, is_input=True, bounds=(0, 0, 100, 50))
+        obs = a.UIObservation((el,))
+        ex.execute(
+            a.Action(
+                a.ActionKind.INPUT_TEXT, target_id="e:0",
+                credential_kind=a.CredentialKind.USERNAME,
+            ),
+            obs,
+            secret="user@example.com",
+        )
+        # Caret-to-end still runs via adb even when focus was a Maestro tapOn.
+        self.assertEqual(adb_calls, [["shell", "input", "keyevent", "123"]])
+        self.assertEqual(
+            flow_calls,
+            [
+                '- tapOn:\n    text: "Email or phone number"\n',
+                f"- eraseText: {a.CREDENTIAL_FIELD_ERASE_CHARS}\n",
+                f"- inputText: ${{{a.MAESTRO_SECRET_ENV}}}\n",
+            ],
+        )
 
 class KeyboardFilteringTests(unittest.TestCase):
     """The live bug: after typing a password the on-screen keyboard adds 100+
@@ -3025,6 +3122,605 @@ class InstalledCaseIsolationTests(unittest.TestCase):
         )
         runner.run_uninstalled_case(_ucase("TCU"))
         self.assertNotIn(("stop_app", None), executor.calls)
+
+
+class _PasswordThenSubmitProvider:
+    """Mimics the flaky model that keeps choosing to re-type the password
+    whenever the field is offered, and only taps Sign in when it is not. Proves
+    the agent withholds an already-entered credential so login advances to
+    submit instead of hard-failing on a re-entry loop."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def decide(self, request):
+        self.calls += 1
+        for action in request.available_actions:
+            if (
+                action.kind == a.ActionKind.INPUT_TEXT
+                and action.credential_kind == a.CredentialKind.PASSWORD
+            ):
+                return a.ModelDecision(action=action, reason="enter password")
+        for action in request.available_actions:
+            if action.kind == a.ActionKind.TAP:
+                element = request.observation.find(action.target_id)
+                if element is not None and element.resource_id == "idSIButton9":
+                    return a.ModelDecision(action=action, reason="submit")
+        return a.ModelDecision(
+            action=a.Action(a.ActionKind.PRESS_BACK), reason="fallback"
+        )
+
+
+class _CapturingExecutor:
+    def __init__(self):
+        self.actions = []
+
+    def execute(self, action, observation, secret=None):
+        self.actions.append((action.kind, action.credential_kind))
+
+
+class EnteredCredentialWithholdingTests(unittest.TestCase):
+    def _password_screen(self):
+        return a.UIObservation(
+            (
+                _ui_el(
+                    element_id="pw", resource_id="i0118", hint_text="Password",
+                    is_input=True, clickable=True, label="Enter password",
+                ),
+                _ui_el(
+                    element_id="signin", resource_id="idSIButton9",
+                    text="Sign in", clickable=True, label="Sign in",
+                ),
+            )
+        )
+
+    def _agent(self, observer, provider, executor):
+        return a.AppPilotAgent(
+            observer=observer,
+            goal_evaluator=a.SignedInCopilotGoalEvaluator(),
+            decision_provider=provider,
+            safety_validator=a.SafetyValidator(),
+            executor=executor,
+            max_actions=30,
+            runtime_context=a.RuntimeContext(
+                {a.CredentialKind.PASSWORD: "pw"}
+            ),
+            sleep=lambda seconds: None,
+            nonactionable_wait_seconds=0,
+        )
+
+    def test_password_entered_once_then_submit_completes_login(self):
+        # Password screen looks identical after entry (the field never echoes),
+        # so a naive model re-selects the input. The agent must withhold the
+        # entered field and let the model submit - completing login, not looping.
+        observer = _SequenceObserver(
+            [
+                self._password_screen(),
+                self._password_screen(),  # identical: field still looks empty
+                a.UIObservation((_composer_home_el(),)),  # signed in after submit
+            ]
+        )
+        provider = _PasswordThenSubmitProvider()
+        executor = _CapturingExecutor()
+        result, out = _capture(
+            self._agent(observer, provider, executor).run, "goal", "guidance"
+        )
+        self.assertTrue(result)
+        self.assertNotIn("repeated credential entry", out)
+        # Password typed exactly once, then the submit tap - no re-entry loop.
+        self.assertEqual(
+            executor.actions,
+            [
+                (a.ActionKind.INPUT_TEXT, a.CredentialKind.PASSWORD),
+                (a.ActionKind.TAP, None),
+            ],
+        )
+
+    def test_credential_offered_again_after_screen_changes(self):
+        # Withholding is per-screen: a genuinely new credential screen must offer
+        # the input again (the entered-field set is cleared when the UI changes).
+        agent = self._agent(_StubObserver(), _RecordingBackProvider(), _CapturingExecutor())
+        screen = self._password_screen()
+        filled = set()
+        # First offer includes the password input.
+        actions, fp = agent._offer_actions(screen, filled, None)
+        self.assertTrue(
+            any(x.credential_kind == a.CredentialKind.PASSWORD for x in actions)
+        )
+        # Record the field as entered on this screen; it is then withheld.
+        filled.add(agent._credential_field_key(
+            next(x for x in actions if x.credential_kind == a.CredentialKind.PASSWORD),
+            screen,
+        ))
+        actions, fp = agent._offer_actions(screen, filled, fp)
+        self.assertFalse(
+            any(x.credential_kind == a.CredentialKind.PASSWORD for x in actions)
+        )
+        # A genuinely changed screen must clear the memory and offer the input
+        # again. Reuse the SAME field id (i0118) but change the surrounding UI,
+        # and keep a second actionable element present - so this can only pass
+        # because the entered-field memory was cleared on the screen change, not
+        # because the stranding guard re-offered a would-be-withheld lone field.
+        other = a.UIObservation(
+            (
+                _ui_el(
+                    element_id="pw", resource_id="i0118", hint_text="Password",
+                    is_input=True, clickable=True, label="Re-enter password",
+                ),
+                _ui_el(
+                    element_id="verify", resource_id="idSIButton9",
+                    text="Verify", clickable=True, label="Verify",
+                ),
+            )
+        )
+        actions, _ = agent._offer_actions(other, filled, fp)
+        self.assertTrue(
+            any(x.credential_kind == a.CredentialKind.PASSWORD for x in actions)
+        )
+
+    def test_entered_field_is_still_offered_when_it_is_the_only_action(self):
+        # Stranding guard: withholding is skipped when the entered credential is
+        # the only actionable (non-Back) element, so the agent is never stuck.
+        agent = self._agent(_StubObserver(), _RecordingBackProvider(), _CapturingExecutor())
+        lone = a.UIObservation(
+            (
+                _ui_el(
+                    element_id="pw", resource_id="i0118", hint_text="Password",
+                    is_input=True, clickable=False, label="Enter password",
+                ),
+            )
+        )
+        actions, fp = agent._offer_actions(lone, set(), None)
+        password = next(
+            x for x in actions if x.credential_kind == a.CredentialKind.PASSWORD
+        )
+        filled = {agent._credential_field_key(password, lone)}
+        # Same screen, field recorded as entered - still offered (no other step).
+        actions, _ = agent._offer_actions(lone, filled, fp)
+        self.assertTrue(
+            any(x.credential_kind == a.CredentialKind.PASSWORD for x in actions)
+        )
+
+    def test_withholding_is_specific_to_the_entered_field(self):
+        # A second, differently-keyed credential field on the SAME screen is not
+        # withheld just because another credential field was entered.
+        agent = self._agent(_StubObserver(), _RecordingBackProvider(), _CapturingExecutor())
+        two_fields = a.UIObservation(
+            (
+                _ui_el(
+                    element_id="pw", resource_id="i0118", hint_text="Password",
+                    is_input=True, clickable=True, label="Enter password",
+                ),
+                _ui_el(
+                    element_id="pin", resource_id="i0119", hint_text="Confirm password",
+                    is_input=True, clickable=True, label="Confirm password",
+                ),
+            )
+        )
+        actions, fp = agent._offer_actions(two_fields, set(), None)
+        first = next(
+            x for x in actions
+            if x.kind == a.ActionKind.INPUT_TEXT
+            and x.credential_kind is not None
+            and two_fields.find(x.target_id).resource_id == "i0118"
+        )
+        filled = {agent._credential_field_key(first, two_fields)}
+        actions, _ = agent._offer_actions(two_fields, filled, fp)
+        offered_ids = {
+            two_fields.find(x.target_id).resource_id
+            for x in actions
+            if x.kind == a.ActionKind.INPUT_TEXT and x.credential_kind is not None
+        }
+        self.assertNotIn("i0118", offered_ids)  # entered field withheld
+        self.assertIn("i0119", offered_ids)     # other credential field intact
+
+
+class _FakeRelay:
+    """Scripted relay transport recording each POST to /send-report."""
+
+    def __init__(self, status=202):
+        self.requests = []
+        self._status = status
+
+    def __call__(self, request):
+        self.requests.append(request)
+        return (self._status, "")
+
+
+class EmailReportTests(unittest.TestCase):
+    _ENV = {
+        "APPPILOT_EMAIL_API_URL": "https://relay.example.com/send-report",
+        "APPPILOT_EMAIL_API_KEY": "secret-key",
+    }
+
+    def _result(self, test_id, passed, *, installed=True,
+                expected="Chat screen", reason="restricted screen"):
+        case = d.DeeplinkTestCase(
+            test_id=test_id,
+            deep_link="myapp://open/chat",
+            user_type="Premium",
+            expected_result=expected,
+            installed=installed,
+        )
+        attempts = [d.AttemptResult(
+            attempt=1, matched=passed, reason="match" if passed else reason
+        )]
+        return d.TestCaseResult(case=case, attempts=attempts)
+
+    def _report(self, *results):
+        report = d.SuiteReport()
+        report.results.extend(results)
+        return report
+
+    def _mixed_report(self):
+        return self._report(
+            self._result("TC001", True, installed=True),
+            self._result("TC002", False, installed=False, reason="age/location block"),
+        )
+
+    def test_successful_send(self):
+        relay = _FakeRelay()
+        report = self._mixed_report()
+        result, out = _capture(
+            email_report.send_suite_report, report, env=self._ENV, transport=relay
+        )
+        self.assertTrue(result)
+        self.assertIn("[EMAIL] report sent successfully", out)
+        # Exactly one authenticated POST to the relay endpoint (single email).
+        self.assertEqual(len(relay.requests), 1)
+        sent = relay.requests[0]
+        self.assertEqual(sent.full_url, self._ENV["APPPILOT_EMAIL_API_URL"])
+        self.assertEqual(sent.get_method(), "POST")
+        self.assertEqual(sent.get_header("X-api-key"), "secret-key")
+        payload = json.loads(sent.data.decode("utf-8"))
+        # With no recipient chosen the caller sends subject + plain body + the
+        # HTML table; the sender is fixed server-side and the relay applies its
+        # default recipient.
+        self.assertEqual(set(payload), {"subject", "body", "html"})
+        self.assertIn("FAIL", payload["subject"])
+        body = payload["body"]
+        self.assertIn("Suite result: FAIL", body)
+        self.assertIn("Installed: 1", body)
+        self.assertIn("Uninstalled: 1", body)
+        self.assertIn("TC001", body)
+        self.assertIn("age/location block", body)  # failure reason preserved
+        self.assertIn("DEEPLINK TEST REPORT", body)  # existing report is source of truth
+        html_body = payload["html"]
+        self.assertIn("<table", html_body)
+        self.assertIn(">PASS<", html_body)  # green cell for the passing case
+        self.assertIn(">FAIL<", html_body)  # red cell for the failing case
+        self.assertIn("TC001", html_body)
+
+    def test_only_one_email_for_the_whole_suite(self):
+        relay = _FakeRelay()
+        report = self._report(
+            self._result("TC001", True, installed=True),
+            self._result("TC002", True, installed=True),
+            self._result("TC003", False, installed=False),
+            self._result("TC004", False, installed=False),
+        )
+        email_report.send_suite_report(report, env=self._ENV, transport=relay)
+        self.assertEqual(len(relay.requests), 1)  # one report, not per-case/retry
+
+    def test_missing_configuration_returns_false_without_calling_relay(self):
+        env = dict(self._ENV)
+        del env["APPPILOT_EMAIL_API_KEY"]
+        relay = _FakeRelay()
+        result, out = _capture(
+            email_report.send_suite_report,
+            self._mixed_report(), env=env, transport=relay,
+        )
+        self.assertFalse(result)
+        self.assertIn("missing configuration", out)
+        self.assertIn("APPPILOT_EMAIL_API_KEY", out)
+        self.assertEqual(relay.requests, [])  # no network attempted
+
+    def test_email_failure_does_not_raise(self):
+        # A transport that raises must be swallowed (returns False), so the suite
+        # result - computed independently from report.failed - is never affected.
+        def boom(_request):
+            raise urllib.error.URLError("network down")
+
+        report = self._mixed_report()
+        result, out = _capture(
+            email_report.send_suite_report, report, env=self._ENV, transport=boom
+        )
+        self.assertFalse(result)
+        self.assertIn("[EMAIL] report send FAILED", out)
+        # The report/suite verdict is untouched by the email outcome.
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(report.passed, 1)
+
+    def test_recipient_is_forwarded_to_the_relay(self):
+        relay = _FakeRelay()
+        email_report.send_suite_report(
+            self._mixed_report(), env=self._ENV,
+            recipient="picked@example.com", transport=relay,
+        )
+        payload = json.loads(relay.requests[0].data.decode("utf-8"))
+        self.assertEqual(payload["to"], "picked@example.com")
+
+    def test_no_recipient_omits_to_field(self):
+        relay = _FakeRelay()
+        email_report.send_suite_report(
+            self._mixed_report(), env=self._ENV, transport=relay
+        )
+        payload = json.loads(relay.requests[0].data.decode("utf-8"))
+        self.assertNotIn("to", payload)  # relay uses its fixed default recipient
+
+    def test_html_body_renders_table_with_colored_result_cells(self):
+        report = self._mixed_report()
+        html_body = email_report.build_html_body(report)
+        # A bordered table with a header and one row per case.
+        self.assertIn("<table", html_body)
+        self.assertIn("S.No", html_body)
+        self.assertIn("Result", html_body)
+        # Result cells use PASS on a green background / FAIL on a red one.
+        self.assertIn("#1e7e34", html_body)  # green (pass)
+        self.assertIn("#c62828", html_body)  # red (fail)
+        self.assertIn(">PASS<", html_body)
+        self.assertIn(">FAIL<", html_body)
+
+    def test_html_body_escapes_dynamic_values(self):
+        report = self._report(
+            self._result("TC<script>", True, expected="<b>chat</b>"),
+        )
+        html_body = email_report.build_html_body(report)
+        self.assertNotIn("<script>", html_body)
+        self.assertIn("&lt;script&gt;", html_body)
+        self.assertIn("&lt;b&gt;chat&lt;/b&gt;", html_body)
+
+    def test_html_body_sorts_cases_by_test_id(self):
+        # Natural order: TC2 before TC10, regardless of insertion order.
+        report = self._report(
+            self._result("TC10", True),
+            self._result("TC2", True),
+            self._result("TC1", True),
+        )
+        html_body = email_report.build_html_body(report)
+        self.assertLess(html_body.index("TC1"), html_body.index("TC2"))
+        self.assertLess(html_body.index("TC2"), html_body.index("TC10"))
+
+    def test_html_body_includes_per_attempt_explanations(self):
+        report = self._report(
+            self._result("TC001", False, installed=True,
+                         reason="access restricted by age or location"),
+        )
+        html_body = email_report.build_html_body(report)
+        # Detail row carries the same verdicts + attempt reasons as plain text.
+        self.assertIn("Deeplink test:", html_body)
+        self.assertIn("Overall test case:", html_body)
+        self.assertIn("Attempt 1:", html_body)
+        self.assertIn("access restricted by age or location", html_body)
+        self.assertIn("mismatch", html_body)
+
+    def test_html_body_forwarded_to_relay(self):
+        relay = _FakeRelay()
+        email_report.send_suite_report(
+            self._mixed_report(), env=self._ENV, transport=relay
+        )
+        payload = json.loads(relay.requests[0].data.decode("utf-8"))
+        self.assertIn("html", payload)
+        self.assertIn("<table", payload["html"])
+
+    def test_any_transport_exception_is_swallowed(self):
+        # The suite result must be independent of email; realistic failures are
+        # NOT urllib.error.URLError (and Ctrl-C is BaseException), so the catch
+        # must cover them all.
+        for exc in (socket.timeout(), ConnectionResetError(), TimeoutError(),
+                    TypeError("bad transport"), ValueError("boom"),
+                    KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__):
+                def boom(_request, _exc=exc):
+                    raise _exc
+
+                result, out = _capture(
+                    email_report.send_suite_report,
+                    self._mixed_report(), env=self._ENV, transport=boom,
+                )
+                self.assertFalse(result)
+                self.assertIn("[EMAIL] report send FAILED", out)
+
+    def test_success_accepts_any_2xx_status(self):
+        # urllib raises HTTPError for non-2xx, so a returned status is always 2xx;
+        # 201/204 must count as success, not be rejected.
+        for status in (200, 201, 202, 204):
+            with self.subTest(status=status):
+                relay = _FakeRelay(status=status)
+                result = email_report.send_suite_report(
+                    self._mixed_report(), env=self._ENV, transport=relay
+                )
+                self.assertTrue(result)
+
+    def test_3xx_or_error_status_is_treated_as_failure(self):
+        for status in (301, 400, 500):
+            with self.subTest(status=status):
+                relay = _FakeRelay(status=status)
+                result, out = _capture(
+                    email_report.send_suite_report,
+                    self._mixed_report(), env=self._ENV, transport=relay,
+                )
+                self.assertFalse(result)
+                self.assertIn("[EMAIL] report send FAILED", out)
+
+    def test_non_https_relay_url_is_rejected(self):
+        relay = _FakeRelay()
+        env = dict(self._ENV, APPPILOT_EMAIL_API_URL="http://relay.example.com/x")
+        result, out = _capture(
+            email_report.send_suite_report,
+            self._mixed_report(), env=env, transport=relay,
+        )
+        self.assertFalse(result)
+        self.assertIn("[EMAIL] report send FAILED", out)
+        self.assertEqual(relay.requests, [])  # never posted over cleartext
+
+    def test_oversized_body_is_truncated_before_send(self):
+        report = self._report(*[
+            self._result(f"TC{i:04d}", False, reason="x" * 500)
+            for i in range(600)
+        ])
+        body = email_report.build_body(report)
+        self.assertLessEqual(len(body), email_report._MAX_BODY_CHARS + 100)
+        self.assertIn("truncated", body)
+
+
+class EmailRecipientPromptTests(unittest.TestCase):
+    """The up-front prompt phase (asked BEFORE the suite runs) is isolated from
+    delivery: it only resolves a recipient, never contacts the relay."""
+
+    _ENV = EmailReportTests._ENV
+
+    def _prompt(self, answers, *, interactive=True, saved=None):
+        it = iter(answers)
+        with mock.patch.object(email_report, "_load_saved_recipient", return_value=saved), \
+                mock.patch.object(email_report, "_save_recipient") as save:
+            result, out = _capture(
+                email_report.prompt_email_recipient,
+                env=self._ENV, interactive=interactive,
+                input_fn=lambda _prompt: next(it), output=print,
+            )
+        return result, out, save
+
+    def test_yes_returns_entered_recipient_and_persists_it(self):
+        recipient, out, save = self._prompt(["y", "picked@example.com"])
+        self.assertEqual(recipient, "picked@example.com")
+        self.assertIn("will be emailed to picked@example.com", out)
+        save.assert_called_once_with("picked@example.com")
+
+    def test_affirmative_styles_are_accepted(self):
+        for answer in ("y", "Y", "yes", "YES", " Yes "):
+            with self.subTest(answer=answer):
+                recipient, _out, _save = self._prompt([answer, "a@b.com"])
+                self.assertEqual(recipient, "a@b.com")
+
+    def test_empty_input_returns_saved_default(self):
+        recipient, _out, _save = self._prompt(["y", ""], saved="remembered@x.com")
+        self.assertEqual(recipient, "remembered@x.com")
+
+    def test_invalid_email_reprompts_then_returns_valid_one(self):
+        recipient, out, _save = self._prompt(["yes", "not-an-email", "good@x.com"])
+        self.assertEqual(recipient, "good@x.com")
+        self.assertIn("Invalid email address", out)
+
+    def test_gives_up_after_repeated_invalid_addresses(self):
+        recipient, out, save = self._prompt(["y", "bad1", "bad2", "bad3"])
+        self.assertIsNone(recipient)
+        self.assertIn("no valid recipient", out)
+        save.assert_not_called()
+
+    def test_decline_returns_none(self):
+        recipient, out, save = self._prompt(["n"])
+        self.assertIsNone(recipient)
+        self.assertIn("declined", out)
+        save.assert_not_called()
+
+    def test_cancel_at_first_prompt_returns_none(self):
+        def interrupt(_prompt):
+            raise KeyboardInterrupt
+
+        recipient, out = _capture(
+            email_report.prompt_email_recipient,
+            env=self._ENV, interactive=True, input_fn=interrupt,
+        )
+        self.assertIsNone(recipient)
+        self.assertIn("cancelled", out)
+
+    def test_cancel_at_recipient_returns_none_not_saved_default(self):
+        # Regression: Ctrl-C at the recipient prompt must ABORT, not silently
+        # reuse the remembered address (only empty input accepts the default).
+        answers = iter(["y"])
+
+        def ask(_prompt):
+            try:
+                return next(answers)
+            except StopIteration:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(
+            email_report, "_load_saved_recipient", return_value="old@example.com"
+        ), mock.patch.object(email_report, "_save_recipient") as save:
+            recipient, out = _capture(
+                email_report.prompt_email_recipient,
+                env=self._ENV, interactive=True, input_fn=ask,
+            )
+        self.assertIsNone(recipient)
+        self.assertIn("cancelled", out)
+        save.assert_not_called()
+
+    def test_non_interactive_returns_none(self):
+        recipient, out, _save = self._prompt(["y", "a@b.com"], interactive=False)
+        self.assertIsNone(recipient)
+        self.assertIn("non-interactive", out)
+
+    def test_missing_config_returns_none_without_asking(self):
+        env = {"APPPILOT_EMAIL_API_URL": "https://relay.example.com/send-report"}
+        asked = []
+
+        def record(prompt):
+            asked.append(prompt)
+            return "y"
+
+        recipient, out = _capture(
+            email_report.prompt_email_recipient,
+            env=env, interactive=True, input_fn=record,
+        )
+        self.assertIsNone(recipient)
+        self.assertIn("missing configuration", out)
+        self.assertEqual(asked, [])
+
+    def test_helper_predicates(self):
+        self.assertTrue(email_report.is_affirmative("YES"))
+        self.assertFalse(email_report.is_affirmative("nope"))
+        self.assertTrue(email_report.is_valid_email("a.b@c.co"))
+        self.assertFalse(email_report.is_valid_email("a@b"))
+
+    def test_recipient_round_trips_through_a_real_store_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / ".apppilot_recipient"
+            with mock.patch.object(email_report, "_RECIPIENT_STORE", store):
+                answers = iter(["y", "saved@example.com"])
+                recipient = email_report.prompt_email_recipient(
+                    env=self._ENV, interactive=True,
+                    input_fn=lambda _p: next(answers),
+                )
+                self.assertEqual(recipient, "saved@example.com")
+                self.assertEqual(store.read_text().strip(), "saved@example.com")
+                self.assertEqual(email_report._load_saved_recipient(), "saved@example.com")
+
+    def test_corrupt_store_file_never_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Path(tmp) / ".apppilot_recipient"
+            store.write_bytes(b"\xff\xfe not a valid utf8 email \x00")
+            with mock.patch.object(email_report, "_RECIPIENT_STORE", store):
+                # A corrupt/garbage store must be ignored, not crash the CLI.
+                self.assertIsNone(email_report._load_saved_recipient())
+
+    def test_prompt_up_front_then_send_after_delivers_to_chosen_recipient(self):
+        # Mirrors the CLI flow: ask BEFORE the run, deliver AFTER it.
+        with mock.patch.object(email_report, "_load_saved_recipient", return_value=None), \
+                mock.patch.object(email_report, "_save_recipient"):
+            answers = iter(["y", "after@example.com"])
+            recipient = email_report.prompt_email_recipient(
+                env=self._ENV, interactive=True,
+                input_fn=lambda _p: next(answers),
+            )
+        self.assertEqual(recipient, "after@example.com")
+        # ... suite would run here ...
+        relay = _FakeRelay()
+        report = d.SuiteReport()
+        report.results.append(d.TestCaseResult(
+            case=d.DeeplinkTestCase(
+                test_id="TC001", deep_link="myapp://open/chat", user_type="Premium",
+                expected_result="Chat screen", installed=True,
+            ),
+            attempts=[d.AttemptResult(attempt=1, matched=True, reason="match")],
+        ))
+        sent = email_report.send_suite_report(
+            report, env=self._ENV, recipient=recipient, transport=relay,
+        )
+        self.assertTrue(sent)
+        payload = json.loads(relay.requests[0].data.decode("utf-8"))
+        self.assertEqual(payload["to"], "after@example.com")
 
 
 if __name__ == "__main__":

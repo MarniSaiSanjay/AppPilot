@@ -57,6 +57,7 @@ try:
     from ..apppilot.agent import _load_dotenv  # noqa: E402
     from ..apppilot.models import UIObservation  # noqa: E402
     from ..apppilot import officemobile_build  # noqa: E402
+    from ..apppilot import email_report  # noqa: E402
 except ImportError:
     from apppilot.android import (  # noqa: E402
         APP_ID,
@@ -66,6 +67,7 @@ except ImportError:
     from apppilot.agent import _load_dotenv  # noqa: E402
     from apppilot.models import UIObservation  # noqa: E402
     from apppilot import officemobile_build  # noqa: E402
+    from apppilot import email_report  # noqa: E402
 
 # The SHARED login capability (same generic AppPilotAgent + Brain) - reused, not
 # duplicated. Sibling import works whether this module is loaded as
@@ -81,7 +83,11 @@ DEFAULT_RETRY_WAIT_SECONDS = 2.0
 DEFAULT_SETTLE_SECONDS = 3.0
 # Bounded verification polling: observe -> judge repeatedly, PASS on first match,
 # mismatch only after the window elapses. Same for installed AND uninstalled.
-DEFAULT_VERIFY_TIMEOUT_SECONDS = 15.0
+# Each observe+judge (a11y dump + AI judge) takes a few seconds, so this window
+# fits ~3 validations - enough for a slow-settling screen to appear and be caught
+# by a cheap re-check, instead of falling through to an expensive full retry
+# (which re-opens the deeplink and, when uninstalled, re-installs the app).
+DEFAULT_VERIFY_TIMEOUT_SECONDS = 30.0
 DEFAULT_VERIFY_POLL_INTERVAL_SECONDS = 2.0
 # Bounded wait for the app to become foreground after an adb launch (a returning
 # launch command is not proof); confirmed via the deterministic adb foreground check.
@@ -1135,7 +1141,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--verify-timeout", type=float, default=DEFAULT_VERIFY_TIMEOUT_SECONDS,
         help=(
             "Maximum seconds to poll for the expected result after a deeplink "
-            "before declaring a mismatch (default 15)."
+            "before declaring a mismatch (default 30)."
         ),
     )
     parser.add_argument(
@@ -1211,10 +1217,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         login_flow=login_flow,
         installer=installer,
     )
+    # Ask UP FRONT whether to email the report and to whom, so the operator can
+    # start the (long) suite and walk away; delivery happens automatically once
+    # the run finishes. Prompting is isolated and must never affect the suite
+    # result, so any failure here is swallowed.
+    try:
+        interactive = getattr(sys.stdin, "isatty", lambda: False)()
+        email_recipient = email_report.prompt_email_recipient(
+            env=os.environ, interactive=interactive
+        )
+    except Exception as error:  # pragma: no cover - defensive; prompt never raises
+        print(f"[EMAIL] email prompt failed - continuing without email: {error}")
+        email_recipient = None
+
     # The orchestrator owns the explicit top-level lifecycle and composes the
     # runner for per-case execution, judging, retry and reporting.
     report = DeeplinkSuiteOrchestrator(runner).run(cases)
-    print(report.format())
+    print("[REPORT] generating report...")
+    report_text = report.format()
+    print(report_text)
+    print("[REPORT] report generated")
+    # TESTS -> FINAL REPORT -> EMAIL. Deliver to the address chosen up front (if
+    # any). Delivery must never affect the verdict, so failure is swallowed.
+    if email_recipient is not None:
+        print("[EMAIL] triggering email delivery...")
+        try:
+            email_report.send_suite_report(
+                report, env=os.environ, recipient=email_recipient
+            )
+        except Exception as error:  # pragma: no cover - defensive last line
+            print(f"[EMAIL] report not sent - unexpected error: {error}")
     return 0 if report.failed == 0 else 1
 
 

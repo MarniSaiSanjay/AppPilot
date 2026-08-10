@@ -544,33 +544,63 @@ class MaestroExecutor:
         kind, payload = self._tap_command(target)
         if kind == "point":
             self._tap_point(*payload)
-        else:
+            return
+        try:
             self._run_flow(payload)
+        except RuntimeError:
+            # A selector tap (id/text) can miss an element that IS present in the
+            # a11y snapshot we observed - Maestro's own lookup can fail to match a
+            # Compose node, or the screen is mid-settle when the driver runs. When
+            # we already know the element's on-screen centre, fall back to a
+            # coordinate tap via adb (the most reliable delivery on Compose)
+            # instead of letting one flaky tap crash the whole suite. Without
+            # bounds there is no safe fallback, so the error propagates.
+            center = target.center
+            if center is None:
+                raise
+            print("[MAESTRO] selector tap failed; retrying via coordinate tap")
+            self._tap_point(*center)
 
     def _input_text(
         self, action: Action, target: UIElement, secret: str | None
     ) -> None:
         use_secret = secret is not None
-        if action.credential_kind is not None or use_secret:
-            # Clear any existing/accumulated content first so repeated entry
-            # replaces rather than appends, then inject the secret via the
-            # environment placeholder (never the literal value in the YAML).
-            follow = (
-                f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n"
-                f"- inputText: ${{{MAESTRO_SECRET_ENV}}}\n"
-            )
-        else:
-            follow = f"- inputText: {json.dumps(action.input_text)}\n"
+        replace_existing = action.credential_kind is not None or use_secret
 
         kind, payload = self._tap_command(target)
+        # Focus the target field first. Coordinate taps go through adb; text
+        # matches run a Maestro tapOn. Either way the field ends up focused so
+        # the subsequent clear/type acts on it.
         if kind == "point":
-            # The field is focused by the coordinate tap, then typed into by a
-            # separate Maestro flow (eraseText/inputText act on the focused
-            # field, so no in-flow tapOn is required).
             self._tap_point(*payload)
-            self._run_flow(follow, secret=secret)
         else:
-            self._run_flow(payload + follow, secret=secret)
+            self._run_flow(payload)
+
+        if replace_existing:
+            # Reliably empty the field before entry so a re-entered/default value
+            # replaces the old one instead of merging with it, then inject the
+            # secret via the environment placeholder (never the literal value in
+            # the YAML).
+            self._clear_focused_field()
+            self._run_flow(
+                f"- inputText: ${{{MAESTRO_SECRET_ENV}}}\n", secret=secret
+            )
+        else:
+            self._run_flow(f"- inputText: {json.dumps(action.input_text)}\n")
+
+    def _clear_focused_field(self) -> None:
+        """Deterministically empty the currently focused text field.
+
+        ``eraseText`` only deletes to the LEFT of the caret, so when the focus
+        tap lands in the middle of pre-filled text the characters to its right
+        survive - producing a garbled mix of old and new input (observed on the
+        sign-in email field). Moving the caret to the end first makes the erase
+        remove the whole field regardless of where the tap placed the caret.
+        """
+        # KEYCODE_MOVE_END (123): caret to end of the focused field, so the
+        # generous eraseText below clears everything to its left = the field.
+        self._run_adb(["shell", "input", "keyevent", "123"])
+        self._run_flow(f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n")
 
     def _tap_point(self, x: int, y: int) -> None:
         """Deliver a coordinate tap through adb's input pipeline.

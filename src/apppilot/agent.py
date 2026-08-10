@@ -99,6 +99,12 @@ class AppPilotAgent:
         # to avoid re-entering the same credential when the UI has not changed.
         last_credential_key: tuple[str, str] | None = None
         last_credential_fingerprint: tuple | None = None
+        # Credentials already entered on the current (unchanged) screen. Their
+        # input actions are withheld from the model until the screen changes, so
+        # it advances to submit instead of re-typing a field that looks empty (a
+        # password box never echoes its value, so the screen appears unchanged).
+        filled_credential_keys: set[tuple[str, str]] = set()
+        filled_fingerprint: tuple | None = None
         # Track consecutive actions that leave the meaningful UI unchanged.
         last_acted_fingerprint: tuple | None = None
         consecutive_stuck = 0
@@ -116,7 +122,9 @@ class AppPilotAgent:
             # actionable step exists, wait and re-observe (never invent an action
             # or a diagnostic Back) until a step appears, the goal is reached, or
             # the wait budget is exhausted.
-            available_actions = self._safety_validator.available_actions(observation)
+            available_actions, filled_fingerprint = self._offer_actions(
+                observation, filled_credential_keys, filled_fingerprint
+            )
             waits = 0
             while not self._has_actionable_step(observation, available_actions):
                 if waits >= self._max_nonactionable_waits:
@@ -139,8 +147,8 @@ class AppPilotAgent:
                 if reached:
                     self._log_pass()
                     return True
-                available_actions = self._safety_validator.available_actions(
-                    observation
+                available_actions, filled_fingerprint = self._offer_actions(
+                    observation, filled_credential_keys, filled_fingerprint
                 )
 
             # Advance the stuck counter when the last action left the meaningful
@@ -217,13 +225,7 @@ class AppPilotAgent:
                 # Guard against re-entering the same credential on an unchanged
                 # screen (prevents redundant entry loops). The model remains the
                 # decision-maker; this is only a safety guard, not a login step.
-                target = observation.find(action.target_id)
-                credential_key = (
-                    action.credential_kind.value,
-                    (target.resource_id if target and target.resource_id else action.target_id)
-                    or action.target_id
-                    or "",
-                )
+                credential_key = self._credential_field_key(action, observation)
                 fingerprint = self._observation_fingerprint(observation)
                 if (
                     credential_key == last_credential_key
@@ -245,6 +247,14 @@ class AppPilotAgent:
 
             self._emit(f"ACTION:\n{action.describe(observation)}\n")
             self._executor.execute(action, observation, secret=secret)
+            if action.credential_kind is not None:
+                # Withhold this field's input next turn (until the screen changes)
+                # so the model proceeds to submit rather than re-typing it.
+                # filled_fingerprint already matches this observation (set by the
+                # _offer_actions call above), so no recompute is needed here.
+                filled_credential_keys.add(
+                    self._credential_field_key(action, observation)
+                )
             history.append(action.describe(observation))
             # Remember the state we just acted on, to detect progress next step.
             last_acted_fingerprint = meaningful_fingerprint
@@ -324,6 +334,52 @@ class AppPilotAgent:
             for element in observation.elements
             if element.resource_id or element.clickable or element.is_input
         )
+
+    def _offer_actions(self, observation, filled_keys, filled_fingerprint):
+        """Safe actions for this screen, withholding already-entered credential
+        fields until the screen changes.
+
+        A credential input whose field was already filled on this same screen is
+        removed, so the model advances to submit instead of re-typing a field
+        that still looks empty. The set is cleared whenever the screen changes.
+        Withholding is skipped if it would leave no actionable (non-Back) step,
+        so the agent is never stranded on a screen whose only action was the
+        already-entered field.
+        """
+        current_fingerprint = self._observation_fingerprint(observation)
+        if current_fingerprint != filled_fingerprint:
+            filled_keys.clear()
+        actions = self._safety_validator.available_actions(observation)
+        if filled_keys:
+            withheld = tuple(
+                action
+                for action in actions
+                if not self._is_entered_credential(action, observation, filled_keys)
+            )
+            if self._has_actionable_ui(withheld):
+                actions = withheld
+        return actions, current_fingerprint
+
+    def _is_entered_credential(self, action, observation, filled_keys) -> bool:
+        if action.kind != ActionKind.INPUT_TEXT or action.credential_kind is None:
+            return False
+        return self._credential_field_key(action, observation) in filled_keys
+
+    @staticmethod
+    def _credential_field_key(action, observation) -> tuple[str, str]:
+        """Stable per-field key for a credential input.
+
+        Keyed on the field's resource id (stable across identical re-renders,
+        unlike the element path, which can shift), so an entered field is
+        recognised again on the unchanged screen.
+        """
+        target = observation.find(action.target_id)
+        field_id = (
+            target.resource_id
+            if target and target.resource_id
+            else action.target_id
+        )
+        return (action.credential_kind.value, field_id or "")
 
 
 
