@@ -67,8 +67,8 @@ committed).
 | `APPPILOT_MODEL` | yes* | Decision-model deployment/name (e.g. `gpt-4.1-mini`). |
 | `APPPILOT_MODEL_API_KEY` | yes* | API key for the model endpoint. |
 | `APPPILOT_MODEL_BASE_URL` | no | OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint). |
-| `APPPILOT_USERNAME` | for login goals | Sign-in username/email, resolved locally and injected straight into Maestro — never sent to the model. |
-| `APPPILOT_PASSWORD` | for login goals | Sign-in password, handled the same secure way. |
+| `APPPILOT_USERNAME` | for login goals | **Sign-in username/email for the app under test** (e.g. the Microsoft account used to log into the Office hub app) — resolved locally and injected straight into Maestro, never sent to the model. Not the model API key. |
+| `APPPILOT_PASSWORD` | for login goals | **Sign-in password for the app under test**, handled the same secure way. |
 | `APPPILOT_MAX_ACTIONS` | no | Absolute upper bound on actions per run (default `30`). |
 | `APPPILOT_MAX_STUCK_ACTIONS` | no | Consecutive actions with no meaningful UI change before the run stops early with a controlled FAIL (default `5`). |
 
@@ -79,6 +79,12 @@ Credentials are never placed in prompts, observations, logs, exceptions,
 Maestro arguments, or source. The model can only *request* a credential by kind
 (`username` / `password`); AppPilot resolves the real value locally and hands it
 to Maestro securely.
+
+> **Note:** `APPPILOT_USERNAME` / `APPPILOT_PASSWORD` are the **login credentials
+> for the app being tested** (the account AppPilot signs in with when a scenario
+> reaches a login screen). They are **only** needed for login scenarios, and are
+> unrelated to the model API key (`APPPILOT_MODEL_API_KEY`) or any GitHub
+> credentials.
 
 Example `.env`:
 
