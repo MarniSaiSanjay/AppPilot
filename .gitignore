@@ -17,3 +17,6 @@ testcases/regressions/*.xlsx
 
 # Locally remembered email recipient (never commit)
 .apppilot_recipient
+
+# Locally remembered APK path (never commit)
+.apppilot_apk

@@ -353,14 +353,15 @@ RESULT</code></pre>
           <tr><td><code>--max-attempts</code></td><td>Attempts per case before FAIL (default <code>2</code>).</td></tr>
           <tr><td><code>--verify-timeout</code></td><td>Bounded polling window for the expected result (default <code>30</code> seconds).</td></tr>
           <tr><td><code>--no-warm-up</code></td><td>Skip the one-time installed-batch warm-up.</td></tr>
-          <tr><td><code>--rebuild</code></td><td>Force a fresh local OfficeMobile APK build.</td></tr>
+          <tr><td><code>--apk</code></td><td>Path to the local <code>.apk</code> to install (else the saved path is offered/reused, otherwise you are prompted).</td></tr>
         </tbody>
       </table>
       <p>At the end it prints a concise per-test report plus totals (Total / Passed / Failed).</p>
       <div class="warn">
         <strong>Local APK and deferred-link requirements</strong>
-        The current workflow expects a clean OfficeMobile enlistment at <code>/Volumes/Office/omr1/src</code>
-        already on <code>lkg/main/android</code>. AppPilot does not commit, switch, or pull that repository.
+        AppPilot installs only a user-provided local <code>.apk</code> — there is no build, enlistment, or store acquisition.
+        Supply it with <code>--apk PATH</code> or let the CLI offer the saved path (<code>.apppilot_apk</code>, gitignored) / prompt for one at startup;
+        it is validated (exists, is a file, <code>.apk</code>, readable) before the suite runs, and an invalid path exits with code <code>2</code>.
         Deferred deeplink/referrer delivery for uninstalled cases must be confirmed on a real clean device;
         unit tests can validate orchestration but not Android platform delivery.
       </div>

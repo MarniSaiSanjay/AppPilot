@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-BUILD = "BUILD"
 EMAIL = "EMAIL"
 INSTALL = "INSTALL"
 INSTALLED = "INSTALLED"

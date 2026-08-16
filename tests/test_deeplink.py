@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import apppilot_agent as a  # noqa: E402
 import deeplink_runner as d  # noqa: E402
-from apppilot import email_report, logtags, officemobile_build  # noqa: E402
+from apppilot import email_report, logtags  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_XLSX = REPO_ROOT / "testcases" / "deeplinks" / "deeplink_tests.xlsx"
@@ -1030,72 +1030,6 @@ class AndroidStateOperationTests(unittest.TestCase):
 
         with self.assertRaises(a.AndroidOperationalError):
             executor._tap_point(10, 20)
-
-
-class OfficeMobileBuildSafetyTests(unittest.TestCase):
-    def test_dirty_enlistment_fails_without_git_mutation(self):
-        calls = []
-
-        def fake_git(*args):
-            calls.append(args)
-            if args == ("status", "--porcelain"):
-                return " M file"
-            raise AssertionError(f"unexpected git mutation: {args}")
-
-        with mock.patch.object(officemobile_build, "_git", fake_git):
-            with self.assertRaisesRegex(
-                officemobile_build.BuildError, "local changes"
-            ):
-                officemobile_build._prepare_branch()
-
-        self.assertEqual(calls, [("status", "--porcelain")])
-
-    def test_wrong_branch_requires_explicit_switch(self):
-        responses = {
-            ("status", "--porcelain"): "",
-            ("branch", "--show-current"): "feature/work",
-        }
-
-        with mock.patch.object(
-            officemobile_build,
-            "_git",
-            side_effect=lambda *args: responses[args],
-        ):
-            with self.assertRaisesRegex(
-                officemobile_build.BuildError,
-                officemobile_build.LKG_BRANCH,
-            ):
-                officemobile_build._prepare_branch()
-
-    def test_prepared_branch_is_not_modified(self):
-        calls = []
-
-        def fake_git(*args):
-            calls.append(args)
-            if args == ("status", "--porcelain"):
-                return ""
-            if args == ("branch", "--show-current"):
-                return officemobile_build.LKG_BRANCH
-            raise AssertionError(f"unexpected git mutation: {args}")
-
-        with mock.patch.object(officemobile_build, "_git", fake_git):
-            officemobile_build._prepare_branch()
-
-        self.assertEqual(
-            calls,
-            [("status", "--porcelain"), ("branch", "--show-current")],
-        )
-
-    def test_build_timeout_is_controlled(self):
-        with mock.patch.object(
-            officemobile_build.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired("zsh", 1),
-        ):
-            with self.assertRaisesRegex(
-                officemobile_build.BuildError, "timed out"
-            ):
-                officemobile_build._run_omrdroid_build()
 
 
 class SuggestedPromptGuardTests(unittest.TestCase):
@@ -2997,7 +2931,6 @@ class AgentLogTagTests(unittest.TestCase):
 
     def test_subsystem_tags_are_centralized(self):
         expected = {
-            "BUILD": "BUILD",
             "EMAIL": "EMAIL",
             "INSTALL": "INSTALL",
             "INSTALLED": "INSTALLED",

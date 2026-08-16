@@ -2,7 +2,7 @@
 
 Parses the deeplink flags, loads the Excel test cases, wires the semantic judge,
 the Maestro executor/observer, the shared login/installer/warm-up nodes and the
-local officemobile APK build, then runs the suite via the orchestrator and
+user-provided local APK path, then runs the suite via the orchestrator and
 optionally emails the report. Behavior, flags, exit codes and output are the
 Deeplink use case's own contract.
 """
@@ -19,14 +19,14 @@ from typing import Sequence
 try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     from ...apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from ...apppilot.agent import _load_dotenv
-    from ...apppilot import email_report, logtags, officemobile_build
+    from ...apppilot import apk_config, email_report, logtags
     from ...shared.warmup import MaestroWarmUp
     from ...shared.installer import LocalApkInstaller
     from ...shared.login import LoginCapability, SharedLoginFlow, build_login_agent
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from apppilot.agent import _load_dotenv
-    from apppilot import email_report, logtags, officemobile_build
+    from apppilot import apk_config, email_report, logtags
     from shared.warmup import MaestroWarmUp
     from shared.installer import LocalApkInstaller
     from shared.login import LoginCapability, SharedLoginFlow, build_login_agent
@@ -76,8 +76,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Skip the one-time first-install warm-up before the suite.",
     )
     parser.add_argument(
-        "--rebuild", action="store_true",
-        help="Force a fresh officemobile build even if a prior APK exists.",
+        "--apk", default=None,
+        help=(
+            "Path to the local .apk to install. If omitted, a previously saved "
+            "path is offered/reused, otherwise you are prompted for one."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -96,6 +99,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         cases = load_deeplink_cases(args.excel)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         print(f"ERROR: could not load deeplink test cases: {error}", file=sys.stderr)
+        return 2
+
+    # AppPilot installs ONLY a user-provided local APK (no build/acquisition).
+    # Resolve it up front from --apk, a saved path, or an interactive prompt, and
+    # validate before any execution. An unresolved/invalid path is a clean setup
+    # error (exit 2); it never reaches test execution and never leaks a traceback.
+    interactive = getattr(sys.stdin, "isatty", lambda: False)()
+    apk_path = apk_config.resolve_apk_path(args.apk, interactive=interactive)
+    if apk_path is None:
+        print("ERROR: no valid APK path provided", file=sys.stderr)
         return 2
 
     judge = LLMExpectationJudge.from_env()
@@ -122,17 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     login_flow: LoginCapability = SharedLoginFlow(login_agent)
 
-    # Build (or reuse) the local officemobile APK and install it via adb - never
-    # from the actual Play Store.
-    try:
-        apk_path = officemobile_build.APK_PATH
-        if args.rebuild or not apk_path.exists():
-            logtags.trace("building local officemobile APK", logtags.BUILD)
-            apk_path = officemobile_build.build_apk()
-        logtags.trace(f"using local APK: {apk_path}", logtags.BUILD)
-    except officemobile_build.BuildError as error:
-        print(f"ERROR: could not build local APK: {error}", file=sys.stderr)
-        return 2
+    logtags.trace(f"using APK: {apk_path}", logtags.INSTALL)
     installer = LocalApkInstaller(executor, str(apk_path))
     runner = DeeplinkTestRunner(
         observer=observer,
@@ -149,7 +152,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     # the run finishes. Prompting is isolated and must never affect the suite
     # result, so any failure here is swallowed.
     try:
-        interactive = getattr(sys.stdin, "isatty", lambda: False)()
         email_recipient = email_report.prompt_email_recipient(
             env=os.environ, interactive=interactive
         )

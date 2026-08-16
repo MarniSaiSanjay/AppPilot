@@ -179,13 +179,16 @@ python3 src/deeplink_runner.py --device emulator-5554
 ```
 
 Options: `--excel` (workbook path), `--device`, `--max-attempts` (default `2`),
-`--verify-timeout` (default `30` seconds), `--no-warm-up`, and `--rebuild`.
-At the end it prints a concise per-test report plus totals.
+`--verify-timeout` (default `30` seconds), `--no-warm-up`, and `--apk` (path to
+the local `.apk` to install). At the end it prints a concise per-test report plus
+totals.
 
-The current local-APK workflow expects a clean OfficeMobile enlistment at
-`/Volumes/Office/omr1/src` already on `lkg/main/android`. AppPilot never commits,
-switches, or pulls that enlistment automatically. A pre-existing APK is reused
-unless `--rebuild` is supplied.
+AppPilot installs **only a user-provided local `.apk`** — there is no build,
+enlistment, or store acquisition. Supply the path with `--apk PATH`, or let the
+CLI prompt for it at startup: a previously saved path (in `.apppilot_apk`,
+gitignored) is offered as `Use this APK? [Y/n]`, otherwise you are asked to enter
+one. The path is normalized and validated (exists, is a file, `.apk`, readable)
+before the suite runs; an invalid path exits cleanly with code `2`.
 
 For uninstalled cases, deferred deeplink/referrer delivery after sideloading is
 a live Android acceptance requirement; unit tests validate orchestration but
