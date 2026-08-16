@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
-import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
 from .models import Action, ActionKind, CredentialKind, ExecutionContext, UIObservation
+
+try:  # package-relative vs top-level (src on sys.path)
+    from ..shared.model_client import ChatModelClient, ModelTransportError
+except ImportError:
+    from shared.model_client import ChatModelClient, ModelTransportError
 
 
 @dataclass(frozen=True)
@@ -163,22 +166,19 @@ class LLMModelDecisionProvider:
         timeout: float = 60.0,
     ) -> None:
         self._model = model
-        self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
+        self._client = ChatModelClient(
+            model=model, api_key=api_key, base_url=base_url, timeout=timeout
+        )
         self._transport = transport or self._http_transport
-        self._timeout = timeout
 
     @classmethod
     def from_env(
         cls, env: dict | None = None
     ) -> "LLMModelDecisionProvider | None":
-        env = os.environ if env is None else env
-        api_key = env.get("APPPILOT_MODEL_API_KEY")
-        model = env.get("APPPILOT_MODEL")
-        if not api_key or not model:
+        config = ChatModelClient.config_from_env(env)
+        if config is None:
             return None
-        base_url = env.get("APPPILOT_MODEL_BASE_URL") or "https://api.openai.com/v1"
-        return cls(model=model, api_key=api_key, base_url=base_url)
+        return cls(**config)
 
     def decide(self, request: DecisionRequest) -> ModelDecision:
         options = list(request.available_actions)
@@ -296,22 +296,7 @@ class LLMModelDecisionProvider:
         return f'tap "{label}"'
 
     def _http_transport(self, payload: dict) -> dict:
-        data = json.dumps(payload).encode("utf-8")
-        http_request = urllib.request.Request(
-            f"{self._base_url}/chat/completions",
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self._api_key}",
-            },
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(http_request, timeout=self._timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except (
-            OSError,
-            json.JSONDecodeError,
-            UnicodeError,
-        ) as error:
+            return self._client.send(payload)
+        except ModelTransportError as error:
             raise RuntimeError(f"Model request failed: {error}") from error

@@ -215,6 +215,35 @@ class ExcelLoadingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             d.load_deeplink_cases(_write_xlsx(Path(self._tmp()), []))
 
+    def _write_zip_without_worksheet(self) -> Path:
+        # A valid ZIP that is NOT a readable workbook: it lacks the expected
+        # xl/worksheets/sheet1.xml member (e.g. a renamed/reordered sheet).
+        path = Path(self._tmp()) / "no_sheet.xlsx"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("xl/worksheets/sheet2.xml", "<worksheet/>")
+        return path
+
+    def test_missing_worksheet_member_raises_valueerror(self):
+        # Regression (B1): a valid ZIP without the expected worksheet member must
+        # surface a stable domain-level ValueError, not a zip-internal KeyError.
+        with self.assertRaises(ValueError) as ctx:
+            d.load_deeplink_cases(self._write_zip_without_worksheet())
+        self.assertIn("not a readable deeplink workbook", str(ctx.exception))
+
+    def test_cli_reports_missing_worksheet_as_exit_2(self):
+        # Regression (B1): the CLI must convert the loader error into a clean
+        # exit code 2 (never a traceback), matching the existing invalid-input
+        # contract. Loading happens before any model/build wiring.
+        import contextlib
+        import io as _io
+
+        bad_path = self._write_zip_without_worksheet()
+        stderr = _io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = d.main(["--excel", str(bad_path)])
+        self.assertEqual(rc, 2)
+        self.assertIn("could not load deeplink test cases", stderr.getvalue())
+
     def _tmp(self):
         import tempfile
         return tempfile.mkdtemp()
@@ -1365,7 +1394,7 @@ class LoginBoundaryTests(unittest.TestCase):
 
         _, out2 = _capture(flow.ensure_ready)
         self.assertIn("[LOGIN] Sign-in required", out2)
-        self.assertIn("[LOGIN] Returning control to deeplink test", out2)
+        self.assertIn("[LOGIN] Returning control to use case", out2)
         self.assertGreaterEqual(provider.calls, 1)
 
     def test_logged_out_takes_authentication_action(self):
@@ -2847,7 +2876,7 @@ class ExecutionTraceLoggingTests(unittest.TestCase):
         _, out = _capture(flow.ensure_ready)
         self.assertIn("[LOGIN] Already signed in - no login actions required", out)
         self.assertNotIn("[LOGIN] Sign-in required", out)
-        self.assertNotIn("[LOGIN] Returning control to deeplink test", out)
+        self.assertNotIn("[LOGIN] Returning control to use case", out)
 
     def test_login_sign_in_required_logging(self):
         logged_out = _logged_out_observation()
@@ -2864,7 +2893,7 @@ class ExecutionTraceLoggingTests(unittest.TestCase):
         )
         _, out = _capture(flow.ensure_ready)
         self.assertIn("[LOGIN] Sign-in required - starting shared login flow", out)
-        self.assertIn("[LOGIN] Returning control to deeplink test", out)
+        self.assertIn("[LOGIN] Returning control to use case", out)
 
 
 # --------------------------------------------------------------------------- #
@@ -4425,6 +4454,315 @@ class EmailRecipientPromptTests(unittest.TestCase):
         self.assertTrue(sent)
         payload = json.loads(relay.requests[0].data.decode("utf-8"))
         self.assertEqual(payload["to"], "after@example.com")
+
+
+class SharedLoginPolicyTests(unittest.TestCase):
+    """Phase-2 shared login node: LoginPolicy + terminal abstractions. The shared
+    login must stay generic (no use-case branching); a use case supplies WHAT/WHY
+    via a policy while the node owns HOW. Default behavior must be unchanged."""
+
+    class _FakeStateJudge:
+        """Stand-in for SemanticStateEvaluator: matches() returns a fixed verdict
+        and records calls, so a semantic terminal is deterministic in tests."""
+
+        def __init__(self, result):
+            self.result = result
+            self.calls = 0
+            self.begin_calls = 0
+            self.last_description = None
+
+        def begin_run(self):
+            self.begin_calls += 1
+
+        def matches(self, description, observation):
+            self.calls += 1
+            self.last_description = description
+            return self.result
+
+    class _RecTerminal:
+        def __init__(self, reached):
+            self.reached = reached
+            self.calls = 0
+
+        def begin_run(self):
+            pass
+
+        def is_reached(self, goal, observation):
+            self.calls += 1
+            return self.reached
+
+        def has_actionable_step(self, observation):
+            return None
+
+    def _login_mod(self):
+        import flows.login as login_mod
+
+        return login_mod
+
+    # 1 + default policy stays identical to today's login.
+    def test_default_policy_matches_prototype_constants(self):
+        login_mod = self._login_mod()
+        policy = login_mod.LoginPolicy.default()
+        self.assertEqual(policy.goal, login_mod.PROTOTYPE_GOAL)
+        self.assertEqual(policy.guidance, login_mod.DEFAULT_GUIDANCE)
+        self.assertEqual(policy.terminals, ())
+        self.assertTrue(policy.stop_at_login_completion)
+
+    def test_default_build_uses_authoritative_evaluator_directly(self):
+        login_mod = self._login_mod()
+        with mock.patch.object(
+            login_mod.LLMLoginGoalEvaluator, "from_env", return_value=None
+        ), mock.patch.object(
+            login_mod.SemanticStateEvaluator, "from_env", return_value=None
+        ):
+            agent = login_mod.build_login_agent(
+                observer=_FixedObserver(a.UIObservation((_chat_screen_el(),))),
+                executor=_NoopExecutor(),
+                provider=_RecordingProvider(),
+                policy=login_mod.LoginPolicy.default(),
+            )
+        # The default agent's evaluator is the SAME object type/behavior as today
+        # (not wrapped in a composite): byte-for-byte behavior preservation.
+        self.assertIsInstance(
+            agent._goal_evaluator, a.AuthoritativeLoginGoalEvaluator
+        )
+
+    # 2 + 3 configured semantic terminal stops BEFORE brain/action; never dismissed.
+    def test_semantic_terminal_stops_before_brain_and_is_not_dismissed(self):
+        login_mod = self._login_mod()
+        judge = self._FakeStateJudge(True)
+        policy = login_mod.LoginPolicy(
+            goal="reach the First-Run / FRI screen",
+            guidance=None,
+            terminals=(
+                login_mod.SemanticTerminalState(
+                    "the First-Run / FRI screen is displayed", evaluator=judge
+                ),
+            ),
+        )
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        with mock.patch.object(
+            login_mod.LLMLoginGoalEvaluator, "from_env", return_value=None
+        ):
+            agent = login_mod.build_login_agent(
+                observer=_FixedObserver(
+                    a.UIObservation((_ui_el(text="First Run Experience"),))
+                ),
+                executor=executor,
+                provider=provider,
+                policy=policy,
+            )
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = agent.run(policy.goal, policy.guidance)
+        self.assertTrue(result)              # terminal reached => success
+        self.assertEqual(provider.calls, 0)  # Brain never asked (stop first)
+        self.assertEqual(executor.executed, 0)  # terminal NOT dismissed/acted on
+        self.assertGreaterEqual(judge.calls, 1)
+
+    # 4 non-terminal incidental state still drives login normally.
+    def test_non_terminal_state_lets_login_continue(self):
+        login_mod = self._login_mod()
+        judge = self._FakeStateJudge(False)
+        policy = login_mod.LoginPolicy(
+            goal="reach the First-Run / FRI screen",
+            terminals=(
+                login_mod.SemanticTerminalState("the FRI screen", evaluator=judge),
+            ),
+        )
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        with mock.patch.object(
+            login_mod.LLMLoginGoalEvaluator, "from_env", return_value=None
+        ):
+            agent = login_mod.build_login_agent(
+                observer=_FixedObserver(_logged_out_observation()),
+                executor=executor,
+                provider=provider,
+                policy=policy,
+                max_actions=1,
+            )
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.run(policy.goal, policy.guidance)
+        # Terminal did not fire on a non-matching screen, so login proceeded to
+        # consult the Brain (bounded to one action) exactly as an unconstrained
+        # login does today.
+        self.assertGreaterEqual(provider.calls, 1)
+        self.assertGreaterEqual(judge.calls, 1)
+
+    # 5 a use case adds a custom terminal WITHOUT modifying shared login.
+    def test_custom_deterministic_terminal_without_touching_shared_login(self):
+        login_mod = self._login_mod()
+        policy = login_mod.LoginPolicy(
+            goal="stop at the marker screen",
+            terminals=(
+                login_mod.DeterministicTerminalState(
+                    lambda obs: any(
+                        el.resource_id == "marker" for el in obs.elements
+                    ),
+                    name="marker",
+                ),
+            ),
+        )
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        with mock.patch.object(
+            login_mod.LLMLoginGoalEvaluator, "from_env", return_value=None
+        ):
+            agent = login_mod.build_login_agent(
+                observer=_FixedObserver(
+                    a.UIObservation((_ui_el(text="X", resource_id="marker"),))
+                ),
+                executor=executor,
+                provider=provider,
+                policy=policy,
+            )
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = agent.run(policy.goal)
+        self.assertTrue(result)
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(executor.executed, 0)
+
+    # 6 default terminal keeps deterministic-False -> skip-semantic behavior.
+    def test_default_terminal_deterministic_false_skips_semantic(self):
+        semantic = SharedLoginPolicyTests._RecTerminal(True)
+
+        class _RecordingSemantic:
+            def __init__(self):
+                self.reached_calls = 0
+
+            def begin_run(self):
+                pass
+
+            def is_reached(self, goal, observation):
+                self.reached_calls += 1
+                return True
+
+            def has_actionable_step(self, observation):
+                return True
+
+        rec = _RecordingSemantic()
+        evaluator = a.AuthoritativeLoginGoalEvaluator(
+            a.SignedInCopilotGoalEvaluator(foreground_check=lambda: True), rec
+        )
+        # A credential screen is a deterministic "not signed in" (False) verdict,
+        # so the semantic evaluator must NOT be consulted.
+        self.assertFalse(
+            evaluator.is_reached("login", a.UIObservation((_cred_el(),)))
+        )
+        self.assertEqual(rec.reached_calls, 0)
+
+    # 7 multiple terminals obey declaration priority + short-circuit.
+    def test_composite_terminal_priority_and_short_circuit(self):
+        login_mod = self._login_mod()
+        obs = a.UIObservation((_ui_el(text="s"),))
+
+        first_wins = SharedLoginPolicyTests._RecTerminal(True)
+        second = SharedLoginPolicyTests._RecTerminal(True)
+        comp = login_mod.CompositeTerminalEvaluator([first_wins, second])
+        self.assertTrue(comp.is_reached("g", obs))
+        self.assertEqual(first_wins.calls, 1)
+        self.assertEqual(second.calls, 0)  # short-circuit at first reached
+
+        first_false = SharedLoginPolicyTests._RecTerminal(False)
+        second_true = SharedLoginPolicyTests._RecTerminal(True)
+        comp2 = login_mod.CompositeTerminalEvaluator([first_false, second_true])
+        self.assertTrue(comp2.is_reached("g", obs))
+        self.assertEqual(first_false.calls, 1)
+        self.assertEqual(second_true.calls, 1)  # falls through in order
+
+        # No terminal expresses an actionable opinion -> fail open (True).
+        self.assertTrue(
+            login_mod.CompositeTerminalEvaluator(
+                [SharedLoginPolicyTests._RecTerminal(False)]
+            ).has_actionable_step(obs)
+        )
+
+    # 8 credential/safety wiring unchanged by the policy seam.
+    def test_build_preserves_safety_and_login_tag(self):
+        login_mod = self._login_mod()
+        with mock.patch.object(
+            login_mod.LLMLoginGoalEvaluator, "from_env", return_value=None
+        ), mock.patch.object(
+            login_mod.SemanticStateEvaluator, "from_env", return_value=None
+        ):
+            agent = login_mod.build_login_agent(
+                observer=_FixedObserver(a.UIObservation((_chat_screen_el(),))),
+                executor=_NoopExecutor(),
+                provider=_RecordingProvider(),
+            )
+        self.assertIsInstance(agent._safety_validator, a.SafetyValidator)
+        self.assertEqual(agent._log_tag, logtags.LOGIN)
+
+    # 9 P3-1: shared model client seam + preserved error semantics.
+    def test_shared_model_client_seam_and_error_parity(self):
+        from shared.model_client import ChatModelClient, ModelTransportError
+
+        self.assertTrue(issubclass(ModelTransportError, RuntimeError))
+        self.assertIsNone(ChatModelClient.config_from_env({}))
+        self.assertIsNone(ChatModelClient.config_from_env({"APPPILOT_MODEL": "m"}))
+        self.assertEqual(
+            ChatModelClient.config_from_env(
+                {"APPPILOT_MODEL": "m", "APPPILOT_MODEL_API_KEY": "k"}
+            ),
+            {"model": "m", "api_key": "k", "base_url": "https://api.openai.com/v1"},
+        )
+        self.assertEqual(
+            ChatModelClient.config_from_env(
+                {
+                    "APPPILOT_MODEL": "m",
+                    "APPPILOT_MODEL_API_KEY": "k",
+                    "APPPILOT_MODEL_BASE_URL": "http://x/v1",
+                }
+            )["base_url"],
+            "http://x/v1",
+        )
+        # The login judge maps a shared transport failure to its ORIGINAL type
+        # and message, unchanged from before the consolidation.
+        ev = a.LLMLoginGoalEvaluator(
+            model="m", api_key="k", base_url="http://x/v1",
+            foreground_check=lambda: True,
+        )
+        ev._client.send = lambda payload: (_ for _ in ()).throw(
+            ModelTransportError("boom")
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            ev._http_transport({})
+        self.assertEqual(str(ctx.exception), "Login judge request failed: boom")
+
+    # 10 public import/facade surfaces stay compatible.
+    def test_public_facades_remain_compatible(self):
+        login_mod = self._login_mod()
+        for name in (
+            "SignedInCopilotGoalEvaluator",
+            "LLMLoginGoalEvaluator",
+            "AuthoritativeLoginGoalEvaluator",
+            "SemanticStateEvaluator",
+            "build_login_agent",
+            "resolve_decision_provider",
+            "PROTOTYPE_GOAL",
+            "DEFAULT_GUIDANCE",
+            "main",
+            "_parse_args",
+            "LoginPolicy",
+            "DeterministicTerminalState",
+            "SemanticTerminalState",
+            "CompositeTerminalEvaluator",
+            "SharedLoginFlow",
+            "LoginCapability",
+        ):
+            self.assertTrue(hasattr(login_mod, name), name)
+        for name in (
+            "SignedInCopilotGoalEvaluator",
+            "LLMLoginGoalEvaluator",
+            "AuthoritativeLoginGoalEvaluator",
+        ):
+            self.assertTrue(hasattr(a, name), name)
+        self.assertTrue(hasattr(d, "SharedLoginFlow"))
+        self.assertTrue(hasattr(d, "LoginCapability"))
+        import shared.login as sl
+
+        self.assertIs(sl.build_login_agent, login_mod.build_login_agent)
 
 
 if __name__ == "__main__":

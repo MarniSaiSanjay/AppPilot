@@ -150,9 +150,37 @@ be semantically classified by the login judge. Once login completion is true,
 the agent stops before asking the Brain and hands the current UI to deeplink
 verification. Login PASS never implies deeplink PASS.
 
+## Code layering (shared nodes and use cases)
+
+The code is organized in three one-way layers:
+
+```
+usecases  ->  shared  ->  apppilot
+```
+
+- **`apppilot/`** is the generic framework (agent loop, Android/Maestro,
+  model boundary, safety, data contracts, reporting). It knows nothing about
+  any use case.
+- **`shared/`** holds reusable, use-case-agnostic nodes that use cases compose:
+  `model_client` (OpenAI-compatible transport), `installer`, `warmup`, and the
+  generic `login/` node. Shared nodes stay generic — they never import a
+  specific use case — and let callers supply runtime behavior (for example,
+  login accepts a `LoginPolicy` describing the desired terminal states in
+  natural language).
+- **`usecases/`** holds business/test-specific behavior; each use case gets its
+  own folder. `usecases/deeplink/` is the authoritative Deeplink
+  implementation and composes the shared nodes plus the `apppilot` framework.
+
+`flows/login.py`, `flows/deeplink.py`, and `deeplink_runner.py` are thin
+compatibility shims/entry points that re-export the authoritative
+`shared`/`usecases` surfaces.
+
 ## Deeplink test suite (data-driven runner)
 
-`src/deeplink_runner.py` layers a **data-driven deeplink runner** on top of the
+The Deeplink use case now lives under `src/usecases/deeplink/` (composing the
+shared login/installer/warmup/model-client nodes); `src/deeplink_runner.py`
+remains a compatibility entry point that re-exports it. It layers a
+**data-driven deeplink runner** on top of the
 same components — the Maestro executor, the Maestro observer, and the same
 OpenAI-compatible model configuration — rather than forking a second framework.
 It keeps the core boundaries: deterministic execution, AI reasoning, and

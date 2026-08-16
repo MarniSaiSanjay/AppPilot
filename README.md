@@ -28,13 +28,22 @@ design principles.
 
 ## Project structure
 
-- `src/apppilot/` — reusable agent loop, Android/Maestro integration, model
-  boundary, safety validation, data contracts, build helper, and reporting.
-- `src/flows/login.py` — the shared authentication/onboarding preparation flow.
-- `src/flows/deeplink.py` — workbook loading, installed/uninstalled orchestration,
-  retries, verification, and reporting.
+- `src/apppilot/` — the generic framework: agent loop, Android/Maestro
+  integration, model boundary, safety validation, data contracts, build helper,
+  and reporting.
+- `src/shared/` — reusable, use-case-agnostic nodes composed by use cases:
+  `model_client` (OpenAI-compatible transport), `installer`, `warmup`, and
+  `login/` (generic sign-in driven by a runtime `LoginPolicy`).
+- `src/usecases/deeplink/` — the Deeplink regression use case and its
+  authoritative implementation: Excel testcase loading, installed/uninstalled
+  orchestration, retries, verification, results, and CLI.
+- `src/flows/login.py` and `src/flows/deeplink.py` — thin compatibility shims
+  that re-export the shared login node and the `usecases.deeplink` public
+  surface so existing imports and `python -m flows.*` keep working.
 - `src/apppilot_agent.py` and `src/deeplink_runner.py` — compatibility CLI
   entry points.
+- Dependency direction is one-way — `usecases → shared → apppilot` — so shared
+  nodes stay generic and never import a specific use case.
 - `docs/` — project documentation.
 - `testcases/regressions/regression_suite.xlsx` — regression workbook (reserved
   for later; workbook/Excel integration is intentionally out of scope for the
