@@ -48,6 +48,14 @@ class DeeplinkSuiteOrchestrator:
             -> final SuiteReport
     """
 
+    #: Canonical, human-readable name of the suite this orchestrator runs. The
+    #: orchestrator owns the suite's identity: it stamps every ``SuiteReport``
+    #: it produces with this name, and reporting / the email subject and header
+    #: derive their labels from it rather than hardcoding "Deeplink". A use case
+    #: may have several suites; each suite's orchestrator declares its own
+    #: ``SUITE_NAME``.
+    SUITE_NAME = "Deeplink"
+
     def __init__(self, runner: "DeeplinkTestRunner") -> None:
         self._runner = runner
 
@@ -69,7 +77,7 @@ class DeeplinkSuiteOrchestrator:
         # so record every case as a startup failure and return the report -
         # never abort. The real reason is preserved (no false PASS) and final
         # reporting/email still happen. Existing per-case semantics are unchanged.
-        report = SuiteReport()
+        report = SuiteReport(suite_name=self.SUITE_NAME)
         try:
             self._runner.ensure_clean_install_state()
         except RuntimeError as exc:

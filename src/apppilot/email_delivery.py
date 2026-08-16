@@ -1,11 +1,12 @@
-"""Send the final deeplink suite report by email via the AppPilot email relay.
+"""Send a test-suite report by email via the AppPilot email relay.
 
-Isolated component. The report is delivered by a single authenticated HTTPS POST
-to the AppPilot email relay service, which owns the fixed sender (and a default
-recipient) and holds the privileged Azure Communication Services credential
-server-side - so no email/Azure credential ever lives in this CLI. Stdlib-only
-(urllib). The suite report stays the source of truth; this module only
-summarizes and delivers it. Email failures are logged under ``[EMAIL]`` and
+Isolated, use-case-agnostic delivery layer. The report is delivered by a single
+authenticated HTTPS POST to the AppPilot email relay service, which owns the
+fixed sender (and a default recipient) and holds the privileged Azure
+Communication Services credential server-side - so no email/Azure credential
+ever lives in this CLI. Stdlib-only (urllib). The suite report stays the source
+of truth; this module only delivers it (presentation lives in
+:mod:`apppilot.email_render`). Email failures are logged under ``[EMAIL]`` and
 never change the suite result.
 
 Before the suite runs the CLI asks the operator whether to send the report and,
@@ -18,18 +19,18 @@ time.
 Configuration (from the environment / .env; the end-user supplies nothing):
   APPPILOT_EMAIL_API_URL   the relay ``/send-report`` endpoint
   APPPILOT_EMAIL_API_KEY   the scoped relay API key
+  APPPILOT_CONTACT_EMAIL   optional footer contact address (omitted if unset)
 """
 
 from __future__ import annotations
 
-import html
 import json
 import re
 import urllib.request
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional
 
-from . import logtags
+from . import logtags, email_render
 
 _REQUIRED_ENV = (
     "APPPILOT_EMAIL_API_URL",
@@ -82,170 +83,22 @@ def _default_transport(request: urllib.request.Request) -> "tuple[int, str]":
         return response.status, response.read().decode("utf-8")
 
 
-def build_subject(report) -> str:
-    result = "PASS" if report.failed == 0 else "FAIL"
-    return f"AppPilot Deeplink Suite: {result} ({report.passed}/{report.total} passed)"
-
-
-def build_body(report) -> str:
-    """Summary header (suite result + installed/uninstalled breakdown) followed
-    by the existing report text, which stays the source of truth."""
-    result = "PASS" if report.failed == 0 else "FAIL"
-    installed = [r for r in report.results if r.case.installed]
-    uninstalled = [r for r in report.results if not r.case.installed]
-
-    def _passed(results: Sequence) -> int:
-        return sum(1 for r in results if r.passed)
-
-    header = [
-        f"Suite result: {result}",
-        f"Total cases: {report.total}",
-        f"Passed: {report.passed}   Failed: {report.failed}",
-        f"Installed: {len(installed)} "
-        f"({_passed(installed)} passed, {len(installed) - _passed(installed)} failed)",
-        f"Uninstalled: {len(uninstalled)} "
-        f"({_passed(uninstalled)} passed, {len(uninstalled) - _passed(uninstalled)} failed)",
-        "",
-        "-" * 60,
-        "",
-    ]
-    body = "\n".join(header) + report.format()
+def _cap_body(body: str) -> str:
+    """Cap the plain-text body so a huge suite can never trip the relay's size
+    limit. The console output remains the complete record."""
     if len(body) > _MAX_BODY_CHARS:
-        body = (
+        return (
             body[:_MAX_BODY_CHARS]
             + "\n\n[... report truncated for email; see console output ...]"
         )
     return body
 
 
-# Inline styles only (email clients strip <style>/external CSS). PASS/FAIL use a
-# solid green/red background with white text, as requested.
-_TH_STYLE = (
-    "background:#1f4e79;color:#ffffff;border:1px solid #244;"
-    "padding:8px 12px;text-align:left;font-weight:bold;"
-)
-_TD_STYLE = "border:1px solid #244;padding:8px 12px;"
-_PASS_STYLE = _TD_STYLE + "background:#1e7e34;color:#ffffff;font-weight:bold;text-align:center;"
-_FAIL_STYLE = _TD_STYLE + "background:#c62828;color:#ffffff;font-weight:bold;text-align:center;"
-
-_HTML_COLUMNS = ("S.No", "Test ID", "User", "Installed", "Attempt", "Expected", "Result")
-
-_ATTEMPT_MATCH_COLOR = "#1e7e34"
-_ATTEMPT_MISMATCH_COLOR = "#c62828"
-
-_TESTID_CHUNK_RE = re.compile(r"(\d+)")
-
-
-def _testid_sort_key(test_id: str):
-    """Natural sort key for a Test ID so e.g. TC2 sorts before TC10.
-
-    Splits into alternating text/number chunks; numbers compare numerically,
-    text case-insensitively. Purely deterministic (no locale dependence)."""
-    chunks = _TESTID_CHUNK_RE.split(str(test_id))
-    return [
-        (1, int(chunk)) if chunk.isdigit() else (0, chunk.lower())
-        for chunk in chunks
-        if chunk != ""
-    ]
-
-
-def build_html_body(report) -> str:
-    """Render the suite report as a bordered HTML table for the email.
-
-    Same data as the plain-text report, laid out as a table with a styled header
-    and a Result column showing PASS on a green background / FAIL on a red one.
-    Cases are ordered by Test ID. A "Details" section after the table lists, per
-    case, the deeplink/overall verdicts, the expected result, and every attempt's
-    match/mismatch reason (the same per-attempt explanations from the plain-text
-    report). Inline styles only, so it renders in clients that strip <style>.
-    """
-    result = "PASS" if report.failed == 0 else "FAIL"
-    installed = [r for r in report.results if r.case.installed]
-    uninstalled = [r for r in report.results if not r.case.installed]
-
-    def _passed(results: Sequence) -> int:
-        return sum(1 for r in results if r.passed)
-
-    def _esc(value) -> str:
-        return html.escape(str(value))
-
-    # Order cases by Test ID (natural sort so TC2 precedes TC10).
-    ordered = sorted(report.results, key=lambda r: _testid_sort_key(r.case.test_id))
-
-    rows = []
-    for index, r in enumerate(ordered, start=1):
-        passed = r.passed
-        attempt = r.passing_attempt or len(r.attempts)
-        status = "PASS" if passed else "FAIL"
-        status_style = _PASS_STYLE if passed else _FAIL_STYLE
-        cells = [
-            f'<td style="{_TD_STYLE}">{index}</td>',
-            f'<td style="{_TD_STYLE}">{_esc(r.case.test_id)}</td>',
-            f'<td style="{_TD_STYLE}">{_esc(r.case.user_type or "-")}</td>',
-            f'<td style="{_TD_STYLE}">{"yes" if r.case.installed else "no"}</td>',
-            f'<td style="{_TD_STYLE}">{attempt}</td>',
-            f'<td style="{_TD_STYLE}">{_esc(r.case.expected_result)}</td>',
-            f'<td style="{status_style}">{status}</td>',
-        ]
-        rows.append("<tr>" + "".join(cells) + "</tr>")
-
-    headers = "".join(f'<th style="{_TH_STYLE}">{col}</th>' for col in _HTML_COLUMNS)
-    suite_color = "#1e7e34" if report.failed == 0 else "#c62828"
-
-    # Per-case explanation blocks, listed AFTER the table (not inside it) so the
-    # grid stays clean. Same verdicts + attempt reasons as the plain-text report.
-    detail_blocks = []
-    for r in ordered:
-        passed = r.passed
-        attempt = r.passing_attempt or len(r.attempts)
-        status = "PASS" if passed else "FAIL"
-        header_color = _ATTEMPT_MATCH_COLOR if passed else _ATTEMPT_MISMATCH_COLOR
-        block = [
-            f'<div style="margin:14px 0 4px;">'
-            f'<b>{_esc(r.case.test_id)}</b> '
-            f'<b style="color:{header_color};">{status}</b> '
-            f'&nbsp; Attempt {attempt}</div>',
-            f'<div style="margin:0 0 2px;color:#3c4043;">'
-            f'Deeplink test: <b>{status}</b> &nbsp;|&nbsp; '
-            f'Overall test case: <b>{status}</b></div>',
-            f'<div style="margin:0 0 4px;color:#3c4043;">'
-            f'Expected: {_esc(r.case.expected_result)}</div>',
-        ]
-        for a in r.attempts:
-            mark = "match" if a.matched else "mismatch"
-            color = _ATTEMPT_MATCH_COLOR if a.matched else _ATTEMPT_MISMATCH_COLOR
-            block.append(
-                f'<div style="margin:0 0 3px 16px;color:#3c4043;">'
-                f'Attempt {a.attempt}: '
-                f'<b style="color:{color};">{mark}</b> - {_esc(a.reason)}</div>'
-            )
-        detail_blocks.append("".join(block))
-
-    parts = [
-        "<html><body style=\"font-family:'Segoe UI',Arial,sans-serif;color:#202124;\">",
-        "<h2 style=\"margin:0 0 8px;\">AppPilot Deeplink Suite Report</h2>",
-        f'<p style="margin:0 0 4px;">Suite result: '
-        f'<b style="color:{suite_color};">{result}</b> '
-        f"&mdash; {report.passed}/{report.total} passed</p>",
-        f'<p style="margin:0 0 12px;color:#5f6368;">'
-        f"Installed: {len(installed)} ({_passed(installed)} passed, "
-        f"{len(installed) - _passed(installed)} failed) &nbsp;|&nbsp; "
-        f"Uninstalled: {len(uninstalled)} ({_passed(uninstalled)} passed, "
-        f"{len(uninstalled) - _passed(uninstalled)} failed)</p>",
-        '<table style="border-collapse:collapse;font-size:14px;">',
-        f"<thead><tr>{headers}</tr></thead>",
-        "<tbody>" + "".join(rows) + "</tbody>",
-        "</table>",
-        '<h3 style="margin:20px 0 4px;">Details</h3>',
-        "".join(detail_blocks),
-        "</body></html>",
-    ]
-    body = "".join(parts)
-    if len(body) > _MAX_BODY_CHARS:
-        # Fall back to no HTML rather than sending a truncated/broken table; the
-        # plain-text body (always sent alongside) remains the complete record.
-        return ""
-    return body
+def _cap_html(html_body: str) -> str:
+    """Drop the HTML entirely if it would exceed the relay limit rather than
+    sending a truncated/broken table; the plain-text body (always sent
+    alongside) stays the complete record."""
+    return html_body if len(html_body) <= _MAX_BODY_CHARS else ""
 
 
 def _post_report(
@@ -299,14 +152,18 @@ def send_suite_report(
     destination = recipient or "the configured default recipient"
     # Emitted before the POST so the (possibly long) cold-start wait isn't silent.
     _log(f"sending report to {destination} - this can take up to a minute...")
+    contact = (env.get("APPPILOT_CONTACT_EMAIL") or "").strip() or None
     try:
+        # The report maps itself onto the generic email view; presentation is
+        # rendered by email_render, which has no use-case knowledge.
+        view = report.to_email_report()
         _post_report(
             env,
-            build_subject(report),
-            build_body(report),
+            email_render.build_subject(view),
+            _cap_body(email_render.build_text_body(view, contact)),
             transport,
             recipient,
-            build_html_body(report),
+            _cap_html(email_render.build_html_body(view, contact)),
         )
     except (Exception, KeyboardInterrupt) as error:  # never affect the suite result
         _log(f"report send FAILED: {error}")

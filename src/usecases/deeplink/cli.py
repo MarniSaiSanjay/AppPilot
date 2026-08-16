@@ -19,14 +19,14 @@ from typing import Sequence
 try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     from ...apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from ...apppilot.agent import _load_dotenv
-    from ...apppilot import apk_config, email_report, logtags
+    from ...apppilot import apk_config, email_delivery, logtags
     from ...shared.warmup import MaestroWarmUp
     from ...shared.installer import LocalApkInstaller
     from ...shared.login import LoginCapability, SharedLoginFlow, build_login_agent
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from apppilot.agent import _load_dotenv
-    from apppilot import apk_config, email_report, logtags
+    from apppilot import apk_config, email_delivery, logtags
     from shared.warmup import MaestroWarmUp
     from shared.installer import LocalApkInstaller
     from shared.login import LoginCapability, SharedLoginFlow, build_login_agent
@@ -152,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # the run finishes. Prompting is isolated and must never affect the suite
     # result, so any failure here is swallowed.
     try:
-        email_recipient = email_report.prompt_email_recipient(
+        email_recipient = email_delivery.prompt_email_recipient(
             env=os.environ, interactive=interactive
         )
     except Exception as error:  # pragma: no cover - defensive; prompt never raises
@@ -176,7 +176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if email_recipient is not None:
         print(logtags.prefix(logtags.EMAIL, "triggering email delivery..."))
         try:
-            email_report.send_suite_report(
+            email_delivery.send_suite_report(
                 report, env=os.environ, recipient=email_recipient
             )
         except Exception as error:  # pragma: no cover - defensive last line

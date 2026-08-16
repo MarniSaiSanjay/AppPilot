@@ -38,6 +38,11 @@ from .runner import (
 from .orchestrator import DeeplinkSuiteOrchestrator
 from .cli import main
 
+# The orchestrator owns the suite's identity; re-export its name as the
+# package-level ``SUITE_NAME`` so consumers (reporting, email, facades) have a
+# single public handle without reaching into the orchestrator class.
+SUITE_NAME = DeeplinkSuiteOrchestrator.SUITE_NAME
+
 __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_RETRY_WAIT_SECONDS",
@@ -57,6 +62,7 @@ __all__ = [
     "MaestroWarmUp",
     "SuiteReport",
     "TestCaseResult",
+    "SUITE_NAME",
     "WarmUp",
     "load_deeplink_cases",
     "main",

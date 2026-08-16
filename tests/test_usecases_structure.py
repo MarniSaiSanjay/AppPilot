@@ -41,6 +41,7 @@ _PUBLIC_SURFACE = [
     "MaestroWarmUp",
     "SuiteReport",
     "TestCaseResult",
+    "SUITE_NAME",
     "WarmUp",
     "load_deeplink_cases",
     "main",
