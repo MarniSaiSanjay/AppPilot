@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Protocol
@@ -192,11 +191,11 @@ class LLMModelDecisionProvider:
             ],
             "response_format": {"type": "json_object"},
         }
-        response = self._transport(payload)
         try:
+            response = self._transport(payload)
             content = response["choices"][0]["message"]["content"]
             decoded = json.loads(content)
-        except (KeyError, IndexError, ValueError, TypeError) as error:
+        except (KeyError, IndexError, ValueError, TypeError, RuntimeError) as error:
             return ModelDecision(
                 action=None, reason=f"Model response could not be parsed: {error}"
             )
@@ -207,7 +206,7 @@ class LLMModelDecisionProvider:
         reason = str(decoded.get("reason") or "").strip() or "(no reason given)"
         if action_id is None:
             return ModelDecision(action=None, reason=reason)
-        if not isinstance(action_id, int) or not 0 <= action_id < len(options):
+        if type(action_id) is not int or not 0 <= action_id < len(options):
             return ModelDecision(
                 action=None,
                 reason=(
@@ -310,6 +309,9 @@ class LLMModelDecisionProvider:
         try:
             with urllib.request.urlopen(http_request, timeout=self._timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.URLError as error:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            UnicodeError,
+        ) as error:
             raise RuntimeError(f"Model request failed: {error}") from error
-

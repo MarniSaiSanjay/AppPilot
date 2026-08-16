@@ -28,6 +28,7 @@ try:  # package-relative (python -m src.apppilot_agent)
     )
     from .apppilot.android import (
         APP_ID,
+        AndroidOperationalError,
         CREDENTIAL_FIELD_ERASE_CHARS,
         MAESTRO_SECRET_ENV,
         MaestroExecutor,
@@ -43,6 +44,7 @@ try:  # package-relative (python -m src.apppilot_agent)
         _load_dotenv,
     )
     from .flows.login import (
+        AuthoritativeLoginGoalEvaluator,
         DEFAULT_GUIDANCE,
         LLMLoginGoalEvaluator,
         PROTOTYPE_GOAL,
@@ -71,6 +73,7 @@ except ImportError:  # top-level (src on sys.path)
     )
     from apppilot.android import (
         APP_ID,
+        AndroidOperationalError,
         CREDENTIAL_FIELD_ERASE_CHARS,
         MAESTRO_SECRET_ENV,
         MaestroExecutor,
@@ -86,6 +89,7 @@ except ImportError:  # top-level (src on sys.path)
         _load_dotenv,
     )
     from flows.login import (
+        AuthoritativeLoginGoalEvaluator,
         DEFAULT_GUIDANCE,
         LLMLoginGoalEvaluator,
         PROTOTYPE_GOAL,

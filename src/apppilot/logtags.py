@@ -1,33 +1,19 @@
-"""Central registry of log tags used across AppPilot.
-
-Every user-facing log line is prefixed with a bracketed subsystem tag (e.g.
-``[LOGIN]``, ``[BUILD]``). One registry keeps output greppable and gives new
-components a consistent place to register a tag. String constants only.
-"""
+"""Central registry and rendering helpers for subsystem log tags."""
 
 from __future__ import annotations
 
-# Build / packaging of the app under test.
 BUILD = "BUILD"
-
-# The shared login/onboarding agent (authentication is a PRECONDITION of a
-# deeplink test, never the test's own PASS/FAIL).
-LOGIN = "LOGIN"
-
-# Deeplink test suite lifecycle. Finer-grained phase tags below all belong to
-# the DEEPLINK subsystem so a reader can tell which part ran.
-DEEPLINK = "DEEPLINK"
-SUITE = "SUITE"
-INSTALLED = "INSTALLED"
-UNINSTALLED = "UNINSTALLED"
-INSTALLED_BATCH = "INSTALLED BATCH"
+EMAIL = "EMAIL"
 INSTALL = "INSTALL"
+INSTALLED = "INSTALLED"
+INSTALLED_BATCH = "INSTALLED BATCH"
+LOGIN = "LOGIN"
+MAESTRO = "MAESTRO"
+REPORT = "REPORT"
+SUITE = "SUITE"
+UNINSTALLED = "UNINSTALLED"
 VERIFY = "VERIFY"
 WARM_UP = "WARM-UP"
-
-# The generic AppPilot agent when no caller-supplied context tag is set. Empty
-# means "emit the original untagged lines" (preserves generic reuse).
-AGENT = "AGENT"
 
 
 def tag(name: str) -> str:

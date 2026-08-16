@@ -37,7 +37,6 @@ import json
 import os
 import sys
 import time
-import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -51,23 +50,23 @@ from typing import Callable, Protocol, Sequence
 try:
     from ..apppilot.android import (  # noqa: E402
         APP_ID,
+        AndroidOperationalError,
         MaestroExecutor,
         MaestroHierarchyObserver,
     )
     from ..apppilot.agent import _load_dotenv  # noqa: E402
     from ..apppilot.models import UIObservation  # noqa: E402
-    from ..apppilot import officemobile_build  # noqa: E402
-    from ..apppilot import email_report  # noqa: E402
+    from ..apppilot import email_report, logtags, officemobile_build  # noqa: E402
 except ImportError:
     from apppilot.android import (  # noqa: E402
         APP_ID,
+        AndroidOperationalError,
         MaestroExecutor,
         MaestroHierarchyObserver,
     )
     from apppilot.agent import _load_dotenv  # noqa: E402
     from apppilot.models import UIObservation  # noqa: E402
-    from apppilot import officemobile_build  # noqa: E402
-    from apppilot import email_report  # noqa: E402
+    from apppilot import email_report, logtags, officemobile_build  # noqa: E402
 
 # The SHARED login capability (same generic AppPilotAgent + Brain) - reused, not
 # duplicated. Sibling import works whether this module is loaded as
@@ -95,7 +94,7 @@ DEFAULT_FOREGROUND_TIMEOUT_SECONDS = 30.0
 DEFAULT_FOREGROUND_POLL_SECONDS = 1.0
 
 
-def _trace(message: str) -> None:
+def _trace(message: str, log_tag: str = "") -> None:
     """Emit one execution-trace line to stdout.
 
     This is deliberately a dumb printer, NOT a narration helper: every call site
@@ -106,7 +105,7 @@ def _trace(message: str) -> None:
     corresponding "done" line is never printed. Secrets and full deeplink URLs
     are never passed in here.
     """
-    print(message)
+    print(logtags.prefix(log_tag, message))
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +348,10 @@ class ExpectationVerdict:
     reason: str
 
 
+class ExpectationJudgeOperationalError(RuntimeError):
+    """Expected model transport/response failure during verification."""
+
+
 class ExpectationJudge(Protocol):
     def evaluate(
         self, expected_result: str, observation: UIObservation
@@ -445,7 +448,12 @@ class LLMExpectationJudge:
             return ExpectationVerdict(
                 matched=False, reason=f"Judge response could not be parsed: {error}"
             )
-        matched = bool(decoded.get("match"))
+        matched = decoded.get("match")
+        if type(matched) is not bool:
+            return ExpectationVerdict(
+                matched=False,
+                reason="Judge response field 'match' must be a JSON boolean.",
+            )
         reason = str(decoded.get("reason") or "").strip() or "(no reason given)"
         return ExpectationVerdict(matched=matched, reason=reason)
 
@@ -474,8 +482,14 @@ class LLMExpectationJudge:
         try:
             with urllib.request.urlopen(http_request, timeout=self._timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.URLError as error:
-            raise RuntimeError(f"Judge request failed: {error}") from error
+        except (
+            OSError,
+            json.JSONDecodeError,
+            UnicodeError,
+        ) as error:
+            raise ExpectationJudgeOperationalError(
+                f"Judge request failed: {error}"
+            ) from error
 
 
 # --------------------------------------------------------------------------- #
@@ -506,22 +520,28 @@ class MaestroWarmUp:
 
     def __call__(self) -> None:
         _trace(
-            f"[WARM-UP] Starting installed-app preparation: {self._launches} cycles"
+            f"Starting installed-app preparation: {self._launches} cycles",
+            logtags.WARM_UP,
         )
         for index in range(self._launches):
             cycle = index + 1
-            _trace(f"[WARM-UP] Cycle {cycle}/{self._launches}: launch app")
+            _trace(
+                f"Cycle {cycle}/{self._launches}: launch app", logtags.WARM_UP
+            )
             self._executor.launch_app()
             if self._settle_seconds:
                 _trace(
-                    f"[WARM-UP] Cycle {cycle}/{self._launches}: "
-                    f"waiting {self._settle_seconds:g}s"
+                    f"Cycle {cycle}/{self._launches}: "
+                    f"waiting {self._settle_seconds:g}s",
+                    logtags.WARM_UP,
                 )
                 self._sleep(self._settle_seconds)
-            _trace(f"[WARM-UP] Cycle {cycle}/{self._launches}: stop app")
+            _trace(
+                f"Cycle {cycle}/{self._launches}: stop app", logtags.WARM_UP
+            )
             self._executor.stop_app()
-            _trace(f"[WARM-UP] Cycle {cycle}/{self._launches} complete")
-        _trace("[WARM-UP] Installed-app preparation complete")
+            _trace(f"Cycle {cycle}/{self._launches} complete", logtags.WARM_UP)
+        _trace("Installed-app preparation complete", logtags.WARM_UP)
 
 
 # --------------------------------------------------------------------------- #
@@ -592,15 +612,19 @@ class _SignInTracer:
         if not self._seen_first:
             self._seen_first = True
             if reached:
-                _trace("[LOGIN] Already signed in - no login actions required")
+                _trace(
+                    "Already signed in - no login actions required", logtags.LOGIN
+                )
             else:
                 self._required = True
-                _trace("[LOGIN] Sign-in required - starting shared login flow")
+                _trace(
+                    "Sign-in required - starting shared login flow", logtags.LOGIN
+                )
         elif reached and self._required:
             self._required = False
-            _trace("[LOGIN] Authentication/onboarding boundary reached")
-            _trace("[LOGIN] Login goal reached: true")
-            _trace("[LOGIN] Returning control to deeplink test")
+            _trace("Authentication/onboarding boundary reached", logtags.LOGIN)
+            _trace("Login goal reached: true", logtags.LOGIN)
+            _trace("Returning control to deeplink test", logtags.LOGIN)
         return reached
 
 
@@ -652,7 +676,7 @@ class LocalApkInstaller:
         return self._executor.ensure_uninstalled()
 
     def install_fresh(self) -> None:
-        _trace(f"[INSTALL] installing local build: {self._apk_path}")
+        _trace(f"installing local build: {self._apk_path}", logtags.INSTALL)
         self._executor.install_apk(self._apk_path)
 
     def install_and_open(self, via_store_button: bool = False) -> None:
@@ -664,24 +688,27 @@ class LocalApkInstaller:
         # window from the deeplink); the installed batch launches via adb (no
         # store window). Neither re-fires the deeplink. Return once foreground.
         if via_store_button:
-            _trace("[INSTALL] tapping store Open button via Maestro")
+            _trace("tapping store Open button via Maestro", logtags.INSTALL)
             launch = self._executor.launch_app_via_open_btn_click
         else:
-            _trace("[INSTALL] launching app via adb")
+            _trace("launching app via adb", logtags.INSTALL)
             launch = self._executor.launch_app_via_adb
         launch()
         self._wait_until_foreground(launch)
 
     def _wait_until_foreground(self, relaunch: Callable[[], None]) -> None:
-        _trace("[INSTALL] waiting for target app to become foreground")
+        _trace("waiting for target app to become foreground", logtags.INSTALL)
         deadline = self._monotonic() + self._foreground_timeout_seconds
         while True:
             if self._executor.is_foreground():
-                _trace("[INSTALL] target app is foreground")
+                _trace("target app is foreground", logtags.INSTALL)
                 return
             if self._monotonic() >= deadline:
                 raise RuntimeError(
-                    "[INSTALL] target app did not become foreground within timeout"
+                    logtags.prefix(
+                        logtags.INSTALL,
+                        "target app did not become foreground within timeout",
+                    )
                 )
             self._sleep(self._foreground_poll_seconds)
             # The first launch can be missed while the store window is still
@@ -846,9 +873,9 @@ class DeeplinkTestRunner:
         if self._installer is None:
             return
         if self._installer.ensure_absent():
-            _trace("[SUITE] Removed existing app install")
+            _trace("Removed existing app install", logtags.SUITE)
         else:
-            _trace("[SUITE] No existing app install to remove")
+            _trace("No existing app install to remove", logtags.SUITE)
 
     def open_installed_app(self) -> None:
         # Launch the already-installed build to the foreground so login observes
@@ -881,20 +908,26 @@ class DeeplinkTestRunner:
         verdict = None
         while True:
             _trace(
-                f"[VERIFY] {case.test_id} attempt "
-                f"{attempt}/{self._max_attempts}: checking expected result"
+                f"{case.test_id} attempt "
+                f"{attempt}/{self._max_attempts}: checking expected result",
+                logtags.VERIFY,
             )
             observation = self._observer.observe()
             verdict = self._judge.evaluate(case.expected_result, observation)
             if verdict.matched:
-                _trace(f"[VERIFY] {case.test_id}: expected result matched")
+                _trace(
+                    f"{case.test_id}: expected result matched", logtags.VERIFY
+                )
                 return verdict
             if self._monotonic() >= deadline:
-                _trace(f"[VERIFY] {case.test_id}: verification timeout reached")
+                _trace(
+                    f"{case.test_id}: verification timeout reached", logtags.VERIFY
+                )
                 return verdict
             _trace(
-                f"[VERIFY] {case.test_id}: expected result not reached; "
-                f"waiting {self._verify_poll_interval_seconds:g}s"
+                f"{case.test_id}: expected result not reached; "
+                f"waiting {self._verify_poll_interval_seconds:g}s",
+                logtags.VERIFY,
             )
             self._sleep(self._verify_poll_interval_seconds)
 
@@ -914,15 +947,22 @@ class DeeplinkTestRunner:
         suite always continues.
         """
         result = TestCaseResult(case=case)
-        _trace(f"[{label}] {case.test_id} starting")
+        _trace(f"{case.test_id} starting", label)
         if on_start is not None:
             on_start()
         for attempt in range(1, self._max_attempts + 1):
-            _trace(f"[{label}] {case.test_id} attempt {attempt}/{self._max_attempts}")
+            reset_recovery = getattr(
+                self._observer, "reset_recovery_budget", None
+            )
+            if callable(reset_recovery):
+                reset_recovery()
+            _trace(
+                f"{case.test_id} attempt {attempt}/{self._max_attempts}", label
+            )
             try:
                 prepare(attempt)
             except RuntimeError as exc:
-                _trace(f"[{label}] {case.test_id} attempt setup failed: {exc}")
+                _trace(f"{case.test_id} attempt setup failed: {exc}", label)
                 result.attempts.append(
                     AttemptResult(attempt=attempt, matched=False, reason=str(exc))
                 )
@@ -931,8 +971,25 @@ class DeeplinkTestRunner:
             if self._settle_seconds:
                 self._sleep(self._settle_seconds)
 
-            _trace(f"[{label}] {case.test_id} verifying deeplink expected result")
-            verdict = self._verify(case, attempt)
+            _trace(f"{case.test_id} verifying deeplink expected result", label)
+            try:
+                verdict = self._verify(case, attempt)
+            except (
+                AndroidOperationalError,
+                ExpectationJudgeOperationalError,
+            ) as exc:
+                _trace(
+                    f"{case.test_id} verification operational failure: {exc}",
+                    label,
+                )
+                result.attempts.append(
+                    AttemptResult(
+                        attempt=attempt,
+                        matched=False,
+                        reason=f"verification operational failure: {exc}",
+                    )
+                )
+                continue
             result.attempts.append(
                 AttemptResult(
                     attempt=attempt, matched=verdict.matched, reason=verdict.reason
@@ -940,10 +997,15 @@ class DeeplinkTestRunner:
             )
             if verdict.matched:
                 break
-            _trace(f"[{label}] {case.test_id} attempt {attempt}/{self._max_attempts}: MISMATCH")
+            _trace(
+                f"{case.test_id} attempt "
+                f"{attempt}/{self._max_attempts}: MISMATCH",
+                label,
+            )
         _trace(
-            f"[{label}] {case.test_id} deeplink test case result: "
-            f"{'PASS' if result.passed else 'FAIL'}"
+            f"{case.test_id} deeplink test case result: "
+            f"{'PASS' if result.passed else 'FAIL'}",
+            label,
         )
         return result
 
@@ -956,25 +1018,31 @@ class DeeplinkTestRunner:
         """
         try:
             return self._run_attempts(
-                case, "INSTALLED", self._installed_prepare(case)
+                case, logtags.INSTALLED, self._installed_prepare(case)
             )
         finally:
-            _trace(f"[INSTALLED] {case.test_id} stopping app (case cleanup)")
+            _trace(
+                f"{case.test_id} stopping app (case cleanup)", logtags.INSTALLED
+            )
             self._executor.stop_app()
 
     def _installed_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
         def prepare(attempt: int) -> None:
             if attempt > 1:  # retry recipe: kill -> wait -> reopen the same deeplink
-                _trace(f"[INSTALLED] {case.test_id} retry: stopping app")
+                _trace(f"{case.test_id} retry: stopping app", logtags.INSTALLED)
                 self._executor.stop_app()
                 _trace(
-                    f"[INSTALLED] {case.test_id} retry: "
-                    f"waiting {self._retry_wait_seconds:g}s"
+                    f"{case.test_id} retry: "
+                    f"waiting {self._retry_wait_seconds:g}s",
+                    logtags.INSTALLED,
                 )
                 self._sleep(self._retry_wait_seconds)
-                _trace(f"[INSTALLED] {case.test_id} retry: reopening same deeplink")
+                _trace(
+                    f"{case.test_id} retry: reopening same deeplink",
+                    logtags.INSTALLED,
+                )
             else:
-                _trace(f"[INSTALLED] {case.test_id} opening deeplink")
+                _trace(f"{case.test_id} opening deeplink", logtags.INSTALLED)
             self._executor.open_link(case.deep_link)
 
         return prepare
@@ -985,10 +1053,11 @@ class DeeplinkTestRunner:
         so a retry can never silently degrade into an installed run."""
         return self._run_attempts(
             case,
-            "UNINSTALLED",
+            logtags.UNINSTALLED,
             self._uninstalled_prepare(case),
             on_start=lambda: _trace(
-                f"[UNINSTALLED] {case.test_id} first-open flow - warm-up not applicable"
+                f"{case.test_id} first-open flow - warm-up not applicable",
+                logtags.UNINSTALLED,
             ),
         )
 
@@ -996,35 +1065,52 @@ class DeeplinkTestRunner:
         def prepare(attempt: int) -> None:
             if attempt > 1:  # every retry rebuilds genuine fresh state
                 _trace(
-                    f"[UNINSTALLED] {case.test_id} retry: recreating fresh-install state"
+                    f"{case.test_id} retry: recreating fresh-install state",
+                    logtags.UNINSTALLED,
                 )
             if self._installer is not None:
-                _trace(f"[UNINSTALLED] {case.test_id} ensuring app is uninstalled")
+                _trace(
+                    f"{case.test_id} ensuring app is uninstalled",
+                    logtags.UNINSTALLED,
+                )
                 self._installer.ensure_absent()
-                _trace(f"[UNINSTALLED] {case.test_id} app is uninstalled")
+                _trace(f"{case.test_id} app is uninstalled", logtags.UNINSTALLED)
             # 1) The EXACT deeplink routes to the store window while absent.
-            _trace(f"[UNINSTALLED] {case.test_id} opening deeplink")
+            _trace(f"{case.test_id} opening deeplink", logtags.UNINSTALLED)
             self._executor.open_link(case.deep_link)
+            _trace(
+                f"{case.test_id} deeplink dispatched while app "
+                "absent; deferred handoff pending",
+                logtags.UNINSTALLED,
+            )
             if self._installer is not None:
                 # 2) Install the local build via adb, then 3) open it by tapping
                 # the store's Open button via Maestro (NOT re-firing the
                 # deeplink). "app opened" is only emitted after the app is
                 # confirmed foreground.
-                _trace(f"[INSTALL] {case.test_id} installing local build and opening via store button")
+                _trace(
+                    f"{case.test_id} installing local build and opening via store button",
+                    logtags.INSTALL,
+                )
                 self._installer.install_and_open(via_store_button=True)
-                _trace(f"[INSTALL] {case.test_id} app opened")
+                _trace(f"{case.test_id} app opened", logtags.INSTALL)
             if self._login_flow is not None:  # SAME shared login as the installed path
-                _trace(f"[UNINSTALLED] {case.test_id} ensuring login")
+                _trace(f"{case.test_id} ensuring login", logtags.UNINSTALLED)
                 # On login failure, raise into the per-attempt setup-failure path
                 # (failed attempt -> skip _verify() -> retry fresh / else FAIL)
                 # instead of reporting ready.
                 if not self._login_flow.ensure_ready():
-                    _trace(f"[UNINSTALLED] {case.test_id} login failed")
+                    _trace(f"{case.test_id} login failed", logtags.UNINSTALLED)
                     _trace(
-                        f"[UNINSTALLED] {case.test_id} skipping deeplink verification"
+                        f"{case.test_id} skipping deeplink verification",
+                        logtags.UNINSTALLED,
                     )
                     raise RuntimeError("login preparation failed")
-                _trace(f"[UNINSTALLED] {case.test_id} login ready")
+                _trace(f"{case.test_id} login ready", logtags.UNINSTALLED)
+                _trace(
+                    f"{case.test_id} handing current UI to deeplink verification",
+                    logtags.UNINSTALLED,
+                )
 
         return prepare
 
@@ -1059,10 +1145,10 @@ class DeeplinkSuiteOrchestrator:
         installed = [case for case in cases if case.installed]
         uninstalled = [case for case in cases if not case.installed]
 
-        _trace("[SUITE] Starting deeplink test suite")
-        _trace(f"[SUITE] Loaded {len(cases)} test cases")
-        _trace(f"[SUITE] Installed cases: {len(installed)}")
-        _trace(f"[SUITE] Uninstalled cases: {len(uninstalled)}")
+        _trace("Starting deeplink test suite", logtags.SUITE)
+        _trace(f"Loaded {len(cases)} test cases", logtags.SUITE)
+        _trace(f"Installed cases: {len(installed)}", logtags.SUITE)
+        _trace(f"Uninstalled cases: {len(uninstalled)}", logtags.SUITE)
 
         # One-time clean state: uninstall the app once at suite startup so every
         # run begins deterministically. Existing per-case semantics are unchanged.
@@ -1075,20 +1161,20 @@ class DeeplinkSuiteOrchestrator:
             report.results.append(self.run_uninstalled_case(case))
         # Only reached if the suite ran to completion; a setup failure that
         # raises propagates before this line, so "Completed" is never misleading.
-        _trace("[SUITE] Completed")
+        _trace("Completed", logtags.SUITE)
         return report
 
     def prepare_installed_batch(self) -> bool:
         # Once per batch: install the local APK, launch it, log in, then warm up
         # (never per case / retry). Returns True iff login succeeded; on failure
         # skip warm-up and don't proceed to verification.
-        _trace("[INSTALLED BATCH] Installing local build")
+        _trace("Installing local build", logtags.INSTALLED_BATCH)
         self._runner.install_local_build()
-        _trace("[INSTALLED BATCH] Launching app before login")
+        _trace("Launching app before login", logtags.INSTALLED_BATCH)
         self._runner.open_installed_app()
-        _trace("[INSTALLED BATCH] Ensuring login")
+        _trace("Ensuring login", logtags.INSTALLED_BATCH)
         if not self._runner.ensure_logged_in():
-            _trace("[INSTALLED BATCH] login failed")
+            _trace("login failed", logtags.INSTALLED_BATCH)
             return False
         self._runner.run_warm_up()
         return True
@@ -1096,13 +1182,16 @@ class DeeplinkSuiteOrchestrator:
     def run_installed_batch(
         self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
     ) -> None:
-        _trace("[INSTALLED BATCH] Starting")
+        _trace("Starting", logtags.INSTALLED_BATCH)
         if not self.prepare_installed_batch():
             # Batch login failed: record every case as a login-prep failure
             # (no _verify()), so each is FAIL like the uninstalled flow.
             for case in cases:
-                _trace(f"[INSTALLED] {case.test_id} login failed")
-                _trace(f"[INSTALLED] {case.test_id} skipping deeplink verification")
+                _trace(f"{case.test_id} login failed", logtags.INSTALLED)
+                _trace(
+                    f"{case.test_id} skipping deeplink verification",
+                    logtags.INSTALLED,
+                )
                 report.results.append(_login_failed_result(case))
             return
         for case in cases:
@@ -1200,9 +1289,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         apk_path = officemobile_build.APK_PATH
         if args.rebuild or not apk_path.exists():
-            _trace("[BUILD] building local officemobile APK")
+            _trace("building local officemobile APK", logtags.BUILD)
             apk_path = officemobile_build.build_apk()
-        _trace(f"[BUILD] using local APK: {apk_path}")
+        _trace(f"using local APK: {apk_path}", logtags.BUILD)
     except officemobile_build.BuildError as error:
         print(f"ERROR: could not build local APK: {error}", file=sys.stderr)
         return 2
@@ -1227,26 +1316,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             env=os.environ, interactive=interactive
         )
     except Exception as error:  # pragma: no cover - defensive; prompt never raises
-        print(f"[EMAIL] email prompt failed - continuing without email: {error}")
+        print(
+            logtags.prefix(
+                logtags.EMAIL,
+                f"email prompt failed - continuing without email: {error}",
+            )
+        )
         email_recipient = None
 
     # The orchestrator owns the explicit top-level lifecycle and composes the
     # runner for per-case execution, judging, retry and reporting.
     report = DeeplinkSuiteOrchestrator(runner).run(cases)
-    print("[REPORT] generating report...")
+    print(logtags.prefix(logtags.REPORT, "generating report..."))
     report_text = report.format()
     print(report_text)
-    print("[REPORT] report generated")
+    print(logtags.prefix(logtags.REPORT, "report generated"))
     # TESTS -> FINAL REPORT -> EMAIL. Deliver to the address chosen up front (if
     # any). Delivery must never affect the verdict, so failure is swallowed.
     if email_recipient is not None:
-        print("[EMAIL] triggering email delivery...")
+        print(logtags.prefix(logtags.EMAIL, "triggering email delivery..."))
         try:
             email_report.send_suite_report(
                 report, env=os.environ, recipient=email_recipient
             )
         except Exception as error:  # pragma: no cover - defensive last line
-            print(f"[EMAIL] report not sent - unexpected error: {error}")
+            print(
+                logtags.prefix(
+                    logtags.EMAIL,
+                    f"report not sent - unexpected error: {error}",
+                )
+            )
     return 0 if report.failed == 0 else 1
 
 

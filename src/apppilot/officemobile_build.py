@@ -4,10 +4,9 @@ Encapsulates the omrdroid build recipe so the deeplink suite can produce a
 fresh local APK and install it via adb instead of tapping the Play Store.
 
 Recipe (per owiki "Android innerloop on mac (omrdroid)"):
-  1. If the enlistment has local changes, commit them as "temp - reset later".
-  2. Check out the LKG branch and pull.
-  3. Run `omrdroid build` (imports -> local.properties -> ./gradlew assembleDebug).
-  4. Return the built APK path.
+  1. Require a clean enlistment already on the LKG branch.
+  2. Run `omrdroid build` (imports -> local.properties -> ./gradlew assembleDebug).
+  3. Return the built APK path.
 
 The build runs under zsh with init.sh sourced (bash is unsupported).
 """
@@ -17,6 +16,11 @@ from __future__ import annotations
 import subprocess
 import time
 from pathlib import Path
+
+try:
+    from . import logtags
+except ImportError:  # direct script execution
+    import logtags
 
 ENLISTMENT_ROOT = Path("/Volumes/Office/omr1")
 SRC_ROOT = ENLISTMENT_ROOT / "src"
@@ -31,7 +35,8 @@ APK_PATH = (
 JAVA_HOME = "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
 NUGET_ROOT = "/Volumes/Office/NugetCache"
 
-TEMP_COMMIT_MESSAGE = "temp - reset later"
+GIT_TIMEOUT_SECONDS = 60
+BUILD_TIMEOUT_SECONDS = 3600
 
 
 class BuildError(RuntimeError):
@@ -39,12 +44,25 @@ class BuildError(RuntimeError):
 
 
 def _git(*args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(SRC_ROOT), *args],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(SRC_ROOT), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise BuildError(
+            f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS}s"
+        ) from error
+    except OSError as error:
+        raise BuildError(f"could not run git {' '.join(args)}: {error}") from error
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise BuildError(
+            f"git {' '.join(args)} failed" + (f": {detail}" if detail else "")
+        )
     return result.stdout.strip()
 
 
@@ -53,12 +71,18 @@ def _has_local_changes() -> bool:
 
 
 def _prepare_branch() -> None:
-    """Stash-free reset: commit stray changes, then move to the LKG branch."""
+    """Require an explicitly prepared, clean LKG checkout without mutating it."""
     if _has_local_changes():
-        _git("add", "-A")
-        _git("commit", "-m", TEMP_COMMIT_MESSAGE)
-    _git("checkout", LKG_BRANCH)
-    _git("pull", "--ff-only")
+        raise BuildError(
+            f"enlistment has local changes at {SRC_ROOT}; commit, stash, or "
+            "discard them explicitly before building"
+        )
+    current_branch = _git("branch", "--show-current")
+    if current_branch != LKG_BRANCH:
+        raise BuildError(
+            f"enlistment is on {current_branch or '<detached HEAD>'}; explicitly "
+            f"switch to {LKG_BRANCH} before building"
+        )
 
 
 def _run_omrdroid_build() -> str:
@@ -75,9 +99,19 @@ def _run_omrdroid_build() -> str:
     # omrdroid exits 0 even when a step fails (failures downgraded to warnings),
     # so its return code can't be trusted. Capture and return output; APK
     # freshness is the authoritative check.
-    result = subprocess.run(
-        ["zsh", "-c", prelude], capture_output=True, text=True
-    )
+    try:
+        result = subprocess.run(
+            ["zsh", "-c", prelude],
+            capture_output=True,
+            text=True,
+            timeout=BUILD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise BuildError(
+            f"omrdroid build timed out after {BUILD_TIMEOUT_SECONDS}s"
+        ) from error
+    except OSError as error:
+        raise BuildError(f"could not start omrdroid build: {error}") from error
     output = f"{result.stdout or ''}{result.stderr or ''}"
     print(output, end="")
     return output
@@ -100,13 +134,17 @@ def build_apk() -> Path:
     stale reuse)."""
     if not SRC_ROOT.exists():
         raise BuildError(f"Enlistment not found at {SRC_ROOT}")
-    print("[BUILD] preparing enlistment (checkout LKG branch, pull)")
+    print(logtags.prefix(logtags.BUILD, "validating clean LKG enlistment"))
     _prepare_branch()
-    print("[BUILD] compiling APK via omrdroid (this can take several minutes)")
+    print(
+        logtags.prefix(
+            logtags.BUILD, "compiling APK via omrdroid (this can take several minutes)"
+        )
+    )
     started = time.time()
     output = _run_omrdroid_build()
 
-    print("[BUILD] verifying built APK")
+    print(logtags.prefix(logtags.BUILD, "verifying built APK"))
     failures = [marker for marker in _FAILURE_MARKERS if marker in output]
     if failures:
         raise BuildError(
@@ -126,10 +164,10 @@ def build_apk() -> Path:
 def main() -> int:
     try:
         apk = build_apk()
-    except (BuildError, subprocess.CalledProcessError) as exc:
-        print(f"[BUILD] FAILED: {exc}")
+    except BuildError as exc:
+        print(logtags.prefix(logtags.BUILD, f"FAILED: {exc}"))
         return 1
-    print(f"[BUILD] APK ready: {apk}")
+    print(logtags.prefix(logtags.BUILD, f"APK ready: {apk}"))
     return 0
 
 

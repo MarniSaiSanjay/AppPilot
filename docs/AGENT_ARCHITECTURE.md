@@ -27,7 +27,7 @@ hardcoded Maestro scripts and **not** a fixed A→B→C test script.
                         v
                      OBSERVE  (Android UI hierarchy -> compact observation)
                         |
-                Is goal reached?  (deterministic evaluator)
+                Is goal reached?  (authoritative evaluator)
                    /          \
                  YES           NO
                   |             |
@@ -62,7 +62,7 @@ being hardcoded.
 | Component | Owns | Does **not** own |
 | --- | --- | --- |
 | **Observer** | Turning the raw UI hierarchy into a bounded, relevant observation (text, accessibility text, resource ids, clickable/enabled/input state, useful relationships). | Deciding actions. |
-| **Goal evaluator** | Deterministically deciding whether the goal state is reached. | Choosing actions; it is independent of the model. |
+| **Login goal evaluator** | Owning the login-stop boundary: deterministic terminal/blocker evidence first, semantic classification only for ambiguous screens. | Choosing or executing actions. |
 | **Decision model (provider)** | Proposing the single next action, or declaring "cannot safely proceed", given the goal, guidance, observation, available safe actions, and execution context. | Executing anything; declaring PASS; inventing elements. |
 | **Safety validator** | Enumerating safe actions and validating every proposed action before execution. | Deciding intent. |
 | **Maestro executor** | Executing a validated action against the device. | Orchestration or decision-making. |
@@ -140,18 +140,15 @@ Configuration precedence for the stuck bound is
 `--max-stuck-actions` &rarr; `APPPILOT_MAX_STUCK_ACTIONS` &rarr; `5`, with
 invalid environment values falling back safely to the default.
 
-## Goal evaluation
+## Login completion
 
-Goal evaluation is **deterministic and separate** from the decision model. For
-the current prototype, PASS means a **usable signed-in Microsoft 365 Copilot
-experience** is reached — the Copilot message composer is present and the app is
-past authentication/onboarding. Two presentations both qualify: the normal
-signed-in landing screen (empty composer, which may read "Message Copilot") and
-a deeplink-opened Copilot screen where a prompt is already populated in the
-composer. The introductory random *suggested-prompt* screen is **not** a PASS
-state — it must be dismissed via its close control rather than sent, and a
-visible/pre-populated prompt is never submitted just because it is present. The
-model must never be the authority that declares PASS.
+Login is preparation, not deeplink verification. The authoritative evaluator
+first recognizes deterministic blockers and terminal states: authentication
+controls, loading/no-actionable states, Chat/composer, Search, restricted-access
+states, and the suggested-prompt interruption. Ambiguous actionable screens may
+be semantically classified by the login judge. Once login completion is true,
+the agent stops before asking the Brain and hands the current UI to deeplink
+verification. Login PASS never implies deeplink PASS.
 
 ## Deeplink test suite (data-driven runner)
 
@@ -181,16 +178,16 @@ Boundaries:
   hardcoded selectors or app-specific success rules; an expected error that is
   correctly observed is a PASS, because the result is *observed vs expected*,
   not *did the deeplink succeed*.
-- **Retry and reporting are deterministic.** Up to 3 attempts per case; on
-  mismatch the app is killed, the runner waits 2 s, and the same deeplink is
-  re-launched. Any matching attempt is a PASS; three mismatches is a FAIL; the
-  suite continues with the next case and prints a per-test report plus totals.
-- **First-install warm-up runs once** for the whole suite (skippable) and is
-  never repeated for retries.
+- **Retry and reporting are deterministic.** Two attempts per case by default.
+  Installed retries stop, wait 2 seconds, and reopen the same deeplink;
+  uninstalled retries recreate the complete fresh-install sequence. Any
+  matching attempt is a PASS; exhausted attempts are a FAIL.
+- **Warm-up runs once for the installed batch** (skippable), never for
+  uninstalled cases and never on retries.
 
-The Excel remains intentionally simple: four positional columns (Test ID, Deep
-Link, User Type, Expected Result), one row per test, parsed with the standard
-library only.
+The Excel has four required fields (Test ID, Deep Link, User Type, Expected
+Result) and an optional Installed field. Recognized headers may be reordered;
+otherwise columns A-D are used.
 
 ## Maestro as the execution layer
 
@@ -245,12 +242,12 @@ boundary from pretending to be intelligent.
 
 ## Intentionally out of scope for the agent core
 
-Proving the core smart agent came first, and the **agent core itself**
+The **agent core itself**
 (`AppPilotAgent`, observer, goal evaluator, decision provider, safety validator)
 remains free of test-data, reporting, and fixed-script concerns. Such
 capabilities are only ever added as **separate layers on top** of the core — as
 the deeplink runner does for Excel test-case loading and report generation,
 while reusing (not modifying) the core boundaries. Still deferred: user
 credential workbooks, login/deeplink automation as fixed A→B→C scripts,
-scheduling, parallel or cloud execution, a web UI, historical reporting,
-self-healing across runs, and automatic APK installation.
+scheduling, parallel or cloud execution, a web UI, historical reporting, and
+self-healing across runs.

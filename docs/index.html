@@ -160,7 +160,9 @@
       <pre><code>observe the UI → is the goal reached? → ask the model for one action
 → validate it for safety → execute it via Maestro → observe again → repeat</code></pre>
       <p>
-        It reaches <strong>PASS</strong> when a deterministic goal evaluator recognizes the goal state, and
+        Login completion uses deterministic terminal/blocker evidence first and semantic classification only
+        for ambiguous screens. Deeplink PASS remains owned by the separate result judge. The run reaches
+        <strong>PASS</strong> when its authoritative evaluator recognizes the goal state, and
         <strong>FAIL</strong> when it cannot safely proceed or an action limit is hit. Unexpected screens
         (permission prompts, "save password" dialogs, onboarding pages) are handled by reasoning, not by
         pre-scripting every screen.
@@ -182,7 +184,7 @@
         <li><strong>Java 17+ (JDK)</strong> — required by Maestro.</li>
         <li><strong>Maestro CLI</strong> — the tool that actually taps/types on the device.</li>
         <li><strong>Android SDK platform-tools</strong> (gives you <code>adb</code>) and an <strong>Android emulator</strong> (or a physical device).</li>
-        <li>The <strong>target app installed</strong> on that emulator (<code>com.microsoft.office.officehubrow</code>).</li>
+        <li>For the standalone login CLI, the target app installed on the device. The deeplink suite manages its local APK installation.</li>
         <li>An <strong>OpenAI-compatible LLM endpoint</strong> — a model name/deployment and an API key.</li>
       </ul>
       <div class="note">
@@ -275,7 +277,7 @@ APPPILOT_PASSWORD=your-password</code></pre>
 
     <section id="emulator">
       <h2><span class="num">4</span>Start the emulator</h2>
-      <p>Launch an Android emulator (from Android Studio → Device Manager, or the terminal) with the target app installed, then confirm it is connected:</p>
+      <p>Launch an Android emulator (from Android Studio → Device Manager, or the terminal), then confirm it is connected. The standalone login CLI requires the target app to be installed; the deeplink suite manages its local APK installation.</p>
       <pre><code>adb devices
 <span class="cmt"># expected output, e.g.:</span>
 <span class="cmt"># List of devices attached</span>
@@ -321,7 +323,7 @@ RESULT</code></pre>
       <pre><code>python3 src/deeplink_runner.py --device emulator-5554</code></pre>
       <h3>The workbook</h3>
       <p>
-        Simple, with four positional columns and one row per test (a header row, if present, is skipped). A
+        Four required fields plus an optional <strong>Installed</strong> field. Recognized headers may be reordered; without a header the required fields use columns A-D. A
         bundled copy lives at <code>testcases/deeplinks/deeplink_tests.xlsx</code>.
       </p>
       <table>
@@ -331,15 +333,16 @@ RESULT</code></pre>
           <tr><td>Deep Link</td><td>The exact deeplink URI to launch (used verbatim).</td></tr>
           <tr><td>User Type</td><td>The user/scenario the case targets.</td></tr>
           <tr><td>Expected Result</td><td>A natural-language description of the expected outcome.</td></tr>
+          <tr><td>Installed (optional)</td><td>Selects installed versus genuine fresh-install execution. When omitted, AppPilot derives it from the deeplink.</td></tr>
         </tbody>
       </table>
       <h3>How each case runs</h3>
       <ol>
-        <li>A one-time first-install <strong>warm-up</strong> runs once before the suite (skip with <code>--no-warm-up</code>); never repeated on retries.</li>
-        <li>The <strong>exact</strong> deeplink is launched deterministically via Maestro <code>openLink</code>.</li>
-        <li>The resulting Android UI is observed.</li>
-        <li>The <strong>AI judges</strong> whether the UI semantically satisfies the Expected Result (expected error/failure states count as PASS when correctly observed).</li>
-        <li>On a mismatch it <strong>kills the app, waits 2&nbsp;s, and re-launches the same deeplink</strong>, up to <strong>3 attempts</strong>. Any matching attempt is a PASS; three mismatches is a FAIL. Then it continues with the next case.</li>
+        <li>Installed cases are prepared as one batch: install/launch, login, then one warm-up for the batch.</li>
+        <li>Uninstalled cases recreate uninstall → exact deeplink while absent → local APK install/open → login for every attempt. They never warm up.</li>
+        <li>The resulting Android UI is observed and polled for a bounded verification window.</li>
+        <li>The <strong>AI judge</strong> owns deeplink PASS/FAIL by comparing the UI with Expected Result.</li>
+        <li>Installed retries stop/wait/reopen. Uninstalled retries recreate the full fresh-install sequence. The default is <strong>2 attempts</strong>.</li>
       </ol>
       <h3>Options</h3>
       <table>
@@ -347,11 +350,20 @@ RESULT</code></pre>
         <tbody>
           <tr><td><code>--excel</code></td><td>Path to the workbook (defaults to the bundled one).</td></tr>
           <tr><td><code>--device</code></td><td>ADB device id.</td></tr>
-          <tr><td><code>--max-attempts</code></td><td>Attempts per case before FAIL (default <code>3</code>).</td></tr>
-          <tr><td><code>--no-warm-up</code></td><td>Skip the one-time first-install warm-up.</td></tr>
+          <tr><td><code>--max-attempts</code></td><td>Attempts per case before FAIL (default <code>2</code>).</td></tr>
+          <tr><td><code>--verify-timeout</code></td><td>Bounded polling window for the expected result (default <code>30</code> seconds).</td></tr>
+          <tr><td><code>--no-warm-up</code></td><td>Skip the one-time installed-batch warm-up.</td></tr>
+          <tr><td><code>--rebuild</code></td><td>Force a fresh local OfficeMobile APK build.</td></tr>
         </tbody>
       </table>
       <p>At the end it prints a concise per-test report plus totals (Total / Passed / Failed).</p>
+      <div class="warn">
+        <strong>Local APK and deferred-link requirements</strong>
+        The current workflow expects a clean OfficeMobile enlistment at <code>/Volumes/Office/omr1/src</code>
+        already on <code>lkg/main/android</code>. AppPilot does not commit, switch, or pull that repository.
+        Deferred deeplink/referrer delivery for uninstalled cases must be confirmed on a real clean device;
+        unit tests can validate orchestration but not Android platform delivery.
+      </div>
     </section>
 
     <section id="tests">

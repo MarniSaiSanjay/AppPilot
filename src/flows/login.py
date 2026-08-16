@@ -12,7 +12,6 @@ import json
 import os
 import subprocess
 import sys
-import urllib.error
 import urllib.request
 from typing import Callable
 
@@ -68,7 +67,15 @@ DEFAULT_GUIDANCE = (
     "Advance ONLY through sign-in and required first-launch onboarding. When a "
     "sign-in email/username or password field is shown, choose the matching "
     "credential input action and set input_kind accordingly; AppPilot supplies "
-    "the actual value securely, so never type a credential yourself. Dismiss "
+    "the actual value securely, so never type a credential yourself. PREFER "
+    "PASSWORD SIGN-IN: if the screen offers to send or verify a one-time code "
+    "(for example a code sent to a phone/SMS/text or email, an authenticator "
+    "approval, or any passwordless/verification-code screen), do NOT request or "
+    "wait for a code. Instead choose an alternative like 'Other ways to sign "
+    "in', 'Sign in another way', 'Use your password', or 'Use password "
+    "instead', then select the PASSWORD method and enter the password to "
+    "continue. Only fall back to a code method if no password option exists at "
+    "all. Dismiss "
     "incidental interruptions (for example a 'Save password' prompt) with the "
     "safest non-destructive option and keep going. If the introductory screen "
     "shows a random suggested prompt with a Send button and a close (X) control, "
@@ -117,6 +124,18 @@ class SignedInCopilotGoalEvaluator:
         "message microsoft 365 copilot",
     )
     _COMPOSER_INPUT_RESOURCE = ("copilot", "composer")
+    _SEARCH_INPUT_TEXT = ("search",)
+    _SEARCH_INPUT_RESOURCE = ("search_box", "search_input", "search_field")
+    _RESTRICTED_TEXT = (
+        "not eligible to access copilot",
+        "access to copilot is restricted",
+        "copilot access restricted",
+        "don't have access to copilot",
+        "do not have access to copilot",
+        "copilot isn't available for your account",
+        "copilot is not available for your account",
+    )
+    _RESTRICTED_RESOURCE = ("access_restricted", "not_eligible", "copilot_restricted")
     # Optional intro/suggested-prompt interruption to dismiss when present.
     _INTRO = (
         "let's get started",
@@ -149,12 +168,48 @@ class SignedInCopilotGoalEvaluator:
 
     def is_reached(self, goal: str, observation: UIObservation) -> bool:
         del goal
-        # Login is not complete unless the TARGET app is actually foreground -
-        # available credentials or a prior signed-in state never mean "complete"
-        # while another window (e.g. the launching store window) is in front.
+        verdict = self.deterministic_verdict(observation)
+        if verdict is not None:
+            return verdict
+        # Preserve the legacy fallback for standalone/offline callers. Production
+        # wraps this evaluator and sends ambiguous screens to the semantic judge.
+        return self._settled_inside(observation)
+
+    def deterministic_verdict(
+        self, observation: UIObservation
+    ) -> "bool | None":
+        """Return a definite login verdict, or None for an ambiguous app screen."""
         if self._foreground_check is not None and not self._foreground_check():
             return False
-        return not self._blocked(observation) and self._settled_inside(observation)
+        if self._blocked(observation):
+            return False
+        if (
+            self._signed_in_home(observation)
+            or self._search_screen(observation)
+            or self._restricted_terminal(observation)
+        ):
+            return True
+        if not self._has_actionable_ui(observation):
+            return False
+        return None
+
+    def deterministic_actionable_verdict(
+        self, observation: UIObservation
+    ) -> "bool | None":
+        """Return whether a definite login step exists, or None if ambiguous."""
+        if self._foreground_check is not None and not self._foreground_check():
+            return False
+        if self._blocked(observation):
+            return True
+        if (
+            self._signed_in_home(observation)
+            or self._search_screen(observation)
+            or self._restricted_terminal(observation)
+        ):
+            return True
+        if not self._has_actionable_ui(observation):
+            return False
+        return None
 
     def _blocked(self, observation: UIObservation) -> bool:
         # Not yet past authentication + onboarding.
@@ -196,6 +251,21 @@ class SignedInCopilotGoalEvaluator:
             text=self._COMPOSER_INPUT_TEXT,
             resource=self._COMPOSER_INPUT_RESOURCE,
             require_input=True,
+        )
+
+    def _search_screen(self, observation: UIObservation) -> bool:
+        return self._matches(
+            observation,
+            text=self._SEARCH_INPUT_TEXT,
+            resource=self._SEARCH_INPUT_RESOURCE,
+            require_input=True,
+        )
+
+    def _restricted_terminal(self, observation: UIObservation) -> bool:
+        return self._matches(
+            observation,
+            text=self._RESTRICTED_TEXT,
+            resource=self._RESTRICTED_RESOURCE,
         )
 
     @staticmethod
@@ -335,6 +405,10 @@ class LLMLoginGoalEvaluator:
         self._cache_key: tuple | None = None
         self._cache_val: dict | None = None
 
+    def begin_run(self) -> None:
+        self._cache_key = None
+        self._cache_val = None
+
     @classmethod
     def from_env(
         cls,
@@ -407,10 +481,11 @@ class LLMLoginGoalEvaluator:
             # trap a real sign-in screen in the wait loop - the Brain (a separate
             # model) can still be asked to drive login, as it was before.
             return {"reached": False, "actionable_step": True}
-        return {
-            "reached": bool(decoded.get("reached")),
-            "actionable_step": bool(decoded.get("actionable_step")),
-        }
+        reached = decoded.get("reached")
+        actionable_step = decoded.get("actionable_step")
+        if type(reached) is not bool or type(actionable_step) is not bool:
+            return {"reached": False, "actionable_step": False}
+        return {"reached": reached, "actionable_step": actionable_step}
 
     @staticmethod
     def _fingerprint(observation: UIObservation) -> tuple:
@@ -448,8 +523,40 @@ class LLMLoginGoalEvaluator:
         try:
             with urllib.request.urlopen(http_request, timeout=self._timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.URLError as error:
+        except (OSError, json.JSONDecodeError, UnicodeError) as error:
             raise RuntimeError(f"Login judge request failed: {error}") from error
+
+
+class AuthoritativeLoginGoalEvaluator:
+    """Production login boundary: deterministic evidence first, AI if ambiguous."""
+
+    def __init__(
+        self,
+        deterministic: SignedInCopilotGoalEvaluator,
+        semantic: "LLMLoginGoalEvaluator | None",
+    ) -> None:
+        self._deterministic = deterministic
+        self._semantic = semantic
+
+    def begin_run(self) -> None:
+        if self._semantic is not None:
+            self._semantic.begin_run()
+
+    def is_reached(self, goal: str, observation: UIObservation) -> bool:
+        verdict = self._deterministic.deterministic_verdict(observation)
+        if verdict is not None:
+            return verdict
+        if self._semantic is not None:
+            return self._semantic.is_reached(goal, observation)
+        return self._deterministic.is_reached(goal, observation)
+
+    def has_actionable_step(self, observation: UIObservation) -> bool:
+        verdict = self._deterministic.deterministic_actionable_verdict(observation)
+        if verdict is not None:
+            return verdict
+        if self._semantic is not None:
+            return self._semantic.has_actionable_step(observation)
+        return self._deterministic.has_actionable_step(observation)
 
 
 def resolve_decision_provider(
@@ -481,16 +588,21 @@ def build_login_agent(
 ) -> AppPilotAgent:
     """Build the single, shared login/onboarding agent (AppPilotAgent + Brain).
 
-    No UI steps hardcoded: the model decides each action. The STOP evaluator is
-    the AI-backed LLMLoginGoalEvaluator when a model is configured, else the
-    deterministic marker-based SignedInCopilotGoalEvaluator (offline fallback).
-    Both honor ``foreground_check`` so login never completes while the app is not
-    foreground. Callers may pass an existing observer/executor to reuse the same
-    Android infrastructure (DRY).
+    No UI steps are hardcoded: the model decides each action. The authoritative
+    STOP evaluator uses deterministic terminal/blocker evidence first and the
+    semantic evaluator only for ambiguous screens. Callers may reuse an existing
+    observer/executor.
     """
-    goal_evaluator = LLMLoginGoalEvaluator.from_env(
+    deterministic_evaluator = SignedInCopilotGoalEvaluator(
         foreground_check=foreground_check
-    ) or SignedInCopilotGoalEvaluator(foreground_check=foreground_check)
+    )
+    semantic_evaluator = LLMLoginGoalEvaluator.from_env(
+        foreground_check=foreground_check
+    )
+    goal_evaluator = AuthoritativeLoginGoalEvaluator(
+        deterministic=deterministic_evaluator,
+        semantic=semantic_evaluator,
+    )
     # Let the login evaluator classify whether the screen presents a genuine
     # login/onboarding step, so the agent waits/re-observes on transient loading
     # screens (e.g. "looking for accounts" with only a "Terms of use" link)

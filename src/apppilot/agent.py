@@ -88,6 +88,9 @@ class AppPilotAgent:
         self._emit(f"RESULT:\nFAIL - {detail}")
 
     def run(self, goal: str, guidance: str | None = None) -> bool:
+        reset_recovery = getattr(self._observer, "reset_recovery_budget", None)
+        if callable(reset_recovery):
+            reset_recovery()
         self._emit(f"GOAL:\n{goal}\n")
         if guidance:
             self._emit(f"GUIDANCE:\n{guidance}\n")
@@ -197,6 +200,19 @@ class AppPilotAgent:
                 f"Reason: {decision.reason}\n"
             )
 
+            fresh_observation = self._reobserve_before_action()
+            self._emit(f"RE-OBSERVE:\n{fresh_observation.describe()}\n")
+            if not self._decision_is_current(
+                decision.action, observation, fresh_observation
+            ):
+                self._emit(
+                    "STALE DECISION:\ndiscarded because the UI changed before "
+                    "execution\n"
+                )
+                continue
+            observation = fresh_observation
+            meaningful_fingerprint = self._meaningful_fingerprint(observation)
+
             try:
                 self._safety_validator.validate(decision.action, observation)
             except ValueError as error:
@@ -281,6 +297,37 @@ class AppPilotAgent:
         if self._actionable_step_check is not None:
             return bool(self._actionable_step_check(observation))
         return True
+
+    def _reobserve_before_action(self) -> UIObservation:
+        reobserve = getattr(self._observer, "reobserve", None)
+        if callable(reobserve):
+            return reobserve()
+        return self._observer.observe()
+
+    @classmethod
+    def _decision_is_current(
+        cls,
+        action,
+        original: UIObservation,
+        fresh: UIObservation,
+    ) -> bool:
+        if cls._meaningful_fingerprint(original) != cls._meaningful_fingerprint(
+            fresh
+        ):
+            return False
+        if action.kind == ActionKind.PRESS_BACK:
+            return True
+        original_target = original.find(action.target_id)
+        fresh_target = fresh.find(action.target_id)
+        if original_target is None or fresh_target is None:
+            return False
+        return (
+            original_target.resource_id == fresh_target.resource_id
+            and original_target.selector_text == fresh_target.selector_text
+            and original_target.clickable == fresh_target.clickable
+            and original_target.is_input == fresh_target.is_input
+            and original_target.enabled == fresh_target.enabled
+        )
 
     @staticmethod
     def _has_actionable_ui(available_actions) -> bool:

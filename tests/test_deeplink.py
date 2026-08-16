@@ -1,16 +1,10 @@
-"""Tests for the data-driven AppPilot deeplink test runner.
-
-Covers Excel loading/parsing and required columns, deeplink/expected-result
-extraction, the deterministic retry recipe (kill + 2s wait + relaunch), the
-3-attempt bound, PASS on later attempts, FAIL after all mismatches, continuing
-past failures, expected-failure-state matching, report generation, and the
-one-time warm-up.
-"""
+"""Tests for AppPilot's agent, login, deeplink, Android, and reporting contracts."""
 
 import contextlib
 import io
 import json
 import socket
+import subprocess
 import sys
 import tempfile
 import types
@@ -24,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import apppilot_agent as a  # noqa: E402
 import deeplink_runner as d  # noqa: E402
-from apppilot import email_report  # noqa: E402
+from apppilot import email_report, logtags, officemobile_build  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_XLSX = REPO_ROOT / "testcases" / "deeplinks" / "deeplink_tests.xlsx"
@@ -97,6 +91,9 @@ def _case(test_id="TC001", expected="Chat screen"):
 class _StubObserver:
     def observe(self):
         return a.UIObservation(())
+
+    def reobserve(self):
+        return self.observe()
 
 
 class _RecordingExecutor:
@@ -321,6 +318,39 @@ class RunnerBehaviourTests(unittest.TestCase):
         self.assertFalse(report.results[0].passed)
         self.assertTrue(report.results[1].passed)
 
+    def test_verification_operational_failure_retries_and_suite_continues(self):
+        class _OperationalJudge:
+            def __init__(self):
+                self.calls = 0
+
+            def evaluate(self, expected_result, observation):
+                self.calls += 1
+                if self.calls == 1:
+                    raise d.ExpectationJudgeOperationalError("temporary outage")
+                return d.ExpectationVerdict(matched=True, reason="ok")
+
+        judge = _OperationalJudge()
+        runner, _, _ = _make_runner(judge)
+
+        report = runner.run([_case("TC001"), _case("TC002")])
+
+        self.assertEqual(report.passed, 2)
+        self.assertEqual(len(report.results[0].attempts), 2)
+        self.assertIn(
+            "verification operational failure",
+            report.results[0].attempts[0].reason,
+        )
+
+    def test_programming_error_during_verification_remains_fatal(self):
+        class _BrokenJudge:
+            def evaluate(self, expected_result, observation):
+                raise RuntimeError("programming error")
+
+        runner, _, _ = _make_runner(_BrokenJudge())
+
+        with self.assertRaisesRegex(RuntimeError, "programming error"):
+            runner.run([_case()])
+
 
 # --------------------------------------------------------------------------- #
 # Warm-up
@@ -436,6 +466,12 @@ class JudgeTests(unittest.TestCase):
         judge = self._judge("not json")
         verdict = judge.evaluate("Chat screen", a.UIObservation(()))
         self.assertFalse(verdict.matched)
+
+    def test_non_boolean_match_is_controlled_mismatch(self):
+        judge = self._judge('{"match": "false", "reason": "malformed"}')
+        verdict = judge.evaluate("Chat screen", a.UIObservation(()))
+        self.assertFalse(verdict.matched)
+        self.assertIn("JSON boolean", verdict.reason)
 
     def test_specific_expected_prompt_is_enforced(self):
         # A specific/quoted expected prompt must require THAT prompt's content -
@@ -907,6 +943,132 @@ class LocalApkInstallerTests(unittest.TestCase):
         self.assertEqual(exe.events, [("install_apk", "/tmp/officemobile.apk")])
 
 
+class AndroidStateOperationTests(unittest.TestCase):
+    def _result(self, returncode=0, stdout="", stderr=""):
+        return types.SimpleNamespace(
+            returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    def test_is_installed_distinguishes_adb_failure_from_absence(self):
+        executor = a.MaestroExecutor("com.example.app", "device")
+        executor._run_adb = lambda *args, **kwargs: self._result(
+            returncode=1, stderr="device offline"
+        )
+
+        with self.assertRaises(a.AndroidOperationalError):
+            executor.is_installed()
+
+    def test_is_installed_requires_exact_package_line(self):
+        executor = a.MaestroExecutor("com.example.app", "device")
+        executor._run_adb = lambda *args, **kwargs: self._result(
+            stdout="package:com.example.app.beta\n"
+        )
+
+        self.assertFalse(executor.is_installed())
+
+    def test_failed_uninstall_is_not_reported_as_absent(self):
+        executor = a.MaestroExecutor("com.example.app", "device")
+        results = iter(
+            [
+                self._result(stdout="package:com.example.app\n"),
+                self._result(returncode=1, stderr="uninstall failed"),
+            ]
+        )
+        executor._run_adb = lambda *args, **kwargs: next(results)
+
+        with self.assertRaises(a.AndroidOperationalError):
+            executor.ensure_uninstalled()
+
+    def test_uninstall_postcondition_must_be_absent(self):
+        executor = a.MaestroExecutor("com.example.app", "device")
+        results = iter(
+            [
+                self._result(stdout="package:com.example.app\n"),
+                self._result(stdout="Success\n"),
+                self._result(stdout="package:com.example.app\n"),
+            ]
+        )
+        executor._run_adb = lambda *args, **kwargs: next(results)
+
+        with self.assertRaises(a.AndroidOperationalError):
+            executor.ensure_uninstalled()
+
+    def test_coordinate_tap_failure_is_not_silent(self):
+        executor = a.MaestroExecutor("com.example.app", "device")
+        executor._run_adb = lambda *args, **kwargs: self._result(
+            returncode=1, stderr="tap failed"
+        )
+
+        with self.assertRaises(a.AndroidOperationalError):
+            executor._tap_point(10, 20)
+
+
+class OfficeMobileBuildSafetyTests(unittest.TestCase):
+    def test_dirty_enlistment_fails_without_git_mutation(self):
+        calls = []
+
+        def fake_git(*args):
+            calls.append(args)
+            if args == ("status", "--porcelain"):
+                return " M file"
+            raise AssertionError(f"unexpected git mutation: {args}")
+
+        with mock.patch.object(officemobile_build, "_git", fake_git):
+            with self.assertRaisesRegex(
+                officemobile_build.BuildError, "local changes"
+            ):
+                officemobile_build._prepare_branch()
+
+        self.assertEqual(calls, [("status", "--porcelain")])
+
+    def test_wrong_branch_requires_explicit_switch(self):
+        responses = {
+            ("status", "--porcelain"): "",
+            ("branch", "--show-current"): "feature/work",
+        }
+
+        with mock.patch.object(
+            officemobile_build,
+            "_git",
+            side_effect=lambda *args: responses[args],
+        ):
+            with self.assertRaisesRegex(
+                officemobile_build.BuildError,
+                officemobile_build.LKG_BRANCH,
+            ):
+                officemobile_build._prepare_branch()
+
+    def test_prepared_branch_is_not_modified(self):
+        calls = []
+
+        def fake_git(*args):
+            calls.append(args)
+            if args == ("status", "--porcelain"):
+                return ""
+            if args == ("branch", "--show-current"):
+                return officemobile_build.LKG_BRANCH
+            raise AssertionError(f"unexpected git mutation: {args}")
+
+        with mock.patch.object(officemobile_build, "_git", fake_git):
+            officemobile_build._prepare_branch()
+
+        self.assertEqual(
+            calls,
+            [("status", "--porcelain"), ("branch", "--show-current")],
+        )
+
+    def test_build_timeout_is_controlled(self):
+        with mock.patch.object(
+            officemobile_build.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("zsh", 1),
+        ):
+            with self.assertRaisesRegex(
+                officemobile_build.BuildError, "timed out"
+            ):
+                officemobile_build._run_omrdroid_build()
+
+
 class SuggestedPromptGuardTests(unittest.TestCase):
     def _element(self, *, text="", resource_id="", is_input=False):
         return a.UIElement(
@@ -1359,6 +1521,27 @@ class LLMLoginGoalEvaluatorTests(unittest.TestCase):
 
         self.assertFalse(self._ev(transport=transport).is_reached("g", self._obs()))
 
+    def test_non_boolean_fields_are_controlled_not_reached(self):
+        def transport(payload):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "reached": "false",
+                                    "actionable_step": "true",
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+        evaluator = self._ev(transport=transport)
+        self.assertFalse(evaluator.is_reached("g", self._obs()))
+        self.assertFalse(evaluator.has_actionable_step(self._obs()))
+
     def test_prompt_uses_redacted_describe_and_goal(self):
         ev = self._ev(reached=False)
         ev.is_reached("MY-GOAL", self._obs())
@@ -1424,6 +1607,178 @@ class LLMLoginGoalEvaluatorTests(unittest.TestCase):
             foreground_check=lambda: True,
         )
         self.assertIsInstance(ev, a.LLMLoginGoalEvaluator)
+
+
+class ModelDecisionResponseValidationTests(unittest.TestCase):
+    def test_boolean_action_id_is_rejected(self):
+        provider = a.LLMModelDecisionProvider(
+            model="m",
+            api_key="k",
+            transport=lambda payload: {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"action_id": True, "reason": "malformed"}
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+        request = a.DecisionRequest(
+            goal="g",
+            guidance=None,
+            observation=a.UIObservation(()),
+            available_actions=(
+                a.Action(a.ActionKind.PRESS_BACK),
+                a.Action(a.ActionKind.PRESS_BACK),
+            ),
+            context=a.ExecutionContext(step=0, max_steps=1),
+        )
+
+        decision = provider.decide(request)
+
+        self.assertIsNone(decision.action)
+        self.assertIn("not one of the offered safe actions", decision.reason)
+
+    def test_transport_failure_is_controlled_cannot_proceed(self):
+        provider = a.LLMModelDecisionProvider(
+            model="m",
+            api_key="k",
+            transport=lambda payload: (_ for _ in ()).throw(
+                RuntimeError("temporary model failure")
+            ),
+        )
+        request = a.DecisionRequest(
+            goal="g",
+            guidance=None,
+            observation=a.UIObservation(()),
+            available_actions=(a.Action(a.ActionKind.PRESS_BACK),),
+            context=a.ExecutionContext(step=0, max_steps=1),
+        )
+
+        decision = provider.decide(request)
+
+        self.assertIsNone(decision.action)
+        self.assertIn("could not be parsed", decision.reason)
+
+
+class AuthoritativeLoginGoalEvaluatorTests(unittest.TestCase):
+    class _Semantic:
+        def __init__(self, reached=True, actionable=True):
+            self.reached = reached
+            self.actionable = actionable
+            self.reached_calls = 0
+            self.actionable_calls = 0
+            self.begin_calls = 0
+
+        def begin_run(self):
+            self.begin_calls += 1
+
+        def is_reached(self, goal, observation):
+            self.reached_calls += 1
+            return self.reached
+
+        def has_actionable_step(self, observation):
+            self.actionable_calls += 1
+            return self.actionable
+
+    def _evaluator(self, semantic=None):
+        return a.AuthoritativeLoginGoalEvaluator(
+            a.SignedInCopilotGoalEvaluator(foreground_check=lambda: True),
+            semantic,
+        )
+
+    def test_known_terminal_states_do_not_call_ai(self):
+        semantic = self._Semantic(reached=False)
+        evaluator = self._evaluator(semantic)
+        terminals = (
+            a.UIObservation((_chat_screen_el(),)),
+            a.UIObservation((_search_screen_el(),)),
+            a.UIObservation(
+                (_ui_el(text="You're not eligible to access Copilot"),)
+            ),
+        )
+
+        for observation in terminals:
+            self.assertTrue(evaluator.is_reached("login", observation))
+
+        self.assertEqual(semantic.reached_calls, 0)
+
+    def test_known_login_and_loading_states_do_not_call_ai(self):
+        semantic = self._Semantic(reached=True, actionable=True)
+        evaluator = self._evaluator(semantic)
+
+        self.assertFalse(
+            evaluator.is_reached("login", a.UIObservation((_cred_el(),)))
+        )
+        self.assertFalse(
+            evaluator.is_reached(
+                "login", a.UIObservation((_ui_el(text="please wait"),))
+            )
+        )
+        self.assertEqual(semantic.reached_calls, 0)
+
+    def test_ambiguous_actionable_app_screen_uses_ai(self):
+        semantic = self._Semantic(reached=True)
+        evaluator = self._evaluator(semantic)
+
+        self.assertTrue(
+            evaluator.is_reached("login", a.UIObservation((_post_intro_el(),)))
+        )
+        self.assertEqual(semantic.reached_calls, 1)
+
+    def test_begin_run_resets_semantic_state(self):
+        semantic = self._Semantic()
+        evaluator = self._evaluator(semantic)
+
+        evaluator.begin_run()
+
+        self.assertEqual(semantic.begin_calls, 1)
+
+    def test_build_login_agent_uses_authoritative_evaluator(self):
+        import flows.login as login_mod
+
+        with mock.patch.object(
+            login_mod.LLMLoginGoalEvaluator, "from_env", return_value=None
+        ):
+            agent = login_mod.build_login_agent(
+                observer=_FixedObserver(
+                    a.UIObservation((_chat_screen_el(),))
+                ),
+                executor=_NoopExecutor(),
+                provider=_RecordingProvider(),
+            )
+
+        self.assertIsInstance(
+            agent._goal_evaluator, a.AuthoritativeLoginGoalEvaluator
+        )
+
+    def test_terminal_state_stops_agent_before_brain_or_action(self):
+        semantic = self._Semantic(reached=False)
+        evaluator = self._evaluator(semantic)
+        provider = _RecordingBackProvider()
+        executor = _NoopRecordingExecutor()
+        agent = a.AppPilotAgent(
+            observer=_FixedObserver(
+                a.UIObservation(
+                    (_ui_el(text="You're not eligible to access Copilot"),)
+                )
+            ),
+            goal_evaluator=evaluator,
+            decision_provider=provider,
+            safety_validator=a.SafetyValidator(),
+            executor=executor,
+            max_actions=5,
+            runtime_context=a.RuntimeContext({}),
+            sleep=lambda seconds: None,
+            nonactionable_wait_seconds=0,
+        )
+
+        self.assertTrue(agent.run("login"))
+        self.assertEqual(provider.calls, 0)
+        self.assertEqual(executor.executed, 0)
 
 
 class LoginWaitsOnTransientScreenTests(unittest.TestCase):
@@ -1678,6 +2033,9 @@ class _FixedObserver:
     def observe(self):
         return self._observation
 
+    def reobserve(self):
+        return self._observation
+
 
 class _NoopExecutor:
     def execute(self, *args, **kwargs):  # pragma: no cover - never called here
@@ -1745,12 +2103,17 @@ class _SequenceObserver:
     def __init__(self, observations):
         self._obs = list(observations)
         self._i = 0
+        self._last = self._obs[0]
 
     def observe(self):
         obs = self._obs[self._i]
+        self._last = obs
         if self._i < len(self._obs) - 1:
             self._i += 1
         return obs
+
+    def reobserve(self):
+        return self._last
 
 
 class _BackProvider:
@@ -1833,7 +2196,10 @@ class TapDeliveryTests(unittest.TestCase):
         ex = a.MaestroExecutor("com.example.app", "emulator-5554")
         adb_calls = []
         flow_calls = []
-        ex._run_adb = lambda args, **kw: adb_calls.append(list(args))
+        def run_adb(args, **kw):
+            adb_calls.append(list(args))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        ex._run_adb = run_adb
         ex._run_flow = lambda commands, **kw: flow_calls.append(commands)
         return ex, adb_calls, flow_calls
 
@@ -1901,6 +2267,29 @@ class TapDeliveryTests(unittest.TestCase):
         )
         self.assertEqual(adb_calls, [["shell", "input", "tap", "100", "50"]])
         self.assertEqual(flow_calls, ['- inputText: "hi"\n'])
+
+    def test_selector_infrastructure_failure_does_not_fallback_to_tap(self):
+        ex, adb_calls, _ = self._executor()
+
+        def failing_flow(commands, **kw):
+            raise a.AndroidOperationalError(
+                "Maestro action execution failed: driver unavailable"
+            )
+
+        ex._run_flow = failing_flow
+        el = _ui_el(
+            element_id="e:0",
+            resource_id="nextButton",
+            clickable=True,
+            bounds=(0, 0, 200, 100),
+        )
+
+        with self.assertRaises(a.AndroidOperationalError):
+            ex.execute(
+                a.Action(a.ActionKind.TAP, target_id="e:0"),
+                a.UIObservation((el,)),
+            )
+        self.assertEqual(adb_calls, [])
 
     def test_credential_coordinate_input_moves_caret_to_end_before_clearing(self):
         # Regression: eraseText only backspaces LEFT of the caret, so a focus tap
@@ -2145,6 +2534,16 @@ class BlankScreenUnblockTests(unittest.TestCase):
         self.assertEqual([c for c in calls if "keyevent" in c], [])
         self.assertEqual(
             [c for c in calls if "dumpsys" in c], []
+        )
+
+    def test_recovery_budget_can_be_reset_for_next_lifecycle(self):
+        obs = self._observer()
+        obs._popup_unblock_budget = 0
+
+        obs.reset_recovery_budget()
+
+        self.assertEqual(
+            obs._popup_unblock_budget, obs._popup_unblock_budget_limit
         )
 
     def test_non_blank_screen_is_never_touched(self):
@@ -2460,13 +2859,19 @@ class _CountingObserver:
         self._obs = list(observations)
         self._i = 0
         self.count = 0
+        self._last = self._obs[0]
 
     def observe(self):
         self.count += 1
         obs = self._obs[min(self._i, len(self._obs) - 1)]
+        self._last = obs
         if self._i < len(self._obs) - 1:
             self._i += 1
         return obs
+
+    def reobserve(self):
+        self.count += 1
+        return self._last
 
 
 class _CapturingProvider:
@@ -2543,6 +2948,25 @@ class AgentLogTagTests(unittest.TestCase):
             result = agent.run("reach chat", None)
         return result, buffer.getvalue()
 
+    def test_subsystem_tags_are_centralized(self):
+        expected = {
+            "BUILD": "BUILD",
+            "EMAIL": "EMAIL",
+            "INSTALL": "INSTALL",
+            "INSTALLED": "INSTALLED",
+            "INSTALLED_BATCH": "INSTALLED BATCH",
+            "LOGIN": "LOGIN",
+            "MAESTRO": "MAESTRO",
+            "REPORT": "REPORT",
+            "SUITE": "SUITE",
+            "UNINSTALLED": "UNINSTALLED",
+            "VERIFY": "VERIFY",
+            "WARM_UP": "WARM-UP",
+        }
+        self.assertEqual(
+            {name: getattr(logtags, name) for name in expected}, expected
+        )
+
     def test_default_keeps_untagged_lines(self):
         result, out = self._run(self._reached_agent(""))
         self.assertTrue(result)
@@ -2606,6 +3030,74 @@ class GenericAgentLoadingTests(unittest.TestCase):
         agent = self._make(obs, provider)
         self.assertTrue(self._run(agent))
         self.assertEqual(provider.calls, 0)
+
+    def test_each_agent_run_resets_observer_recovery_budget(self):
+        class _ResettingObserver:
+            def __init__(self):
+                self.resets = 0
+
+            def reset_recovery_budget(self):
+                self.resets += 1
+
+            def observe(self):
+                return a.UIObservation(
+                    (_ui_el(text="Chat screen with prompt"),)
+                )
+
+        observer = _ResettingObserver()
+        agent = _make_agent(
+            observer, _CapturingProvider(), _MarkerGoal("Chat screen")
+        )
+
+        self.assertTrue(self._run(agent))
+        self.assertTrue(self._run(agent))
+        self.assertEqual(observer.resets, 2)
+
+    def test_changed_ui_discards_stale_model_action(self):
+        old = a.UIObservation(
+            (_ui_el(
+                element_id="old",
+                text="Continue",
+                resource_id="continue",
+                clickable=True,
+            ),)
+        )
+        done = a.UIObservation((_ui_el(text="done"),))
+
+        class _ChangingObserver:
+            def __init__(self):
+                self.changed = False
+
+            def observe(self):
+                return done if self.changed else old
+
+            def reobserve(self):
+                self.changed = True
+                return done
+
+        class _TapProvider:
+            def __init__(self):
+                self.calls = 0
+
+            def decide(self, request):
+                self.calls += 1
+                action = next(
+                    item
+                    for item in request.available_actions
+                    if item.kind == a.ActionKind.TAP
+                )
+                return a.ModelDecision(action=action, reason="continue")
+
+        observer = _ChangingObserver()
+        provider = _TapProvider()
+        executor = _NoopRecordingExecutor()
+        agent = _make_agent(
+            observer, provider, _MarkerGoal("done"), executor=executor
+        )
+
+        self.assertTrue(self._run(agent))
+        self.assertEqual(provider.calls, 1)
+        self.assertEqual(executor.executed, 0)
 
     def test_goal_not_reached_actionable_ui_calls_brain(self):
         obs = a.UIObservation((_actionable_el(),))

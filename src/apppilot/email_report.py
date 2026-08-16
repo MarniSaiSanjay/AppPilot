@@ -29,6 +29,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
+from . import logtags
+
 _REQUIRED_ENV = (
     "APPPILOT_EMAIL_API_URL",
     "APPPILOT_EMAIL_API_KEY",
@@ -57,7 +59,7 @@ Transport = Callable[[urllib.request.Request], "tuple[int, str]"]
 
 
 def _log(message: str) -> None:
-    print(f"[EMAIL] {message}")
+    print(logtags.prefix(logtags.EMAIL, message))
 
 
 def _missing_config(env: Mapping[str, str]) -> "list[str]":

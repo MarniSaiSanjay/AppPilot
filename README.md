@@ -12,11 +12,11 @@ observe the UI → is the goal reached? → ask the decision model for one actio
 → validate it for safety → execute it via Maestro → observe again → repeat
 ```
 
-It reaches **PASS** when a deterministic goal evaluator recognizes the goal
+It reaches **PASS** when the authoritative goal evaluator recognizes the goal
 state, and **FAIL** when the model cannot safely proceed or a configurable
-action limit is hit. Unexpected screens (permission prompts, "save password"
-dialogs, onboarding pages, error pop-ups, etc.) are handled by *reasoning*, not
-by pre-scripting every screen.
+action limit is hit. Login completion uses deterministic evidence first and
+semantic classification only for ambiguous screens. Unexpected screens are
+handled by reasoning rather than pre-scripting every screen.
 
 > **Roles:** the LLM is the **brain** (chooses the next action), the Android UI
 > hierarchy is the **eyes**, Maestro is the **hands** (execution only), and the
@@ -28,9 +28,13 @@ design principles.
 
 ## Project structure
 
-- `src/apppilot_agent.py` — the entire agent: UI observer, deterministic goal
-  evaluator, replaceable decision-model provider, safety validator, Maestro
-  executor, and the orchestration loop.
+- `src/apppilot/` — reusable agent loop, Android/Maestro integration, model
+  boundary, safety validation, data contracts, build helper, and reporting.
+- `src/flows/login.py` — the shared authentication/onboarding preparation flow.
+- `src/flows/deeplink.py` — workbook loading, installed/uninstalled orchestration,
+  retries, verification, and reporting.
+- `src/apppilot_agent.py` and `src/deeplink_runner.py` — compatibility CLI
+  entry points.
 - `docs/` — project documentation.
 - `testcases/regressions/regression_suite.xlsx` — regression workbook (reserved
   for later; workbook/Excel integration is intentionally out of scope for the
@@ -46,8 +50,9 @@ design principles.
   # then ensure $HOME/.maestro/bin is on your PATH
   maestro --version
   ```
-- **A running Android emulator** with the target app installed. Start one from
-  Android Studio (Device Manager) or the terminal, and confirm it is connected:
+- **A running Android emulator**. The standalone login CLI requires the target
+  app to be installed; the deeplink suite manages its local APK installation.
+  Start a device and confirm it is connected:
   ```bash
   adb devices        # e.g. emulator-5554  device
   ```
@@ -124,9 +129,9 @@ GOAL REACHED
 RESULT
 ```
 
-The current prototype goal is to *complete authentication and onboarding and
-reach a usable signed-in Microsoft 365 Copilot experience, without executing an
-unintended suggested prompt.*
+The login goal is preparation only: complete authentication and required
+onboarding, dismiss the initial suggested-prompt interruption when present, then
+stop immediately and hand the current UI to the caller.
 
 ## Deeplink test suite
 
@@ -135,29 +140,44 @@ test cases from an Excel workbook. It reuses the same Maestro executor, Maestro
 UI observer, and model configuration as the agent — it is **not** a second
 framework.
 
-The Excel is intentionally simple, with four positional columns and one row per
-test: **Test ID**, **Deep Link**, **User Type**, **Expected Result** (a header
-row, if present, is skipped). A bundled copy lives at
+The Excel has four required fields: **Test ID**, **Deep Link**, **User Type**,
+and **Expected Result**, plus an optional **Installed** field. Header names may
+be reordered; without a recognized header the four required fields use columns
+A-D. When **Installed** is omitted, the scenario is derived deterministically
+from the deeplink. A bundled copy lives at
 `testcases/deeplinks/deeplink_tests.xlsx`.
 
 For each test case:
 
-1. A one-time first-install **warm-up** runs once before the suite (skippable
-   with `--no-warm-up`); it is never repeated for retries.
-2. The **exact** deeplink is launched deterministically via Maestro `openLink`.
-3. The resulting Android UI is observed.
-4. The **AI judges** whether the observed UI *semantically* satisfies the
+1. The suite establishes a clean app state.
+2. Installed cases run as one batch: install/launch, shared login preparation,
+   then one warm-up for the entire installed batch.
+3. Uninstalled cases recreate uninstall → exact deeplink while absent → local
+   APK install/open → shared login preparation on every attempt. They never run
+   warm-up.
+4. The **exact** deeplink is launched deterministically via Maestro `openLink`.
+5. The resulting Android UI is observed.
+6. The **AI judges** whether the observed UI *semantically* satisfies the
    natural-language Expected Result — including expected error/failure states,
    which count as PASS when correctly observed. The model never invents or
    modifies a deeplink and never drives UI actions here.
-5. On a mismatch the runner **kills the app, waits 2 s, and re-launches the same
-   deeplink**, up to **3 attempts**. Any matching attempt is a PASS; three
-   mismatches is a FAIL. The suite then continues with the next case.
+7. Installed retries stop, wait 2 seconds, and reopen the same deeplink.
+   Uninstalled retries recreate the complete fresh-install sequence. The default
+   is **2 attempts** total. The suite continues with the next case after failure.
 
 ```bash
 python3 src/deeplink_runner.py --device emulator-5554
 ```
 
-Options: `--excel` (workbook path), `--device`, `--max-attempts` (default `3`),
-`--no-warm-up`. At the end it prints a concise per-test report plus totals
-(Total / Passed / Failed).
+Options: `--excel` (workbook path), `--device`, `--max-attempts` (default `2`),
+`--verify-timeout` (default `30` seconds), `--no-warm-up`, and `--rebuild`.
+At the end it prints a concise per-test report plus totals.
+
+The current local-APK workflow expects a clean OfficeMobile enlistment at
+`/Volumes/Office/omr1/src` already on `lkg/main/android`. AppPilot never commits,
+switches, or pulls that enlistment automatically. A pre-existing APK is reused
+unless `--rebuild` is supplied.
+
+For uninstalled cases, deferred deeplink/referrer delivery after sideloading is
+a live Android acceptance requirement; unit tests validate orchestration but
+cannot prove platform delivery.
