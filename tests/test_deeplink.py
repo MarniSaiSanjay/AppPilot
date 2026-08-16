@@ -2699,23 +2699,41 @@ class ExecutionTraceLoggingTests(unittest.TestCase):
         self.assertIn("[INSTALLED BATCH] Ensuring login", out)
         self.assertIn("[SUITE] Completed", out)
 
-    def test_suite_completed_not_logged_when_setup_raises(self):
-        class _BoomLogin:
-            def ensure_ready(self):
-                raise RuntimeError("boom")
+    def test_startup_clean_state_failure_records_all_cases_without_aborting(self):
+        # A suite-STARTUP precondition failure (clean-state uninstall) means no
+        # case can run safely. It must NOT abort/raise: record every case as a
+        # startup failure, preserve the real reason, and return a report (so
+        # final reporting/email still happen). No false PASS, no misleading
+        # "[SUITE] Completed".
+        class _AbsentBoomInstaller(_FakeInstaller):
+            def ensure_absent(self):
+                raise a.AndroidOperationalError("device offline")
 
         judge = _ScriptedJudge([(True, "ok")])
-        runner, _, _ = _make_runner(judge, login_flow=_BoomLogin())
+        installer = _AbsentBoomInstaller()
+        login = _FakeLogin()
+        runner, _, _ = _make_runner(judge, installer=installer, login_flow=login)
         orch = d.DeeplinkSuiteOrchestrator(runner)
-        import contextlib
-        import io as _io
 
-        buf = _io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            with self.assertRaises(RuntimeError):
-                orch.run([_icase("T1")])
-        # A raised setup failure must NOT print a misleading completion line.
-        self.assertNotIn("[SUITE] Completed", buf.getvalue())
+        report, out = _capture(orch.run, [_icase("T1"), _ucase("T2")])
+
+        # Returned a report instead of raising.
+        self.assertEqual(report.total, 2)
+        self.assertEqual(report.passed, 0)  # no false PASS
+        self.assertEqual(report.failed, 2)
+        # Real operational reason preserved on every case.
+        for result in report.results:
+            self.assertFalse(result.passed)
+            self.assertIn("device offline", result.attempts[0].reason)
+        # No unsafe test execution occurred after the precondition failed.
+        self.assertEqual(installer.fresh_calls, 0)
+        self.assertEqual(installer.install_calls, 0)
+        self.assertEqual(login.ready_calls, 0)
+        self.assertEqual(judge.seen, [])
+        # Startup-failure trace present; misleading completion line absent.
+        self.assertIn("[SUITE] startup clean-install precondition failed", out)
+        self.assertIn("[SUITE] Aborted before test execution", out)
+        self.assertNotIn("[SUITE] Completed", out)
 
     def test_warm_up_cycle_logging_matches_real_cycles(self):
         warm = d.MaestroWarmUp(
@@ -3614,6 +3632,200 @@ class InstalledCaseIsolationTests(unittest.TestCase):
         )
         runner.run_uninstalled_case(_ucase("TCU"))
         self.assertNotIn(("stop_app", None), executor.calls)
+
+
+class _StopFailingExecutor(_RecordingExecutor):
+    """Records lifecycle calls; stop_app() raises an operational error."""
+
+    def stop_app(self):
+        self.calls.append(("stop_app", None))
+        raise a.AndroidOperationalError("stop_app boom")
+
+
+class _BatchInstallFailingInstaller(_FakeInstaller):
+    """Batch install (install_fresh) fails operationally; the uninstalled
+    per-attempt path (install_and_open) still works."""
+
+    def install_fresh(self):
+        self.fresh_calls += 1
+        raise a.AndroidOperationalError("install did not confirm success")
+
+
+class _BatchLaunchFailingInstaller(_FakeInstaller):
+    """Batch launch (open) fails (app never foreground); uninstalled path works."""
+
+    def open(self):
+        self.open_calls += 1
+        raise RuntimeError("app did not become foreground")
+
+
+class InstalledOperationalFailureIsolationTests(unittest.TestCase):
+    """P1: an operational failure during installed per-case cleanup or during
+    installed-batch setup must NOT abort the suite. It is logged/recorded and the
+    suite continues, so unrelated cases still run and the final report is still
+    produced. Existing retry semantics are unchanged."""
+
+    def test_cleanup_stop_app_failure_does_not_abort_suite(self):
+        judge = _ScriptedJudge([(True, "ok"), (True, "ok")])
+        executor = _StopFailingExecutor()
+        runner, _, _ = _make_runner(judge, executor=executor)
+        report, out = _capture(
+            runner.run,
+            [
+                _icase_link("TC001", "myapp://open/one"),
+                _icase_link("TC002", "myapp://open/two"),
+            ],
+        )
+        # Both cases ran and kept their real verdicts despite cleanup raising.
+        self.assertEqual(report.total, 2)
+        self.assertEqual(report.passed, 2)
+        self.assertIn(("open_link", "myapp://open/two"), executor.calls)
+        self.assertIn("cleanup stop_app failed (ignored)", out)
+        self.assertIn("[SUITE] Completed", out)
+
+    def test_cleanup_guard_preserves_installed_retry_sequence(self):
+        # With a normal executor the guarded cleanup leaves the retry recipe
+        # (open -> stop -> reopen -> cleanup stop) exactly as before the fix.
+        judge = _ScriptedJudge([(False, "no"), (False, "no")])
+        runner, executor, _ = _make_runner(judge, max_attempts=2)
+        result = runner.run_installed_case(_icase("TCR"))
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.attempts), 2)  # retried once
+        self.assertEqual(
+            [c[0] for c in executor.calls],
+            ["open_link", "stop_app", "open_link", "stop_app"],
+        )
+
+    def test_installed_batch_install_failure_records_failures_and_continues(self):
+        judge = _ScriptedJudge([(True, "ok")])  # only the uninstalled case verifies
+        installer = _BatchInstallFailingInstaller()
+        runner, _, _ = _make_runner(
+            judge, installer=installer, login_flow=_FakeLogin()
+        )
+        report, out = _capture(runner.run, [_icase("TCI"), _ucase("TCU")])
+        self.assertEqual(report.total, 2)
+        installed = next(r for r in report.results if r.case.test_id == "TCI")
+        uninstalled = next(r for r in report.results if r.case.test_id == "TCU")
+        self.assertFalse(installed.passed)  # recorded batch-setup FAIL
+        self.assertIn(
+            "installed batch setup failed", installed.attempts[0].reason
+        )
+        self.assertTrue(uninstalled.passed)  # unrelated case still ran
+        self.assertIn("installed batch setup failed", out)
+        self.assertIn("[SUITE] Completed", out)
+
+    def test_installed_batch_launch_failure_records_failures_and_continues(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        installer = _BatchLaunchFailingInstaller()
+        runner, _, _ = _make_runner(
+            judge, installer=installer, login_flow=_FakeLogin()
+        )
+        report, out = _capture(runner.run, [_icase("TCI"), _ucase("TCU")])
+        self.assertEqual(report.total, 2)
+        installed = next(r for r in report.results if r.case.test_id == "TCI")
+        self.assertFalse(installed.passed)
+        self.assertIn(
+            "installed batch setup failed", installed.attempts[0].reason
+        )
+        self.assertTrue(
+            next(r for r in report.results if r.case.test_id == "TCU").passed
+        )
+        self.assertIn("[SUITE] Completed", out)
+
+    def test_final_report_produced_despite_batch_setup_failure(self):
+        judge = _ScriptedJudge([])  # no verification ever happens
+        installer = _BatchInstallFailingInstaller()
+        runner, _, _ = _make_runner(
+            judge, installer=installer, login_flow=_FakeLogin()
+        )
+        report, _ = _capture(runner.run, [_icase("TC001"), _icase("TC002")])
+        self.assertEqual(report.total, 2)
+        self.assertEqual(report.passed, 0)
+        text = report.format()  # still fully formattable for email/report
+        self.assertIn("TC001", text)
+        self.assertIn("TC002", text)
+
+
+class SuiteStartupCleanStateFailureTests(unittest.TestCase):
+    """P2: an operational failure while establishing the one-time suite-startup
+    clean-install precondition means NO case can run safely. It must be handled
+    cleanly - never abort/raise, never a false PASS - by recording every case as
+    a startup failure (real reason preserved) and returning a report so final
+    reporting/email still happen. No unsafe test execution runs afterwards."""
+
+    class _AbsentBoomInstaller(_FakeInstaller):
+        def ensure_absent(self):
+            raise a.AndroidOperationalError("adb uninstall failed")
+
+    def test_startup_failure_returns_report_and_does_not_raise(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        runner, _, _ = _make_runner(
+            judge, installer=self._AbsentBoomInstaller(), login_flow=_FakeLogin()
+        )
+        report = d.DeeplinkSuiteOrchestrator(runner).run([_icase("T1"), _ucase("T2")])
+        self.assertEqual(report.total, 2)
+        self.assertEqual(report.passed, 0)  # never a false PASS
+        self.assertEqual(report.failed, 2)
+
+    def test_startup_failure_preserves_real_reason_for_every_case(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        runner, _, _ = _make_runner(
+            judge, installer=self._AbsentBoomInstaller(), login_flow=_FakeLogin()
+        )
+        report = d.DeeplinkSuiteOrchestrator(runner).run(
+            [_icase("T1"), _ucase("T2")]
+        )
+        for result in report.results:
+            self.assertFalse(result.passed)
+            self.assertEqual(len(result.attempts), 1)
+            self.assertIn(
+                "suite startup clean-install precondition failed",
+                result.attempts[0].reason,
+            )
+            self.assertIn("adb uninstall failed", result.attempts[0].reason)
+
+    def test_startup_failure_runs_no_unsafe_test_execution(self):
+        judge = _ScriptedJudge([(True, "ok")])
+        installer = self._AbsentBoomInstaller()
+        login = _FakeLogin()
+        runner, executor, _ = _make_runner(
+            judge, installer=installer, login_flow=login
+        )
+        d.DeeplinkSuiteOrchestrator(runner).run([_icase("T1"), _ucase("T2")])
+        # No install/launch/login/verify/deeplink happened after the precondition
+        # failed - the device is unsafe, so nothing invalid was executed.
+        self.assertEqual(installer.fresh_calls, 0)
+        self.assertEqual(installer.install_calls, 0)
+        self.assertEqual(login.ready_calls, 0)
+        self.assertEqual(judge.seen, [])
+        self.assertEqual(executor.calls, [])
+
+    def test_startup_failure_report_is_formattable_for_email(self):
+        judge = _ScriptedJudge([])
+        runner, _, _ = _make_runner(
+            judge, installer=self._AbsentBoomInstaller(), login_flow=_FakeLogin()
+        )
+        report = d.DeeplinkSuiteOrchestrator(runner).run(
+            [_icase("TC001"), _ucase("TC002")]
+        )
+        text = report.format()
+        self.assertIn("TC001", text)
+        self.assertIn("TC002", text)
+        self.assertIn("Deeplink test cases failed: 2", text)
+
+    def test_startup_success_still_completes_normally(self):
+        # Guard against regressing the happy path: when the precondition holds,
+        # the suite runs cases and logs completion as before.
+        judge = _ScriptedJudge([(True, "installed ok"), (True, "fresh ok")])
+        runner, _, _ = _make_runner(
+            judge, installer=_FakeInstaller(), login_flow=_FakeLogin()
+        )
+        report, out = _capture(
+            d.DeeplinkSuiteOrchestrator(runner).run, [_icase("T1"), _ucase("T2")]
+        )
+        self.assertEqual(report.passed, 2)
+        self.assertIn("[SUITE] Completed", out)
+        self.assertNotIn("Aborted before test execution", out)
 
 
 class _PasswordThenSubmitProvider:

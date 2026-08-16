@@ -807,6 +807,49 @@ def _login_failed_result(case: DeeplinkTestCase) -> TestCaseResult:
     )
 
 
+def _batch_setup_failed_result(
+    case: DeeplinkTestCase, reason: str
+) -> TestCaseResult:
+    """FAIL result for a case in an installed batch whose shared install/launch
+    setup failed operationally: one failed attempt, no deeplink verdict. The
+    suite still continues and the report/email are still produced."""
+    return TestCaseResult(
+        case=case,
+        attempts=[
+            AttemptResult(
+                attempt=1,
+                matched=False,
+                reason=(
+                    f"installed batch setup failed: {reason}; "
+                    "deeplink verification skipped"
+                ),
+            )
+        ],
+    )
+
+
+def _startup_failed_result(
+    case: DeeplinkTestCase, reason: str
+) -> TestCaseResult:
+    """FAIL result for a case that never ran because the one-time suite-startup
+    clean-install precondition failed operationally: one failed attempt, no
+    deeplink verdict. The real reason is preserved (never masked, never a false
+    PASS) and the suite still returns a report so final reporting/email happen."""
+    return TestCaseResult(
+        case=case,
+        attempts=[
+            AttemptResult(
+                attempt=1,
+                matched=False,
+                reason=(
+                    f"suite startup clean-install precondition failed: {reason}; "
+                    "deeplink verification skipped"
+                ),
+            )
+        ],
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The runner (deterministic orchestration; AI only judges)
 # --------------------------------------------------------------------------- #
@@ -1024,7 +1067,15 @@ class DeeplinkTestRunner:
             _trace(
                 f"{case.test_id} stopping app (case cleanup)", logtags.INSTALLED
             )
-            self._executor.stop_app()
+            # Cleanup must never abort the suite nor mask the case result: an
+            # operational stop_app failure is logged and swallowed.
+            try:
+                self._executor.stop_app()
+            except AndroidOperationalError as exc:
+                _trace(
+                    f"{case.test_id} cleanup stop_app failed (ignored): {exc}",
+                    logtags.INSTALLED,
+                )
 
     def _installed_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
         def prepare(attempt: int) -> None:
@@ -1151,16 +1202,32 @@ class DeeplinkSuiteOrchestrator:
         _trace(f"Uninstalled cases: {len(uninstalled)}", logtags.SUITE)
 
         # One-time clean state: uninstall the app once at suite startup so every
-        # run begins deterministically. Existing per-case semantics are unchanged.
-        self._runner.ensure_clean_install_state()
-
+        # run begins deterministically. If this operational precondition fails
+        # (e.g. device offline / adb uninstall failure) no case can run safely,
+        # so record every case as a startup failure and return the report -
+        # never abort. The real reason is preserved (no false PASS) and final
+        # reporting/email still happen. Existing per-case semantics are unchanged.
         report = SuiteReport()
+        try:
+            self._runner.ensure_clean_install_state()
+        except RuntimeError as exc:
+            _trace(
+                f"startup clean-install precondition failed: {exc}; "
+                "skipping all test execution",
+                logtags.SUITE,
+            )
+            for case in cases:
+                report.results.append(_startup_failed_result(case, str(exc)))
+            _trace("Aborted before test execution", logtags.SUITE)
+            return report
+
         if installed:
             self.run_installed_batch(installed, report)
         for case in uninstalled:
             report.results.append(self.run_uninstalled_case(case))
-        # Only reached if the suite ran to completion; a setup failure that
-        # raises propagates before this line, so "Completed" is never misleading.
+        # Only reached when the startup precondition held and cases executed; a
+        # setup failure is recorded above and returns early, so "Completed" is
+        # never misleading.
         _trace("Completed", logtags.SUITE)
         return report
 
@@ -1183,7 +1250,22 @@ class DeeplinkSuiteOrchestrator:
         self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
     ) -> None:
         _trace("Starting", logtags.INSTALLED_BATCH)
-        if not self.prepare_installed_batch():
+        try:
+            prepared = self.prepare_installed_batch()
+        except RuntimeError as exc:
+            # Operational install/launch/setup failure (includes
+            # AndroidOperationalError): record every case as a batch-setup failure
+            # and continue the suite so unrelated cases still run and the final
+            # report/email are still produced.
+            _trace(f"installed batch setup failed: {exc}", logtags.INSTALLED_BATCH)
+            for case in cases:
+                _trace(
+                    f"{case.test_id} skipping deeplink verification",
+                    logtags.INSTALLED,
+                )
+                report.results.append(_batch_setup_failed_result(case, str(exc)))
+            return
+        if not prepared:
             # Batch login failed: record every case as a login-prep failure
             # (no _verify()), so each is FAIL like the uninstalled flow.
             for case in cases:
