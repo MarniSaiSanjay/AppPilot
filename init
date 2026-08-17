@@ -1,0 +1,13 @@
+#!/bin/sh
+# Launch the AppPilot setup flow (a.k.a. /init) using a Python 3.11+ interpreter.
+# Usage: ./init [args...]
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+for PY in python3.13 python3.12 python3.11 python3; do
+    if command -v "$PY" >/dev/null 2>&1 \
+        && "$PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)'; then
+        exec "$PY" "$DIR/src/apppilot_init.py" "$@"
+    fi
+done
+echo "AppPilot: Python 3.11+ required but none found (tried python3.13/3.12/3.11/python3)." >&2
+exit 1

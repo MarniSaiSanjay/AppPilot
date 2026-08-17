@@ -637,14 +637,17 @@ def check_email(
     output: Callable[[str], None] = print,
     env: Optional[Mapping[str, str]] = None,
     configure: Callable = email_delivery.configure_recipient,
+    load_saved: Callable[[], Optional[str]] = email_delivery._load_saved_recipient,
 ) -> CheckResult:
     """Optionally configure email reporting and map it to an OPTIONAL check.
 
-    Email is never REQUIRED, so it can never make ``/init`` NOT ready. Interactive
-    runs first ask ``Configure email reporting? [y/N]`` (default No); only on Yes
-    is the shared ``configure_recipient`` prompt shown. Non-interactive runs never
-    prompt and simply reuse a saved recipient if one exists. ``/init`` NEVER sends
-    an email or contacts the relay - it only inspects local configuration.
+    Email is never REQUIRED, so it can never make ``/init`` NOT ready. When a
+    recipient was saved on a previous run it is offered as the default straight
+    away (Enter keeps it) - matching ``./run`` - so the saved address is never
+    silently skipped. Only when nothing is saved does the interactive run first
+    ask ``Configure email reporting? [y/N]`` (default No). Non-interactive runs
+    never prompt and simply reuse a saved recipient if one exists. ``/init``
+    NEVER sends an email or contacts the relay - it only inspects local config.
 
     Collect-all: never raises; any unexpected error becomes a clean OPTIONAL
     "not configured" result so every other check still reports.
@@ -655,7 +658,9 @@ def check_email(
             outcome = configure(interactive=False)
             return _email_result(outcome.recipient, resolved_env)
 
-        if not _prompt_yes_no(
+        # With no saved recipient, gate behind a y/N so fresh setups can decline;
+        # with one saved, skip the gate and let ``configure`` offer it as default.
+        if load_saved() is None and not _prompt_yes_no(
             "Configure email reporting?",
             default=False,
             input_fn=input_fn,

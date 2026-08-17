@@ -76,7 +76,13 @@ The prototype targets the Office hub app id
 Run the `/init` setup flow from the project root:
 
 ```bash
-python3 src/apppilot_init.py
+./init
+```
+
+The `./init` wrapper auto-selects a Python 3.11+ interpreter. Equivalently:
+
+```bash
+python3.11 src/apppilot_init.py
 ```
 
 `/init` walks through **Environment** (Python, ADB, Maestro, Java) → **Model** →
@@ -140,7 +146,21 @@ APPPILOT_PASSWORD=your-password
 
 ## Running AppPilot
 
-With a device connected and `.env` in place, run the **deeplink test suite**:
+With a device connected and `.env` in place, run a **test suite**:
+
+```bash
+./run
+```
+
+`./run` (a.k.a. `/run`) selects a **use case** (auto when only one exists,
+otherwise a numbered prompt), then that use case's **test suite** (auto when only
+one workbook exists, otherwise a numbered prompt), then executes all of its test
+cases. Skip use-case selection with `--usecase NAME`; any remaining options are
+passed through to that use case's runner. The wrapper auto-selects a Python 3.11+
+interpreter.
+
+To run the deeplink use case directly (equivalent, bypassing use-case
+selection):
 
 ```bash
 python3 src/deeplink_runner.py
