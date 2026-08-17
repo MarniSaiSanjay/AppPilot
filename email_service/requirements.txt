@@ -1,4 +1,5 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 azure-communication-email==1.0.0
+azure-data-tables==12.5.0
 pydantic==2.10.4

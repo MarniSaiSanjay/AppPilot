@@ -20,6 +20,7 @@ try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     from ...apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from ...apppilot.agent import _load_dotenv
     from ...apppilot import apk_config, device_config, email_delivery, logtags
+    from ...apppilot import telemetry
     from ...shared.warmup import MaestroWarmUp
     from ...shared.installer import LocalApkInstaller
     from ...shared.login import LoginCapability, SharedLoginFlow, build_login_agent
@@ -27,6 +28,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from apppilot.agent import _load_dotenv
     from apppilot import apk_config, device_config, email_delivery, logtags
+    from apppilot import telemetry
     from shared.warmup import MaestroWarmUp
     from shared.installer import LocalApkInstaller
     from shared.login import LoginCapability, SharedLoginFlow, build_login_agent
@@ -183,6 +185,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     # The orchestrator owns the explicit top-level lifecycle and composes the
     # runner for per-case execution, judging, retry and reporting.
     report = DeeplinkSuiteOrchestrator(runner).run(cases)
+    # Best-effort telemetry (roadmap #8/#9): one minimal record per real suite
+    # run, submitted from the CLI seam only (never in the orchestrator, so direct
+    # orchestrator/test calls emit nothing). Never raises; never affects results.
+    telemetry.record_suite_run(report.suite_name, report.total, "Android")
     print(logtags.prefix(logtags.REPORT, "generating report..."))
     report_text = report.format()
     print(report_text)

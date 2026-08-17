@@ -115,8 +115,9 @@ environment variables always take precedence).
 | `APPPILOT_MAX_ACTIONS` | no | Absolute upper bound on actions per run (default `30`). |
 | `APPPILOT_MAX_STUCK_ACTIONS` | no | Consecutive actions with no meaningful UI change before an early controlled FAIL (default `5`). |
 | `APPPILOT_EMAIL_API_URL` | for email | HTTPS relay endpoint used to send the suite report. |
-| `APPPILOT_EMAIL_API_KEY` | for email | Scoped API key for the email relay. |
+| `APPPILOT_EMAIL_API_KEY` | for email | Scoped API key for the email relay (also used for telemetry). |
 | `APPPILOT_CONTACT_EMAIL` | no | Optional contact address shown in the report footer (omitted if unset). |
+| `APPPILOT_TELEMETRY_URL` | for telemetry | HTTPS relay `/telemetry` endpoint. When set, each real suite run best-effort submits one minimal record (suite, test-case count, host OS, target platform) — nothing identifying. Unset disables telemetry. |
 
 \* If no model is configured, the agent does **not** guess — it reports that it
 cannot proceed and how to configure one.
@@ -203,6 +204,15 @@ Email delivery needs `APPPILOT_EMAIL_API_URL` and `APPPILOT_EMAIL_API_KEY`; an
 optional `APPPILOT_CONTACT_EMAIL` appears in the report footer. Neither `/init`
 nor email prompting ever sends mail on its own — delivery only happens after a
 suite finishes, and never affects the run verdict.
+
+## Telemetry
+
+Telemetry is **optional** and off unless `APPPILOT_TELEMETRY_URL` is set. When
+configured, each real suite run best-effort submits **one** minimal record —
+suite name, test-case count, host OS, and target platform — over HTTPS to the
+relay's `/telemetry` endpoint, which stores it in Azure Table Storage. Nothing
+identifying is collected, no Azure credential lives in the CLI, and a failure
+never affects the suite.
 
 ## Documentation
 

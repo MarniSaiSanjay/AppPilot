@@ -34,6 +34,8 @@ pure Azure PaaS resource with a **free, auto-verified Azure-managed domain**
 | Log Analytics workspace | `workspace-...` | Container Apps logs |
 | Container Apps environment | `apppilot-env` | Serverless host env |
 | Container App | `apppilot-email-api` | The relay API (scale-to-zero) |
+| Storage Account (Standard_LRS) | `apppilottelemetry` | Table Storage for telemetry |
+| Table | `SuiteRuns` | One row per suite run (telemetry) |
 
 Fixed sender: `DoNotReply@05294377-b44f-48d0-a7a6-9e78ae5ad6a0.azurecomm.net`
 
@@ -48,6 +50,8 @@ Fixed sender: `DoNotReply@05294377-b44f-48d0-a7a6-9e78ae5ad6a0.azurecomm.net`
   a recipient-domain allowlist if a narrower blast radius is required.
 * The privileged ACS connection string lives only as a Container App secret
   (`acs-conn`); it is never in the CLI, never logged, never returned.
+* The privileged Storage connection string lives only as a Container App secret
+  (`telemetry-conn`); it is never in the CLI, never logged, never returned.
 * The relay pulls its image using its **system-assigned managed identity** with
   only the `AcrPull` role — no broad access, no registry admin creds.
 * Callers authenticate with a scoped API key (`api-key` secret), constant-time
@@ -61,6 +65,7 @@ Fixed sender: `DoNotReply@05294377-b44f-48d0-a7a6-9e78ae5ad6a0.azurecomm.net`
 | `APPPILOT_EMAIL_TO` | default recipient(s) when request omits `to`, comma/semicolon separated |
 | `ACS_CONNECTION_STRING` | `secretref:acs-conn` |
 | `APPPILOT_API_KEY` | `secretref:api-key` |
+| `TELEMETRY_TABLE_CONNECTION_STRING` | `secretref:telemetry-conn` |
 
 Retrieve the API key (owner only):
 
@@ -84,6 +89,18 @@ The client posts `{subject, body[, to]}` with an `X-API-Key` header over https
 only (cleartext and redirects are refused so the key can't leak) and treats any
 2xx as success. See `_post_report` / `send_suite_report` for the authoritative
 implementation; do not fork the snippet here.
+
+## Telemetry endpoint (`POST /telemetry`)
+
+The same relay records minimal per-suite telemetry. Authenticated (`X-API-Key`)
+callers post **exactly four** fields — `suite`, `test_cases`, `host_os`
+(`macOS`/`Windows`), `target_platform` (`Android`/`iOS`); extra or invalid fields
+are rejected (`422`). Each accepted request writes one row to the `SuiteRuns`
+table (via the server-only `telemetry-conn` secret) with `PartitionKey` = suite
+and a random `uuid` `RowKey` (Azure mechanics, not data). The client
+(`src/apppilot/telemetry.py`, stdlib `urllib`) is best-effort. Wire it with
+`APPPILOT_TELEMETRY_URL` = `https://<app-fqdn>/telemetry` and the shared
+`APPPILOT_EMAIL_API_KEY`.
 
 ## Redeploy the image
 
