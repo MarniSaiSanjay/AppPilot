@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -11,10 +12,12 @@ from .android import MaestroExecutor, MaestroHierarchyObserver
 from .brain import DecisionRequest, ModelDecisionProvider
 from . import logtags
 from .models import (
+    Action,
     ActionKind,
     ExecutionContext,
     GoalEvaluator,
     RuntimeContext,
+    UIElement,
     UIObservation,
 )
 from .safety import SafetyValidator
@@ -202,9 +205,10 @@ class AppPilotAgent:
 
             fresh_observation = self._reobserve_before_action()
             self._emit(f"RE-OBSERVE:\n{fresh_observation.describe()}\n")
-            if not self._decision_is_current(
+            current_action = self._rebind_current_action(
                 decision.action, observation, fresh_observation
-            ):
+            )
+            if current_action is None:
                 self._emit(
                     "STALE DECISION:\ndiscarded because the UI changed before "
                     "execution\n"
@@ -214,7 +218,7 @@ class AppPilotAgent:
             meaningful_fingerprint = self._meaningful_fingerprint(observation)
 
             try:
-                self._safety_validator.validate(decision.action, observation)
+                self._safety_validator.validate(current_action, observation)
             except ValueError as error:
                 self._emit(f"SAFETY VALIDATION:\nrejected - {error}\n")
                 self._log_fail("model proposed an unsafe or invalid action")
@@ -225,7 +229,7 @@ class AppPilotAgent:
             # The secret value is never printed and never leaves this scope
             # except to be handed directly to Maestro.
             secret: str | None = None
-            action = decision.action
+            action = current_action
             if action.credential_kind is not None:
                 if not self._runtime_context.has(action.credential_kind):
                     self._emit(
@@ -305,29 +309,81 @@ class AppPilotAgent:
         return self._observer.observe()
 
     @classmethod
-    def _decision_is_current(
+    def _rebind_current_action(
         cls,
-        action,
+        action: Action,
         original: UIObservation,
         fresh: UIObservation,
-    ) -> bool:
+    ) -> "Action | None":
+        """Return the decision retargeted to the fresh pre-action observation,
+        or None if the screen meaningfully changed / the target is unresolvable.
+
+        ``element_id`` is a positional handle over the raw view hierarchy: the
+        top-level window ORDER can differ between two observations of the SAME
+        screen, so an identical control may carry a different id each observe
+        (seen as e:0.1.* one observe, e:0.0.* the next). Re-locating the target
+        by its stable identity - resource id, selector text and interaction
+        traits - keeps an otherwise-current decision from being thrown away as
+        "stale", and rebinds it to the id that exists NOW so the executor taps
+        the right node instead of failing to find a phantom id.
+        """
         if cls._meaningful_fingerprint(original) != cls._meaningful_fingerprint(
             fresh
         ):
-            return False
+            return None
         if action.kind == ActionKind.PRESS_BACK:
-            return True
+            return action
         original_target = original.find(action.target_id)
+        if original_target is None:
+            return None
         fresh_target = fresh.find(action.target_id)
-        if original_target is None or fresh_target is None:
-            return False
+        if fresh_target is not None and cls._same_target(
+            original_target, fresh_target
+        ):
+            return action
+        relocated = cls._relocate_target(original_target, fresh)
+        if relocated is None:
+            return None
+        if relocated.element_id == action.target_id:
+            return action
+        return replace(action, target_id=relocated.element_id)
+
+    @staticmethod
+    def _target_identity(element: UIElement) -> tuple:
+        """Stable, position-independent signature identifying a target element.
+
+        Excludes ``element_id`` (a volatile hierarchy path) on purpose so the
+        same control matches across a window-order reshuffle."""
         return (
-            original_target.resource_id == fresh_target.resource_id
-            and original_target.selector_text == fresh_target.selector_text
-            and original_target.clickable == fresh_target.clickable
-            and original_target.is_input == fresh_target.is_input
-            and original_target.enabled == fresh_target.enabled
+            element.resource_id,
+            element.selector_text,
+            element.clickable,
+            element.is_input,
+            element.enabled,
         )
+
+    @classmethod
+    def _same_target(cls, first: UIElement, second: UIElement) -> bool:
+        return cls._target_identity(first) == cls._target_identity(second)
+
+    @classmethod
+    def _relocate_target(
+        cls, original_target: UIElement, fresh: UIObservation
+    ) -> "UIElement | None":
+        """Find the same target in ``fresh`` by stable identity.
+
+        Requires a UNIQUE identity match: if the trait signature is ambiguous
+        (or absent) in the fresh observation, return None so the decision is
+        treated as stale rather than risk tapping the wrong element."""
+        identity = cls._target_identity(original_target)
+        matches = [
+            element
+            for element in fresh.elements
+            if cls._target_identity(element) == identity
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     @staticmethod
     def _has_actionable_ui(available_actions) -> bool:

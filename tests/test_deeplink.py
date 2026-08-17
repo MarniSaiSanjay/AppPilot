@@ -2376,12 +2376,15 @@ class TapDeliveryTests(unittest.TestCase):
             obs,
             secret="user@example.com",
         )
-        # Focus tap, THEN caret-to-end (KEYCODE_MOVE_END = 123) before erasing.
+        # Focus tap, caret-to-end (KEYCODE_MOVE_END = 123) + erase, then RE-FOCUS
+        # (a second tap) before typing so the secret lands even though the prior
+        # flow's subprocess dropped the field's focus.
         self.assertEqual(
             adb_calls,
             [
                 ["shell", "input", "tap", "100", "50"],
                 ["shell", "input", "keyevent", "123"],
+                ["shell", "input", "tap", "100", "50"],
             ],
         )
         # Whole field erased (from the end), then the secret typed via the env
@@ -2410,12 +2413,16 @@ class TapDeliveryTests(unittest.TestCase):
         )
         # Caret-to-end still runs via adb even when focus was a Maestro tapOn.
         self.assertEqual(adb_calls, [["shell", "input", "keyevent", "123"]])
+        # Focus tapOn, erase, then a single flow that RE-TAPS and types together
+        # so the field stays focused for the secret (a standalone inputText would
+        # type into nothing after the prior flow's driver dropped focus).
         self.assertEqual(
             flow_calls,
             [
                 '- tapOn:\n    text: "Email or phone number"\n',
                 f"- eraseText: {a.CREDENTIAL_FIELD_ERASE_CHARS}\n",
-                f"- inputText: ${{{a.MAESTRO_SECRET_ENV}}}\n",
+                '- tapOn:\n    text: "Email or phone number"\n'
+                + f"- inputText: ${{{a.MAESTRO_SECRET_ENV}}}\n",
             ],
         )
 
@@ -2474,7 +2481,10 @@ class KeyboardFilteringTests(unittest.TestCase):
 
         obs = a.MaestroHierarchyObserver("device", ime_package_provider=boom)
         obs._ensure_excluded_prefixes()
-        self.assertEqual(obs._excluded_prefixes, ("com.android.systemui:",))
+        self.assertEqual(
+            obs._excluded_prefixes,
+            ("com.android.systemui:", "android:id/input_method_"),
+        )
 
     def test_keyboard_labels_do_not_bubble_into_ancestor_container(self):
         obs = self._observer()

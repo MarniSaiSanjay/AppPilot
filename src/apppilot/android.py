@@ -47,7 +47,15 @@ class MaestroHierarchyObserver:
     # System-UI prefix always excluded from observations. The active IME package
     # is resolved per device and appended in ``observe`` - an open keyboard adds
     # 100+ key nodes that would crowd real controls out of the truncated tree.
-    _BASE_EXCLUDED_PREFIXES = ("com.android.systemui:",)
+    # ``android:id/input_method_`` is the framework IME navigation bar (e.g. the
+    # ``input_method_nav_back`` button): it lives under the ``android`` namespace
+    # rather than the keyboard package, and toggles with the keyboard - excluding
+    # it keeps the screen fingerprint stable across keyboard show/hide so the
+    # login loop guards (already-entered field, re-entry, stuck) are not defeated.
+    _BASE_EXCLUDED_PREFIXES = (
+        "com.android.systemui:",
+        "android:id/input_method_",
+    )
 
     def __init__(
         self,
@@ -690,17 +698,26 @@ class MaestroExecutor:
         else:
             self._run_flow(payload)
 
-        if replace_existing:
-            # Reliably empty the field before entry so a re-entered/default value
-            # replaces the old one instead of merging with it, then inject the
-            # secret via the environment placeholder (never the literal value in
-            # the YAML).
-            self._clear_focused_field()
-            self._run_flow(
-                f"- inputText: ${{{MAESTRO_SECRET_ENV}}}\n", secret=secret
-            )
-        else:
+        if not replace_existing:
             self._run_flow(f"- inputText: {json.dumps(action.input_text)}\n")
+            return
+
+        # Credential / replace entry: empty the field, then RE-FOCUS and type in
+        # a single Maestro flow. Each ``maestro test`` runs in its own subprocess
+        # and tears down its driver on exit, which drops the soft keyboard and
+        # the field's focus - a standalone ``inputText`` then types into nothing,
+        # leaving the field empty (seen as an unfilled password entry and an
+        # "enter your password" validation error). Re-focusing in the same flow
+        # as the type keeps the field focused so the secret always lands. The
+        # field is already cleared here, so the re-tap's caret position - the
+        # reason the earlier clear moves the caret to the end - no longer matters.
+        self._clear_focused_field()
+        input_line = f"- inputText: ${{{MAESTRO_SECRET_ENV}}}\n"
+        if kind == "point":
+            self._tap_point(*payload)
+            self._run_flow(input_line, secret=secret)
+        else:
+            self._run_flow(payload + input_line, secret=secret)
 
     def _clear_focused_field(self) -> None:
         """Deterministically empty the currently focused text field.
