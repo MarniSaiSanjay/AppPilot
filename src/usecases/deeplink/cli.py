@@ -19,14 +19,14 @@ from typing import Sequence
 try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     from ...apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from ...apppilot.agent import _load_dotenv
-    from ...apppilot import apk_config, email_delivery, logtags
+    from ...apppilot import apk_config, device_config, email_delivery, logtags
     from ...shared.warmup import MaestroWarmUp
     from ...shared.installer import LocalApkInstaller
     from ...shared.login import LoginCapability, SharedLoginFlow, build_login_agent
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from apppilot.agent import _load_dotenv
-    from apppilot import apk_config, email_delivery, logtags
+    from apppilot import apk_config, device_config, email_delivery, logtags
     from shared.warmup import MaestroWarmUp
     from shared.installer import LocalApkInstaller
     from shared.login import LoginCapability, SharedLoginFlow, build_login_agent
@@ -59,7 +59,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=str(_default_excel_path()),
         help="Path to the deeplink test-case Excel (default: bundled workbook).",
     )
-    parser.add_argument("--device", default="emulator-5554")
+    parser.add_argument(
+        "--device", default=None,
+        help=(
+            "ADB device serial to target. If omitted, the device selected during "
+            "/init is reused (when still connected), otherwise a single connected "
+            "device is auto-detected."
+        ),
+    )
     parser.add_argument(
         "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
         help="Maximum attempts per deeplink test case (default 2: 1 try + 1 retry).",
@@ -120,15 +127,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
-    executor = MaestroExecutor(APP_ID, args.device)
-    observer = MaestroHierarchyObserver(args.device)
+    # Resolve the target device: explicit --device wins; otherwise reuse the
+    # /init selection (revalidated live) or auto-detect a single connected device
+    # (device.py owns detection). Ambiguous multi-device with no choice exits 2.
+    device_id = device_config.resolve_device(
+        args.device, output=lambda message: print(message, file=sys.stderr),
+    )
+    if device_id is None:
+        return 2
+
+    executor = MaestroExecutor(APP_ID, device_id)
+    observer = MaestroHierarchyObserver(device_id)
     warm_up = None if args.no_warm_up else MaestroWarmUp(executor)
 
     # Shared login capability: the same generic AppPilotAgent + Brain, reusing
     # the device's executor/observer (DRY). The executor's foreground check is
     # injected so login never completes while the app is not foreground.
     login_agent = build_login_agent(
-        args.device,
+        device_id,
         executor=executor,
         observer=observer,
         foreground_check=executor.is_foreground,

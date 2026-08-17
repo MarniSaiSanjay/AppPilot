@@ -183,11 +183,20 @@ Options: `--excel` (workbook path), `--device`, `--max-attempts` (default `2`),
 the local `.apk` to install). At the end it prints a concise per-test report plus
 totals.
 
+`--device` is resolved with a simple precedence: an explicit `--device SERIAL`
+always wins; otherwise the device selected during `/init` (saved, gitignored, in
+`.apppilot_device`) is reused when it is still connected; otherwise a single
+connected device is auto-detected. If several usable devices are connected and
+none is chosen, the run exits cleanly (code `2`) asking you to pass
+`--device <serial>`.
+
 AppPilot installs **only a user-provided local `.apk`** — there is no build,
 enlistment, or store acquisition. Supply the path with `--apk PATH`, or let the
 CLI prompt for it at startup: a previously saved path (in `.apppilot_apk`,
-gitignored) is offered as `Use this APK? [Y/n]`, otherwise you are asked to enter
-one. The path is normalized and validated (exists, is a file, `.apk`, readable)
+gitignored) is offered as a bracketed default, `APK path [<saved-path>]:` —
+press Enter to keep the saved path, or type a new valid path to replace it;
+with no saved path you are simply asked for one (`APK path:`). The path is
+normalized and validated (exists, is a file, `.apk`, readable)
 before the suite runs; an invalid path exits cleanly with code `2`.
 
 For uninstalled cases, deferred deeplink/referrer delivery after sideloading is

@@ -28,7 +28,7 @@ import json
 import re
 import urllib.request
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, NamedTuple, Optional
 
 from . import logtags, email_render
 
@@ -199,6 +199,75 @@ def _save_recipient(recipient: str) -> None:
         pass  # Persisting the default is best-effort; never block the send.
 
 
+class RecipientOutcome(NamedTuple):
+    """Result of :func:`configure_recipient`.
+
+    ``recipient`` is the resolved address, or ``None`` when none was chosen.
+    ``cancelled`` distinguishes an EOF/Ctrl-C abort from exhausting the attempts,
+    so callers can log/report the two cases differently.
+    """
+
+    recipient: Optional[str]
+    cancelled: bool = False
+
+
+def configure_recipient(
+    *,
+    interactive: bool = True,
+    input_fn: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+    max_attempts: int = 3,
+) -> RecipientOutcome:
+    """Resolve the email recipient via the shared bracketed-default prompt.
+
+    Single source of truth for recipient configuration, reused by BOTH the
+    normal-run send flow (:func:`prompt_email_recipient`) and ``/init``. It owns:
+    saved-recipient loading, address validation, the ``Email recipient
+    [<saved>]:`` prompt, Enter-keeps-the-saved-default, replace/persist of a new
+    valid address, bounded invalid-input reprompting, never overwriting the saved
+    default with an invalid entry, and clean EOF/Ctrl-C cancellation.
+
+    Never sends and never raises. Non-interactive runs reuse a saved, still-valid
+    recipient (if any) WITHOUT prompting. The returned :class:`RecipientOutcome`
+    reports whether resolution was cancelled so callers can distinguish an abort
+    from exhausted attempts.
+    """
+
+    def _ask(prompt: str) -> Optional[str]:
+        # Ctrl-C / EOF signals cancellation (None), kept distinct from an empty
+        # answer ("") so aborting can never be mistaken for "accept the default".
+        try:
+            return input_fn(prompt)
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    saved = _load_saved_recipient()
+
+    # Non-interactive: reuse a saved recipient only; never prompt.
+    if not interactive:
+        return RecipientOutcome(saved)
+
+    # Interactive: a single bracketed-default prompt (no Yes/No step). Enter keeps
+    # the saved default unchanged; typing a valid address replaces it.
+    for _ in range(max(1, max_attempts)):
+        hint = f" [{saved}]" if saved else ""
+        entered = _ask(f"Email recipient{hint}: ")
+        if entered is None:  # Ctrl-C / EOF: abort, never reuse the saved default.
+            return RecipientOutcome(None, cancelled=True)
+        entered = entered.strip()
+        if not entered:
+            if saved:  # Enter keeps the saved default; never re-saved/overwritten.
+                return RecipientOutcome(saved)
+            output("Invalid email address - please try again.")
+            continue
+        if is_valid_email(entered):
+            _save_recipient(entered)  # replace the saved default with the new one
+            return RecipientOutcome(entered)
+        output("Invalid email address - please try again.")  # never overwrites saved
+
+    return RecipientOutcome(None)
+
+
 def prompt_email_recipient(
     *,
     env: Mapping[str, str],
@@ -213,7 +282,11 @@ def prompt_email_recipient(
     Returns the recipient address to deliver to once the suite finishes, or
     None to send nothing (non-interactive, missing config, declined, cancelled,
     or no valid address). The chosen address is persisted as the next default.
-    Never raises - email must never affect the suite verdict or exit status."""
+    Never raises - email must never affect the suite verdict or exit status.
+
+    The recipient prompt itself is owned by the shared :func:`configure_recipient`
+    (same bracketed-default UX used by ``/init``); this wrapper adds only the
+    per-run "Send report?" decision and the relay-config fail-fast."""
 
     def _ask(prompt: str) -> Optional[str]:
         # Ctrl-C / EOF signals cancellation (None), kept distinct from an empty
@@ -242,29 +315,22 @@ def prompt_email_recipient(
             _log("report not sent (declined)")
             return None
 
-        saved = _load_saved_recipient()
-        recipient = None
-        for _ in range(max(1, max_email_attempts)):
-            hint = f" [{saved}]" if saved else ""
-            entered = _ask(f"Recipient email address{hint}: ")
-            if entered is None:  # Ctrl-C / EOF: abort, never send to the default.
+        # Recipient resolution/persistence is delegated to the shared helper.
+        outcome = configure_recipient(
+            interactive=True,
+            input_fn=input_fn,
+            output=output,
+            max_attempts=max_email_attempts,
+        )
+        if outcome.recipient is None:
+            if outcome.cancelled:  # Ctrl-C / EOF: abort, never send to the default.
                 _log("report not sent (cancelled)")
-                return None
-            entered = entered.strip()
-            if not entered and saved:
-                recipient = saved
-                break
-            if is_valid_email(entered):
-                recipient = entered
-                break
-            output("Invalid email address - please try again.")
-        if not recipient:
-            _log("report not sent - no valid recipient provided")
+            else:
+                _log("report not sent - no valid recipient provided")
             return None
 
-        _save_recipient(recipient)
-        _log(f"the report will be emailed to {recipient} after the suite finishes")
-        return recipient
+        _log(f"the report will be emailed to {outcome.recipient} after the suite finishes")
+        return outcome.recipient
     except (Exception, KeyboardInterrupt) as error:  # never affect the suite result
         _log(f"report not sent - unexpected error: {error}")
         return None

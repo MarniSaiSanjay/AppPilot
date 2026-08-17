@@ -20,3 +20,6 @@ testcases/regressions/*.xlsx
 
 # Locally remembered APK path (never commit)
 .apppilot_apk
+
+# Locally remembered device serial selected during /init (never commit)
+.apppilot_device
