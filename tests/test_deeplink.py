@@ -250,6 +250,112 @@ class ExcelLoadingTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Test-suite selection (runtime CLI concern; never persisted, never in /init)
+# --------------------------------------------------------------------------- #
+class TestSuiteSelectionTests(unittest.TestCase):
+    """Cover the minimal Deeplink workbook discovery/selection added to the CLI:
+    explicit --excel wins, zero fails cleanly, one auto-selects, several prompt,
+    lock files are ignored, and bad input is handled without crashing."""
+
+    def setUp(self):
+        from usecases.deeplink import cli as _cli
+
+        self._cli = _cli
+        self._dir = Path(tempfile.mkdtemp())
+        self._out = []
+
+    def _touch(self, name):
+        (self._dir / name).write_text("x", encoding="utf-8")
+
+    def _select(self, explicit=None, *, interactive=True, input_fn=None):
+        return self._cli._select_workbook(
+            explicit,
+            directory=self._dir,
+            interactive=interactive,
+            output=self._out.append,
+            input_fn=input_fn if input_fn is not None else self._never_prompt,
+        )
+
+    @staticmethod
+    def _never_prompt(_prompt):
+        raise AssertionError("selection prompt shown when it should not be")
+
+    def test_explicit_excel_bypasses_discovery_and_prompt(self):
+        # Even with several suites present, an explicit path is used verbatim and
+        # no discovery/prompt occurs.
+        self._touch("smoke.xlsx")
+        self._touch("regression.xlsx")
+        chosen = self._select("/tmp/some/given.xlsx", interactive=True)
+        self.assertEqual(chosen, Path("/tmp/some/given.xlsx"))
+        self.assertEqual(self._out, [])
+
+    def test_zero_workbooks_fails_cleanly(self):
+        self.assertIsNone(self._select(interactive=True))
+        self.assertTrue(
+            any("no test suites" in message for message in self._out),
+            self._out,
+        )
+
+    def test_single_workbook_auto_selected_without_prompt(self):
+        self._touch("deeplink_tests.xlsx")
+        chosen = self._select(interactive=False)  # would raise if it prompted
+        self.assertEqual(chosen.name, "deeplink_tests.xlsx")
+        self.assertIn("Found 1 test suite: deeplink_tests.xlsx", self._out)
+        self.assertIn("Running suite: deeplink_tests.xlsx", self._out)
+
+    def test_lock_files_are_ignored(self):
+        # A single real workbook alongside an Excel lock file still auto-selects
+        # (the ~$ lock is not a suite).
+        self._touch("deeplink_tests.xlsx")
+        self._touch("~$deeplink_tests.xlsx")
+        self.assertEqual(self._cli._discover_workbooks(self._dir), [
+            self._dir / "deeplink_tests.xlsx"
+        ])
+        chosen = self._select(interactive=False)
+        self.assertEqual(chosen.name, "deeplink_tests.xlsx")
+
+    def test_multiple_workbooks_prompt_and_select(self):
+        self._touch("smoke.xlsx")
+        self._touch("regression.xlsx")
+        chosen = self._select(interactive=True, input_fn=lambda _p: "2")
+        # Listed case-insensitively by name: 1=regression, 2=smoke.
+        self.assertEqual(chosen.name, "smoke.xlsx")
+        self.assertIn("Available test suites:", self._out)
+        self.assertIn("1. regression.xlsx", self._out)
+        self.assertIn("2. smoke.xlsx", self._out)
+
+    def test_empty_input_selects_the_default_first_suite(self):
+        self._touch("smoke.xlsx")
+        self._touch("regression.xlsx")
+        chosen = self._select(interactive=True, input_fn=lambda _p: "")
+        self.assertEqual(chosen.name, "regression.xlsx")
+
+    def test_invalid_selection_reprompts_then_succeeds(self):
+        self._touch("smoke.xlsx")
+        self._touch("regression.xlsx")
+        answers = iter(["0", "9", "notanumber", "2"])
+        chosen = self._select(interactive=True, input_fn=lambda _p: next(answers))
+        self.assertEqual(chosen.name, "smoke.xlsx")
+        self.assertTrue(
+            any("Invalid selection" in message for message in self._out), self._out
+        )
+
+    def test_repeated_invalid_selection_fails_cleanly(self):
+        self._touch("smoke.xlsx")
+        self._touch("regression.xlsx")
+        chosen = self._select(interactive=True, input_fn=lambda _p: "nope")
+        self.assertIsNone(chosen)
+
+    def test_multiple_workbooks_non_interactive_requires_explicit_excel(self):
+        self._touch("smoke.xlsx")
+        self._touch("regression.xlsx")
+        self.assertIsNone(self._select(interactive=False))
+        self.assertTrue(
+            any("--excel" in message for message in self._out), self._out
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Semantic match / retry behaviour
 # --------------------------------------------------------------------------- #
 class RunnerBehaviourTests(unittest.TestCase):

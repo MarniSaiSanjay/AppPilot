@@ -46,10 +46,79 @@ from .orchestrator import DeeplinkSuiteOrchestrator
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def _default_excel_path() -> Path:
-    return Path(__file__).resolve().parents[3] / "testcases" / "deeplinks" / (
-        "deeplink_tests.xlsx"
+# Bound the interactive suite-selection reprompt so bad input can never loop
+# forever (the run fails cleanly instead).
+_MAX_SELECTION_ATTEMPTS = 5
+
+
+def _deeplink_testcases_dir() -> Path:
+    """Directory owning the Deeplink use case's test workbooks."""
+    return Path(__file__).resolve().parents[3] / "testcases" / "deeplinks"
+
+
+def _discover_workbooks(directory: Path) -> list[Path]:
+    """Return the selectable ``.xlsx`` suites in ``directory`` (sorted by name),
+    ignoring temporary Excel lock files (``~$*.xlsx``)."""
+    return sorted(
+        (path for path in directory.glob("*.xlsx") if not path.name.startswith("~$")),
+        key=lambda path: path.name.casefold(),
     )
+
+
+def _prompt_for_workbook(
+    workbooks: list[Path], *, output, input_fn,
+) -> "Path | None":
+    """Show a numbered suite list and return the chosen workbook. Empty input
+    picks the first ([1]); invalid input reprompts. Returns None if no valid
+    choice is made (EOF / too many invalid entries) so the caller fails cleanly."""
+    output("Available test suites:")
+    for index, workbook in enumerate(workbooks, start=1):
+        output(f"{index}. {workbook.name}")
+    for _ in range(_MAX_SELECTION_ATTEMPTS):
+        try:
+            raw = input_fn("Select test suite [1]: ").strip()
+        except EOFError:
+            return workbooks[0]
+        if not raw:
+            return workbooks[0]
+        if raw.isdigit() and 1 <= int(raw) <= len(workbooks):
+            return workbooks[int(raw) - 1]
+        output(f"Invalid selection {raw!r}; enter a number 1-{len(workbooks)}.")
+    return None
+
+
+def _select_workbook(
+    explicit: "str | None",
+    *,
+    directory: Path,
+    interactive: bool,
+    output,
+    input_fn=input,
+) -> "Path | None":
+    """Resolve which workbook to run.
+
+    * An explicit ``--excel`` path always wins and skips discovery/prompting.
+    * Otherwise discover suites in ``directory``: none -> clean failure (None);
+      exactly one -> auto-select; several -> prompt when interactive, else fail
+      cleanly asking for an explicit ``--excel`` (automation contract).
+    """
+    if explicit is not None:
+        return Path(explicit)
+    workbooks = _discover_workbooks(directory)
+    if not workbooks:
+        output(f"ERROR: no test suites (.xlsx) found in {directory}")
+        return None
+    if len(workbooks) == 1:
+        output(f"Found 1 test suite: {workbooks[0].name}")
+        output(f"Running suite: {workbooks[0].name}")
+        return workbooks[0]
+    if not interactive:
+        output(
+            "ERROR: multiple test suites found; pass --excel PATH to choose one "
+            "in non-interactive mode"
+        )
+        return None
+    return _prompt_for_workbook(workbooks, output=output, input_fn=input_fn)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -58,8 +127,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--excel",
-        default=str(_default_excel_path()),
-        help="Path to the deeplink test-case Excel (default: bundled workbook).",
+        default=None,
+        help=(
+            "Path to a specific deeplink test-case Excel. If omitted, the "
+            "workbooks in the Deeplink testcases directory are discovered and "
+            "(when more than one) you are prompted to select a suite."
+        ),
     )
     parser.add_argument(
         "--device", default=None,
@@ -104,8 +177,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("ERROR: --verify-timeout must not be negative", file=sys.stderr)
         return 2
 
+    interactive = getattr(sys.stdin, "isatty", lambda: False)()
+    # Test-suite selection (runtime CLI concern; never persisted, never in /init).
+    # --excel is an explicit override that skips discovery/prompting; otherwise
+    # discover the Deeplink workbooks and select (auto when only one).
+    excel_path = _select_workbook(
+        args.excel,
+        directory=_deeplink_testcases_dir(),
+        interactive=interactive,
+        output=lambda message: print(message, file=sys.stderr),
+    )
+    if excel_path is None:
+        return 2
+
     try:
-        cases = load_deeplink_cases(args.excel)
+        cases = load_deeplink_cases(excel_path)
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         print(f"ERROR: could not load deeplink test cases: {error}", file=sys.stderr)
         return 2
@@ -114,7 +200,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Resolve it up front from --apk, a saved path, or an interactive prompt, and
     # validate before any execution. An unresolved/invalid path is a clean setup
     # error (exit 2); it never reaches test execution and never leaks a traceback.
-    interactive = getattr(sys.stdin, "isatty", lambda: False)()
     apk_path = apk_config.resolve_apk_path(args.apk, interactive=interactive)
     if apk_path is None:
         print("ERROR: no valid APK path provided", file=sys.stderr)

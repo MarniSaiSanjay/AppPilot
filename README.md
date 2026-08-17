@@ -146,7 +146,8 @@ With a device connected and `.env` in place, run the **deeplink test suite**:
 python3 src/deeplink_runner.py
 ```
 
-Options: `--excel` (workbook path), `--device`, `--max-attempts` (default `2`),
+Options: `--excel` (explicit workbook path; otherwise a suite is selected from
+`testcases/deeplinks/`), `--device`, `--max-attempts` (default `2`),
 `--verify-timeout` (default `30` seconds), `--no-warm-up`, and `--apk`.
 
 `--device` is an **optional** override. When omitted, the device selected during
@@ -168,8 +169,10 @@ Options: `--device`, `--max-actions`, `--max-stuck-actions`, `--guidance`.
 The data-driven runner executes deeplink test cases from an Excel workbook,
 reusing the same Maestro executor, UI observer, and model configuration as the
 agent. The workbook requires **Test ID**, **Deep Link**, **User Type**, and
-**Expected Result**, with optional **Installed**. A bundled workbook lives at
-`testcases/deeplinks/deeplink_tests.xlsx`.
+**Expected Result**, with optional **Installed**. Test suites live in
+`testcases/deeplinks/`; when `--excel` is omitted the runner auto-runs the only
+workbook there, prompts to choose when several exist, and exits cleanly (code
+`2`) when none is found.
 
 For each case, the suite establishes a clean state, launches the **exact**
 deeplink via Maestro `openLink`, observes the resulting UI, and the **AI judges**

@@ -323,8 +323,8 @@ RESULT</code></pre>
       <pre><code>python3 src/deeplink_runner.py --device emulator-5554</code></pre>
       <h3>The workbook</h3>
       <p>
-        Four required fields plus an optional <strong>Installed</strong> field. Recognized headers may be reordered; without a header the required fields use columns A-D. A
-        bundled copy lives at <code>testcases/deeplinks/deeplink_tests.xlsx</code>.
+        Four required fields plus an optional <strong>Installed</strong> field. Recognized headers may be reordered; without a header the required fields use columns A-D. Test
+        suites live in <code>testcases/deeplinks/</code> (for example <code>deeplink_tests.xlsx</code>).
       </p>
       <table>
         <thead><tr><th>Column</th><th>Meaning</th></tr></thead>
@@ -348,7 +348,7 @@ RESULT</code></pre>
       <table>
         <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td><code>--excel</code></td><td>Path to the workbook (defaults to the bundled one).</td></tr>
+          <tr><td><code>--excel</code></td><td>Explicit workbook path. Omit to run the only suite in <code>testcases/deeplinks/</code>, or to pick from a menu when several exist.</td></tr>
           <tr><td><code>--device</code></td><td>ADB device id.</td></tr>
           <tr><td><code>--max-attempts</code></td><td>Attempts per case before FAIL (default <code>2</code>).</td></tr>
           <tr><td><code>--verify-timeout</code></td><td>Bounded polling window for the expected result (default <code>30</code> seconds).</td></tr>
