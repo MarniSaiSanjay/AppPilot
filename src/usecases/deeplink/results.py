@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .testcases import DeeplinkTestCase
+from .deeplink_testcase_loader import DeeplinkTestCase
 
 
 # --------------------------------------------------------------------------- #

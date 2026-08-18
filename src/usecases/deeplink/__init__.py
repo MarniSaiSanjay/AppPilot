@@ -21,7 +21,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from shared.warmup import MaestroWarmUp, WarmUp
     from shared.login import LoginCapability, SharedLoginFlow
 
-from .testcases import DeeplinkTestCase, load_deeplink_cases
+from .deeplink_testcase_loader import DeeplinkTestCase, load_deeplink_cases
 from .verification import (
     ExpectationJudge,
     ExpectationJudgeOperationalError,

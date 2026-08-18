@@ -64,5 +64,10 @@ def record_suite_run(
             method="POST",
         )
         urllib.request.urlopen(request, timeout=10).close()
-    except Exception:
-        pass  # telemetry is best-effort; the suite result is independent of it
+    except (Exception, KeyboardInterrupt):
+        # Best-effort: never affect the suite result. A Ctrl-C landing in the
+        # telemetry POST window must not corrupt the already-computed verdict,
+        # skip the report/email, or surface a traceback. The genuine suite
+        # interruption happens earlier, during suite execution, before telemetry
+        # is ever reached - so this cannot swallow the main application's Ctrl-C.
+        pass

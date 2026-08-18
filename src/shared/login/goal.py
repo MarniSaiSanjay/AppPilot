@@ -99,16 +99,38 @@ class SignedInCopilotGoalEvaluator:
     _COMPOSER_INPUT_RESOURCE = ("copilot", "composer")
     _SEARCH_INPUT_TEXT = ("search",)
     _SEARCH_INPUT_RESOURCE = ("search_box", "search_input", "search_field")
-    _RESTRICTED_TEXT = (
-        "not eligible to access copilot",
-        "access to copilot is restricted",
-        "copilot access restricted",
-        "don't have access to copilot",
-        "do not have access to copilot",
-        "copilot isn't available for your account",
-        "copilot is not available for your account",
+    # Explicit negative authentication terminals: restricted/denied access,
+    # blocked/disabled accounts and outright sign-in failures. These are NOT a
+    # successful login - the login form merely disappearing behind such a screen
+    # must never be reported as reached. This is only a lean deterministic
+    # SAFETY NET for the explicit, common negatives (and the no-AI fallback
+    # path); the semantic judge handles novel wordings. Generic multi-word
+    # English phrases whose negative sense is carried by the paired word (e.g.
+    # "denied"/"restricted"/"failed"), so a legitimate screen merely mentioning
+    # "access", "permission" or "account" does not match. App-agnostic.
+    _NEGATIVE_AUTH_TEXT = (
+        "not eligible",
+        "access denied",
+        "access restricted",
+        "restricted access",
+        "permission denied",
+        "account restricted",
+        "account blocked",
+        "account is blocked",
+        "account disabled",
+        "sign-in failed",
+        "sign in failed",
+        "unable to sign in",
+        "couldn't sign you in",
+        "authentication failed",
+        "not authorized",
     )
-    _RESTRICTED_RESOURCE = ("access_restricted", "not_eligible", "copilot_restricted")
+    _NEGATIVE_AUTH_RESOURCE = (
+        "access_denied",
+        "access_restricted",
+        "account_blocked",
+        "signin_error",
+    )
     # Optional intro/suggested-prompt interruption to dismiss when present.
     _INTRO = (
         "let's get started",
@@ -156,10 +178,15 @@ class SignedInCopilotGoalEvaluator:
             return False
         if self._blocked(observation):
             return False
+        # An explicit restricted/denied/failed authentication screen is a
+        # NEGATIVE terminal: login definitively did not succeed. Decide it
+        # deterministically as not-reached so it can never be mistaken for a
+        # usable in-app screen (and never reach the semantic judge to be flipped).
+        if self._negative_auth_terminal(observation):
+            return False
         if (
             self._signed_in_home(observation)
             or self._search_screen(observation)
-            or self._restricted_terminal(observation)
         ):
             return True
         if not self._has_actionable_ui(observation):
@@ -174,10 +201,14 @@ class SignedInCopilotGoalEvaluator:
             return False
         if self._blocked(observation):
             return True
+        # A negative-auth terminal offers no login/onboarding step to act on: the
+        # agent should stop driving and reach a bounded, controlled non-PASS
+        # rather than hand the dead-end screen to the Brain.
+        if self._negative_auth_terminal(observation):
+            return False
         if (
             self._signed_in_home(observation)
             or self._search_screen(observation)
-            or self._restricted_terminal(observation)
         ):
             return True
         if not self._has_actionable_ui(observation):
@@ -234,11 +265,11 @@ class SignedInCopilotGoalEvaluator:
             require_input=True,
         )
 
-    def _restricted_terminal(self, observation: UIObservation) -> bool:
+    def _negative_auth_terminal(self, observation: UIObservation) -> bool:
         return self._matches(
             observation,
-            text=self._RESTRICTED_TEXT,
-            resource=self._RESTRICTED_RESOURCE,
+            text=self._NEGATIVE_AUTH_TEXT,
+            resource=self._NEGATIVE_AUTH_RESOURCE,
         )
 
     @staticmethod

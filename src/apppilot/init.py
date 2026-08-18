@@ -23,6 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from . import apk_config, device, device_config, email_delivery, environment
 
@@ -190,11 +191,37 @@ def check_java(*, which=None, runner=None) -> CheckResult:
 # Model Checks
 # =============================================================================
 
+def _model_config_problem(config: Mapping[str, str]) -> Optional[str]:
+    """Return a human-readable reason the model config is unusable, else None.
+
+    Purely syntactic and offline: it verifies the values are well-formed enough
+    to be usable - never contacting the endpoint, sending a prompt, or consuming
+    tokens. ``config_from_env`` only checks that the model name and API key are
+    present (non-empty), so whitespace-only values and a malformed base URL slip
+    through as "configured". Those are configured-but-unusable, so /init must not
+    report them as ready. The API key value is inspected but never echoed.
+    """
+    if not config["model"].strip():
+        return "APPPILOT_MODEL is blank"
+    if not config["api_key"].strip():
+        return "APPPILOT_MODEL_API_KEY is blank"
+    base_url = config["base_url"]
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return (
+            f"APPPILOT_MODEL_BASE_URL is not a valid http(s) URL: {base_url!r}"
+        )
+    return None
+
+
 def check_model(env: Optional[Mapping[str, str]] = None) -> CheckResult:
-    """Verify model configuration is present/valid (REQUIRED).
+    """Verify model configuration is present and well-formed (REQUIRED).
 
     Reuses :meth:`ChatModelClient.config_from_env`. Reads only the model *name*
-    for display - the API key is never included in the result.
+    for display - the API key is never included in the result. This is a
+    configuration/readiness check, not a health check: it confirms the values
+    are present and syntactically usable, but does NOT contact the model
+    endpoint or consume tokens, so ``PASS`` means "configured", not "reachable".
     """
     source = os.environ if env is None else env
     config = ChatModelClient.config_from_env(source)
@@ -203,6 +230,15 @@ def check_model(env: Optional[Mapping[str, str]] = None) -> CheckResult:
             "model", _MODEL, Importance.REQUIRED, Status.NOT_CONFIGURED,
             "Model not configured",
             "Configure APPPILOT_MODEL and APPPILOT_MODEL_API_KEY.",
+        )
+    problem = _model_config_problem(config)
+    if problem is not None:
+        return CheckResult(
+            "model", _MODEL, Importance.REQUIRED, Status.FAIL,
+            f"Model misconfigured ({problem})",
+            "Fix the model configuration: set a non-empty APPPILOT_MODEL and "
+            "APPPILOT_MODEL_API_KEY, and a valid http(s) APPPILOT_MODEL_BASE_URL "
+            "(e.g. https://api.openai.com/v1).",
         )
     return CheckResult(
         "model", _MODEL, Importance.REQUIRED, Status.PASS,
@@ -649,8 +685,10 @@ def check_email(
     never prompt and simply reuse a saved recipient if one exists. ``/init``
     NEVER sends an email or contacts the relay - it only inspects local config.
 
-    Collect-all: never raises; any unexpected error becomes a clean OPTIONAL
-    "not configured" result so every other check still reports.
+    Collect-all: never raises on error - any unexpected failure becomes a clean
+    OPTIONAL "not configured" result so every other check still reports. A
+    genuine Ctrl-C (KeyboardInterrupt) is NOT swallowed here; it propagates so
+    ``/init`` aborts consistently instead of reporting a misleading result.
     """
     resolved_env = os.environ if env is None else env
     try:
@@ -681,7 +719,12 @@ def check_email(
                 "email", _EMAIL, Importance.OPTIONAL, Status.NOT_CONFIGURED, detail,
             )
         return _email_result(outcome.recipient, resolved_env)
-    except (Exception, KeyboardInterrupt):  # collect-all: never surface a traceback
+    except Exception:
+        # Collect-all for ERRORS only: an email-config failure becomes a clean
+        # OPTIONAL "not configured" so every other check still reports. A genuine
+        # Ctrl-C (KeyboardInterrupt) is intentionally NOT caught here - it
+        # propagates to main()'s handler so /init aborts ("Aborted." / exit 130)
+        # instead of being silently turned into a "not configured, ready" result.
         return CheckResult(
             "email", _EMAIL, Importance.OPTIONAL, Status.NOT_CONFIGURED,
             "Email not configured (optional)",

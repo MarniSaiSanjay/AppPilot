@@ -15,7 +15,7 @@ try:  # package-relative (python -m src.usecases.deeplink.orchestrator) vs top-l
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot import logtags
 
-from .testcases import DeeplinkTestCase
+from .deeplink_testcase_loader import DeeplinkTestCase
 from .results import (
     SuiteReport,
     TestCaseResult,

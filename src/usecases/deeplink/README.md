@@ -21,7 +21,7 @@ judges expected-vs-observed. Retry and reporting are fully deterministic.
 
 ## Excel-driven testcases
 
-The workbook is the source of truth (`testcases.py`). The loader is tolerant of
+The workbook is the source of truth (`deeplink_testcase_loader.py`). The loader is tolerant of
 layout: it recognises a header row by name (e.g. *Launch URL*, *Expected
 Screen*, *License*, *Installed*) and maps columns accordingly, falling back to a
 fixed positional layout when no header is present. Each data row must provide a

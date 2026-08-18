@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
@@ -268,13 +269,16 @@ class AppPilotAgent:
             self._emit(f"ACTION:\n{action.describe(observation)}\n")
             self._executor.execute(action, observation, secret=secret)
             if action.credential_kind is not None:
-                # Withhold this field's input next turn (until the screen changes)
-                # so the model proceeds to submit rather than re-typing it.
-                # filled_fingerprint already matches this observation (set by the
-                # _offer_actions call above), so no recompute is needed here.
+                # Withhold this field's input next turn (until the meaningful UI
+                # changes) so the model proceeds to submit rather than re-typing
+                # it. Set the withhold baseline from the observation we actually
+                # acted on (fresh_observation, post-reobserve/rebind), not the
+                # pre-reobserve one, so next turn compares against the right
+                # screen. ``meaningful_fingerprint`` is that observation's.
                 filled_credential_keys.add(
                     self._credential_field_key(action, observation)
                 )
+                filled_fingerprint = meaningful_fingerprint
             history.append(action.describe(observation))
             # Remember the state we just acted on, to detect progress next step.
             last_acted_fingerprint = meaningful_fingerprint
@@ -418,15 +422,21 @@ class AppPilotAgent:
         )
 
     @staticmethod
-    def _meaningful_fingerprint(observation: UIObservation) -> tuple:
-        """A stable signature of the meaningful UI state, for stuck detection.
+    def _meaningful_fingerprint(observation: UIObservation) -> "Counter":
+        """An order-independent signature of the meaningful UI state.
 
         Non-secret, like ``_observation_fingerprint``, but limited to elements
         with a resource id or that are interactive (clickable/input). Decorative,
         id-less, non-interactive text (volatile clocks/animation) is excluded, so
         such noise does not reset the stuck counter.
+
+        Returned as a multiset (``Counter``) rather than an ordered tuple so a
+        pure re-ordering of the same windows/elements - which can happen between
+        two observations of the SAME screen (see ``_rebind_current_action``) - is
+        NOT treated as a change, while any genuine add/remove/trait change still
+        is (multiplicity is preserved).
         """
-        return tuple(
+        return Counter(
             (
                 element.resource_id,
                 element.label,
@@ -444,12 +454,13 @@ class AppPilotAgent:
 
         A credential input whose field was already filled on this same screen is
         removed, so the model advances to submit instead of re-typing a field
-        that still looks empty. The set is cleared whenever the screen changes.
-        Withholding is skipped if it would leave no actionable (non-Back) step,
-        so the agent is never stranded on a screen whose only action was the
-        already-entered field.
+        that still looks empty. The set is cleared whenever the MEANINGFUL UI
+        changes (decorative/animated churn is ignored, matching the rest of the
+        agent). Withholding is skipped if it would leave no actionable (non-Back)
+        step, so the agent is never stranded on a screen whose only action was
+        the already-entered field.
         """
-        current_fingerprint = self._observation_fingerprint(observation)
+        current_fingerprint = self._meaningful_fingerprint(observation)
         if current_fingerprint != filled_fingerprint:
             filled_keys.clear()
         actions = self._safety_validator.available_actions(observation)
@@ -487,13 +498,24 @@ class AppPilotAgent:
 
 
 def _default_max_actions() -> int:
-    """Resolve the default action bound from the environment, else the constant."""
+    """Resolve the default action bound from the environment, else the constant.
+
+    Only a POSITIVE integer is a meaningful bound. A non-positive value (0 or
+    negative) is invalid config - like a non-integer - and falls back to the
+    default rather than reaching the agent: a negative bound makes the action
+    loop run zero times and crash (``range(max_actions + 1)`` is empty ->
+    ``AssertionError``), and a zero bound makes every run fail immediately. The
+    explicit ``--max-actions`` CLI flag still hard-errors on ``< 1`` at its own
+    boundary; this only governs the env-derived default.
+    """
     raw = os.environ.get("APPPILOT_MAX_ACTIONS")
     if raw:
         try:
-            return int(raw)
+            value = int(raw)
         except ValueError:
-            pass
+            value = 0
+        if value >= 1:
+            return value
     return DEFAULT_MAX_ACTIONS
 
 
@@ -534,6 +556,14 @@ def _load_dotenv(path: Path | None = None) -> None:
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export ") :].strip()
-        value = value.strip().strip('"').strip("'")
+        value = value.strip()
+        # Strip at most ONE matching surrounding quote pair (both ends the same
+        # quote char). The previous greedy ``.strip('"').strip("'")`` removed any
+        # number of both quote types from both ends, corrupting values whose
+        # content legitimately begins/ends with the other quote (e.g.
+        # ``"abc'"`` -> ``abc`` or ``"'x'"`` -> ``x``). Whitespace inside the
+        # quotes is preserved; an unquoted value keeps its own quote characters.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
         if key and key not in os.environ:
             os.environ[key] = value

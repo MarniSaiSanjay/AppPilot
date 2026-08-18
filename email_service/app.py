@@ -27,6 +27,7 @@ import re
 import uuid
 
 from azure.communication.email import EmailClient
+from azure.core.exceptions import ResourceExistsError
 from azure.data.tables import TableClient
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -59,6 +60,9 @@ _client = EmailClient.from_connection_string(_required("ACS_CONNECTION_STRING"))
 # break email. When unset, /telemetry returns 500 while /send-report keeps working.
 _TELEMETRY_CONN = os.environ.get("TELEMETRY_TABLE_CONNECTION_STRING", "").strip()
 _TELEMETRY_TABLE = "SuiteRuns"
+# Set once the SuiteRuns table is known to exist (created here or already
+# present), so the create-table check runs at most once per process.
+_telemetry_table_ready = False
 _HOST_OS_VALUES = {"macOS", "Windows"}
 _TARGET_PLATFORM_VALUES = {"Android", "iOS"}
 
@@ -133,6 +137,28 @@ class TelemetryIn(BaseModel):
     target_platform: str
 
 
+def _ensure_telemetry_table(table: TableClient) -> None:
+    """Ensure the SuiteRuns table exists before the first write.
+
+    ``create_entity`` does not auto-create the table, so on a fresh deployment
+    (storage account present but the table not yet created) the first insert
+    would fail. Creating it here - idempotently - makes the telemetry backend
+    self-provisioning. An already-existing table (ResourceExistsError) is
+    treated as success and never recreated or deleted. Runs at most once per
+    process; a transient failure leaves the flag unset so a later request
+    retries. This stays within the telemetry try/except, so a storage problem
+    only affects best-effort telemetry - never /healthz or /send-report.
+    """
+    global _telemetry_table_ready
+    if _telemetry_table_ready:
+        return
+    try:
+        table.create_table()
+    except ResourceExistsError:
+        pass
+    _telemetry_table_ready = True
+
+
 @app.post("/telemetry")
 def telemetry(payload: TelemetryIn, x_api_key: str = Header(default="")) -> dict:
     if not hmac.compare_digest(
@@ -162,6 +188,7 @@ def telemetry(payload: TelemetryIn, x_api_key: str = Header(default="")) -> dict
         with TableClient.from_connection_string(
             _TELEMETRY_CONN, table_name=_TELEMETRY_TABLE
         ) as table:
+            _ensure_telemetry_table(table)
             table.create_entity(entity)
     except Exception:  # never leak storage/credential details to the caller
         _log.exception("telemetry insert failed")

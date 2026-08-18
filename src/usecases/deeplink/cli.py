@@ -33,7 +33,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from shared.installer import LocalApkInstaller
     from shared.login import LoginCapability, SharedLoginFlow, build_login_agent
 
-from .testcases import load_deeplink_cases
+from .deeplink_testcase_loader import load_deeplink_cases
 from .verification import LLMExpectationJudge
 from .runner import (
     DEFAULT_MAX_ATTEMPTS,

@@ -10,6 +10,7 @@ model never decides any of it.
 
 from __future__ import annotations
 
+import posixpath
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -35,6 +36,14 @@ class DeeplinkTestCase:
 
 
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+# Relationship namespaces used to resolve the workbook's first worksheet part:
+# the r:id attribute on <sheet> and the package-relationship <Relationship>.
+_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_PKG_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+# Fallback worksheet member, used only when the workbook relationships cannot be
+# resolved (e.g. a minimal package without workbook.xml). This preserves the
+# historical behavior for such inputs.
+_FALLBACK_SHEET = "xl/worksheets/sheet1.xml"
 # Positional fallback used only when no header row is recognised; otherwise
 # columns are mapped by header name (see _map_header).
 _COLUMNS = {
@@ -97,6 +106,40 @@ def _match_field(label: str) -> str | None:
 
 def _column_letter(cell_ref: str) -> str:
     return "".join(ch for ch in cell_ref if ch.isalpha())
+
+
+def _first_worksheet_member(archive: zipfile.ZipFile) -> str:
+    """Resolve the archive member holding the workbook's FIRST worksheet.
+
+    A valid ``.xlsx`` does not have to store its first sheet as
+    ``xl/worksheets/sheet1.xml``: the first ``<sheet>`` in ``xl/workbook.xml``
+    references a relationship id, which ``xl/_rels/workbook.xml.rels`` maps to
+    the actual worksheet part (which may be ``sheet2.xml`` etc.). Resolve it
+    through that metadata and fall back to ``sheet1.xml`` when the relationship
+    cannot be determined, so minimal/legacy packages keep working unchanged.
+    """
+    try:
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    except (KeyError, ET.ParseError):
+        return _FALLBACK_SHEET
+    sheets = workbook.find(f"{_SHEET_NS}sheets")
+    first_sheet = sheets.find(f"{_SHEET_NS}sheet") if sheets is not None else None
+    rel_id = first_sheet.get(f"{_REL_NS}id") if first_sheet is not None else None
+    if not rel_id:
+        return _FALLBACK_SHEET
+    target = None
+    for rel in rels.findall(f"{_PKG_REL_NS}Relationship"):
+        if rel.get("Id") == rel_id:
+            target = rel.get("Target")
+            break
+    if not target:
+        return _FALLBACK_SHEET
+    # Relationship targets are relative to the workbook part (in ``xl/``); an
+    # absolute "/xl/..." target is relative to the package root.
+    if target.startswith("/"):
+        return target.lstrip("/")
+    return posixpath.normpath(posixpath.join("xl", target))
 
 
 def _read_shared_strings(archive: zipfile.ZipFile) -> list[str]:
@@ -182,16 +225,18 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
     path = Path(path)
     with zipfile.ZipFile(path) as archive:
         shared = _read_shared_strings(archive)
+        member = _first_worksheet_member(archive)
         try:
-            sheet_bytes = archive.read("xl/worksheets/sheet1.xml")
+            sheet_bytes = archive.read(member)
         except KeyError as error:
-            # A valid ZIP/XLSX that lacks the expected worksheet member (e.g. a
-            # renamed/reordered first sheet or a non-workbook zip). Surface a
-            # stable domain-level error instead of leaking zip-internal KeyError,
-            # so the CLI reports it cleanly (exit 2) rather than a traceback.
+            # A valid ZIP/XLSX that lacks the resolved worksheet member (e.g. a
+            # non-workbook zip, or a workbook whose relationships point at a
+            # missing part). Surface a stable domain-level error instead of
+            # leaking zip-internal KeyError, so the CLI reports it cleanly
+            # (exit 2) rather than a traceback.
             raise ValueError(
                 f"{path} is not a readable deeplink workbook: expected worksheet "
-                "'xl/worksheets/sheet1.xml' was not found"
+                f"'{member}' was not found"
             ) from error
         sheet = ET.fromstring(sheet_bytes)
 

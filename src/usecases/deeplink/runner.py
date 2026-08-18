@@ -35,7 +35,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from shared.login import LoginCapability
     from shared.warmup import WarmUp
 
-from .testcases import DeeplinkTestCase
+from .deeplink_testcase_loader import DeeplinkTestCase
 from .verification import ExpectationJudge, ExpectationJudgeOperationalError
 from .results import AttemptResult, SuiteReport, TestCaseResult
 

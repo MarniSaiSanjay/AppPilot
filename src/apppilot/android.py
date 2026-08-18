@@ -113,7 +113,9 @@ class MaestroHierarchyObserver:
                 text=True,
                 timeout=30,
             )
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            # ValueError covers UnicodeDecodeError from text=True decoding of
+            # non-UTF-8 subprocess output, matching environment.py's handling.
             raise AndroidOperationalError(
                 f"Maestro hierarchy observation failed: {error}"
             ) from error
@@ -261,9 +263,14 @@ class MaestroHierarchyObserver:
         enabled = self._as_bool(attributes.get("enabled", node.get("enabled")), True)
         is_input = class_name.endswith("EditText") or "TextInput" in class_name
 
-        # Safety: drop the live text/accessibility value of a credential field so
-        # a typed secret never reaches the observation, prompt, or trace. The
-        # stable hint (e.g. "Password") is kept as a safe descriptor.
+        # Safety: drop the live text of a credential field so a typed secret
+        # never reaches the observation, prompt, or trace. The accessibility
+        # text can carry the stable credential descriptor (e.g. "Password") that
+        # is sometimes the ONLY classification signal, but it could also echo the
+        # typed value - so replace it with a constant token derived from the
+        # detected KIND (never the field content). This keeps the credential
+        # classification intact for downstream consumers (available actions and
+        # validation) while guaranteeing no secret can leak.
         field_credential_kind = (
             infer_credential_kind(resource_id, hint_text, class_name, accessibility_text)
             if is_input
@@ -271,7 +278,7 @@ class MaestroHierarchyObserver:
         )
         if field_credential_kind is not None:
             text = ""
-            accessibility_text = ""
+            accessibility_text = field_credential_kind.value
 
         own_labels = [value for value in (text, accessibility_text, hint_text) if value]
         potentially_useful = bool(own_labels or clickable or is_input)
@@ -531,7 +538,9 @@ class MaestroExecutor:
     ) -> subprocess.CompletedProcess:
         try:
             result = self._run_adb(args, timeout=timeout)
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            # ValueError covers UnicodeDecodeError from text=True decoding of
+            # non-UTF-8 subprocess output, matching environment.py's handling.
             raise AndroidOperationalError(
                 f"adb {operation} failed: {error}"
             ) from error
@@ -608,7 +617,9 @@ class MaestroExecutor:
                         timeout=timeout,
                         env=run_env,
                     )
-                except (OSError, subprocess.SubprocessError) as error:
+                except (OSError, subprocess.SubprocessError, ValueError) as error:
+                    # ValueError covers UnicodeDecodeError from text=True
+                    # decoding of non-UTF-8 output, matching environment.py.
                     raise AndroidOperationalError(
                         f"Maestro action execution failed: {error}"
                     ) from error
