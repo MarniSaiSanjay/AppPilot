@@ -34,6 +34,11 @@ of here — that belongs with the use case.
 
 ## Current shared nodes
 
+### `credentials.py` — credential profile resolution
+A generic resolver converts a non-secret runtime label to a stable environment
+suffix and builds a secret-safe `RuntimeContext`. It validates missing values
+and ambiguous normalized labels without rendering usernames or passwords.
+
 ### `model_client.py` — `ChatModelClient`
 The single OpenAI-compatible chat client. It owns endpoint configuration
 (environment resolution via `config_from_env`) and the HTTP transport
@@ -63,6 +68,8 @@ state the policy declares, before offering any action.
   point.
 - `flow.py` — `SharedLoginFlow` / `LoginCapability`: a small adapter the caller
   invokes to prepare login, plus the `[LOGIN]` execution-trace observability.
+- `profiled.py` — `ProfiledLoginFlowFactory`: binds resolved credential profiles
+  to login agents and caches one reusable `SharedLoginFlow` per normalized key.
 
 Customization at a glance:
 

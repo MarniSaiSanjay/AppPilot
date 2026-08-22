@@ -12,8 +12,10 @@ from typing import Sequence, TYPE_CHECKING
 
 try:  # package-relative (python -m src.usecases.deeplink.orchestrator) vs top-level
     from ...apppilot import logtags
+    from ...shared.credentials import normalize_profile_key
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot import logtags
+    from shared.credentials import normalize_profile_key
 
 from .deeplink_testcase_loader import DeeplinkTestCase
 from .results import (
@@ -101,7 +103,7 @@ class DeeplinkSuiteOrchestrator:
         logtags.trace("Completed", logtags.SUITE)
         return report
 
-    def prepare_installed_batch(self) -> bool:
+    def prepare_installed_batch(self, case: DeeplinkTestCase) -> bool:
         # Once per batch: install the local APK, launch it, log in, then warm up
         # (never per case / retry). Returns True iff login succeeded; on failure
         # skip warm-up and don't proceed to verification.
@@ -110,7 +112,7 @@ class DeeplinkSuiteOrchestrator:
         logtags.trace("Launching app before login", logtags.INSTALLED_BATCH)
         self._runner.open_installed_app()
         logtags.trace("Ensuring login", logtags.INSTALLED_BATCH)
-        if not self._runner.ensure_logged_in():
+        if not self._runner.ensure_logged_in(case):
             logtags.trace("login failed", logtags.INSTALLED_BATCH)
             return False
         self._runner.run_warm_up()
@@ -121,7 +123,20 @@ class DeeplinkSuiteOrchestrator:
     ) -> None:
         logtags.trace("Starting", logtags.INSTALLED_BATCH)
         try:
-            prepared = self.prepare_installed_batch()
+            profile_keys = {
+                normalize_profile_key(case.license)
+                for case in cases
+            }
+            if len(profile_keys) > 1:
+                reason = (
+                    "multiple License credential profiles are present in the "
+                    "installed batch; account grouping and switching are required"
+                )
+                logtags.trace(reason, logtags.INSTALLED_BATCH)
+                for case in cases:
+                    report.results.append(_batch_setup_failed_result(case, reason))
+                return
+            prepared = self.prepare_installed_batch(cases[0])
         except RuntimeError as exc:
             # Operational install/launch/setup failure (includes
             # AndroidOperationalError): record every case as a batch-setup failure

@@ -25,25 +25,30 @@ The workbook is the source of truth (`deeplink_testcase_loader.py`). The loader 
 layout: it recognises a header row by name (e.g. *Launch URL*, *Expected
 Screen*, *License*, *Installed*) and maps columns accordingly, falling back to a
 fixed positional layout when no header is present. Each data row must provide a
-Test ID, a Deep Link and an Expected Result.
+Test ID, a Deep Link, a License and an Expected Result. The License selects
+profile-specific credentials from local environment variables; credentials are
+never stored in the workbook.
 
 ## Installed vs uninstalled
 
 The `INSTALLED` column (or a deterministic signal derived from the deeplink)
 selects the scenario:
 
-- **INSTALLED=TRUE** — run as a batch: sign in once via shared login, run the
-  installed warm-up once, then each case. Per-case retry is *kill → wait → reopen*
-  the same deeplink.
+- **INSTALLED=TRUE** — a single-License batch signs in once via that License's
+  shared login flow, runs the installed warm-up once, then each case. Per-case
+  retry is *kill → wait → reopen* the same deeplink. A batch containing multiple
+  License profiles fails safely before install until account grouping/switching
+  is enabled; it is never run under the first account accidentally.
 - **INSTALLED=FALSE** — the genuine first-open-after-install: uninstall, fire the
   deeplink (routes to the store window), install the local APK via adb, then open
   via the store's Open button. No warm-up; every retry re-establishes fresh state.
 
 ## How it consumes shared nodes
 
-- **Login** — builds the shared login agent with the **default** `LoginPolicy`
-  and wraps it in `SharedLoginFlow`. Login stops at the normal sign-in boundary
-  and returns control; Deeplink then does its own verification. (A different use
+- **Login** — resolves every License profile before device work, builds the
+  shared login agent with the **default** `LoginPolicy`, and caches one
+  `SharedLoginFlow` per profile. Login stops at the normal sign-in boundary and
+  returns control; Deeplink then does its own verification. (A different use
   case could pass a custom `LoginPolicy` to the same shared login node.)
 - **Installer** — `shared.installer.LocalApkInstaller` installs the locally built
   APK and opens the app (adb launcher or store Open button).

@@ -13,6 +13,7 @@ import argparse
 import os
 import sys
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 
@@ -23,7 +24,16 @@ try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     from ...apppilot import telemetry
     from ...shared.warmup import MaestroWarmUp
     from ...shared.installer import LocalApkInstaller
-    from ...shared.login import LoginCapability, SharedLoginFlow, build_login_agent
+    from ...shared.credentials import (
+        CredentialConfigurationError,
+        CredentialProfile,
+        CredentialProfileResolver,
+    )
+    from ...shared.login import (
+        ProfiledLoginFlowFactory,
+        build_login_agent,
+        resolve_decision_provider,
+    )
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from apppilot.agent import _load_dotenv
@@ -31,9 +41,18 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot import telemetry
     from shared.warmup import MaestroWarmUp
     from shared.installer import LocalApkInstaller
-    from shared.login import LoginCapability, SharedLoginFlow, build_login_agent
+    from shared.credentials import (
+        CredentialConfigurationError,
+        CredentialProfile,
+        CredentialProfileResolver,
+    )
+    from shared.login import (
+        ProfiledLoginFlowFactory,
+        build_login_agent,
+        resolve_decision_provider,
+    )
 
-from .deeplink_testcase_loader import load_deeplink_cases
+from .deeplink_testcase_loader import DeeplinkTestCase, load_deeplink_cases
 from .verification import LLMExpectationJudge
 from .runner import (
     DEFAULT_MAX_ATTEMPTS,
@@ -121,6 +140,16 @@ def _select_workbook(
     return _prompt_for_workbook(workbooks, output=output, input_fn=input_fn)
 
 
+def _resolve_credential_profiles(
+    cases: Sequence[DeeplinkTestCase],
+    env: "Mapping[str, str] | None" = None,
+) -> dict[str, CredentialProfile]:
+    """Validate and resolve every workbook License before device operations."""
+    return CredentialProfileResolver(env).resolve_all(
+        case.license for case in cases
+    )
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the data-driven AppPilot deeplink test suite."
@@ -195,6 +224,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, zipfile.BadZipFile) as error:
         print(f"ERROR: could not load deeplink test cases: {error}", file=sys.stderr)
         return 2
+    try:
+        credential_profiles = _resolve_credential_profiles(cases)
+    except CredentialConfigurationError as error:
+        print(f"ERROR: invalid credential configuration: {error}", file=sys.stderr)
+        return 2
 
     # AppPilot installs ONLY a user-provided local APK (no build/acquisition).
     # Resolve it up front from --apk, a saved path, or an interactive prompt, and
@@ -227,16 +261,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     observer = MaestroHierarchyObserver(device_id)
     warm_up = None if args.no_warm_up else MaestroWarmUp(executor)
 
-    # Shared login capability: the same generic AppPilotAgent + Brain, reusing
-    # the device's executor/observer (DRY). The executor's foreground check is
-    # injected so login never completes while the app is not foreground.
-    login_agent = build_login_agent(
-        device_id,
-        executor=executor,
-        observer=observer,
-        foreground_check=executor.is_foreground,
+    # Build one cached shared-login flow per resolved License profile. All flows
+    # reuse the same device dependencies and decision provider; only their local,
+    # secret RuntimeContext differs.
+    login_provider = resolve_decision_provider()
+    login_flows = ProfiledLoginFlowFactory(
+        credential_profiles,
+        lambda runtime_context: build_login_agent(
+            device_id,
+            provider=login_provider,
+            executor=executor,
+            observer=observer,
+            foreground_check=executor.is_foreground,
+            runtime_context=runtime_context,
+        ),
     )
-    login_flow: LoginCapability = SharedLoginFlow(login_agent)
 
     logtags.trace(f"using APK: {apk_path}", logtags.INSTALL)
     installer = LocalApkInstaller(executor, str(apk_path))
@@ -247,7 +286,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         warm_up=warm_up,
         max_attempts=args.max_attempts,
         verify_timeout_seconds=args.verify_timeout,
-        login_flow=login_flow,
+        login_flow_for_license=login_flows.for_license,
         installer=installer,
     )
     # Ask UP FRONT whether to email the report and to whom, so the operator can

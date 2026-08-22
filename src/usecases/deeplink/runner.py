@@ -21,6 +21,7 @@ try:  # package-relative (python -m src.usecases.deeplink.runner) vs top-level
         MaestroHierarchyObserver,
     )
     from ...apppilot import logtags
+    from ...shared.credentials import CredentialConfigurationError
     from ...shared.installer import AppInstaller
     from ...shared.login import LoginCapability
     from ...shared.warmup import WarmUp
@@ -31,6 +32,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
         MaestroHierarchyObserver,
     )
     from apppilot import logtags
+    from shared.credentials import CredentialConfigurationError
     from shared.installer import AppInstaller
     from shared.login import LoginCapability
     from shared.warmup import WarmUp
@@ -74,6 +76,7 @@ class DeeplinkTestRunner:
         verify_poll_interval_seconds: float = DEFAULT_VERIFY_POLL_INTERVAL_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
         login_flow: LoginCapability | None = None,
+        login_flow_for_license: "Callable[[str], LoginCapability] | None" = None,
         installer: AppInstaller | None = None,
     ) -> None:
         self._observer = observer
@@ -88,6 +91,7 @@ class DeeplinkTestRunner:
         self._verify_poll_interval_seconds = max(0.0, verify_poll_interval_seconds)
         self._monotonic = monotonic
         self._login_flow = login_flow
+        self._login_flow_for_license = login_flow_for_license
         self._installer = installer
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
@@ -99,11 +103,26 @@ class DeeplinkTestRunner:
 
         return DeeplinkSuiteOrchestrator(self).run(cases)
 
-    def ensure_logged_in(self) -> bool:
+    def _login_flow_for_case(
+        self, case: DeeplinkTestCase
+    ) -> LoginCapability | None:
+        if self._login_flow_for_license is not None:
+            return self._login_flow_for_license(case.license)
+        return self._login_flow
+
+    def ensure_logged_in(self, case: DeeplinkTestCase | None = None) -> bool:
         # Login only if needed, via the shared login capability. Returns True iff
         # login succeeded (True when no login flow is configured).
-        if self._login_flow is not None:
-            return self._login_flow.ensure_ready()
+        if self._login_flow_for_license is not None:
+            if case is None:
+                raise RuntimeError(
+                    "A deeplink test case is required to select login credentials"
+                )
+            login_flow = self._login_flow_for_case(case)
+        else:
+            login_flow = self._login_flow
+        if login_flow is not None:
+            return login_flow.ensure_ready()
         return True
 
     def run_warm_up(self) -> None:
@@ -213,6 +232,15 @@ class DeeplinkTestRunner:
             )
             try:
                 prepare(attempt)
+            except CredentialConfigurationError as exc:
+                logtags.trace(
+                    f"{case.test_id} credential configuration failed: {exc}",
+                    label,
+                )
+                result.attempts.append(
+                    AttemptResult(attempt=attempt, matched=False, reason=str(exc))
+                )
+                break
             except RuntimeError as exc:
                 logtags.trace(f"{case.test_id} attempt setup failed: {exc}", label)
                 result.attempts.append(
@@ -322,7 +350,14 @@ class DeeplinkTestRunner:
         )
 
     def _uninstalled_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
+        login_flow: LoginCapability | None = None
+        login_flow_selected = False
+
         def prepare(attempt: int) -> None:
+            nonlocal login_flow, login_flow_selected
+            if not login_flow_selected:
+                login_flow = self._login_flow_for_case(case)
+                login_flow_selected = True
             if attempt > 1:  # every retry rebuilds genuine fresh state
                 logtags.trace(
                     f"{case.test_id} retry: recreating fresh-install state",
@@ -354,12 +389,12 @@ class DeeplinkTestRunner:
                 )
                 self._installer.install_and_open(via_store_button=True)
                 logtags.trace(f"{case.test_id} app opened", logtags.INSTALL)
-            if self._login_flow is not None:  # SAME shared login as the installed path
+            if login_flow is not None:  # SAME shared login as the installed path
                 logtags.trace(f"{case.test_id} ensuring login", logtags.UNINSTALLED)
                 # On login failure, raise into the per-attempt setup-failure path
                 # (failed attempt -> skip _verify() -> retry fresh / else FAIL)
                 # instead of reporting ready.
-                if not self._login_flow.ensure_ready():
+                if not login_flow.ensure_ready():
                     logtags.trace(f"{case.test_id} login failed", logtags.UNINSTALLED)
                     logtags.trace(
                         f"{case.test_id} skipping deeplink verification",

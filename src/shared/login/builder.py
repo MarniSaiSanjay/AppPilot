@@ -92,6 +92,7 @@ def build_login_agent(
     max_stuck_actions: int | None = None,
     foreground_check: "Callable[[], bool] | None" = None,
     policy: "LoginPolicy | None" = None,
+    runtime_context: "RuntimeContext | None" = None,
 ) -> AppPilotAgent:
     """Build the single, shared login/onboarding agent (AppPilotAgent + Brain).
 
@@ -146,7 +147,11 @@ def build_login_agent(
         safety_validator=SafetyValidator(),
         executor=executor or MaestroExecutor(APP_ID, device),
         max_actions=max_actions if max_actions is not None else _default_max_actions(),
-        runtime_context=RuntimeContext.from_env(),
+        runtime_context=(
+            runtime_context
+            if runtime_context is not None
+            else RuntimeContext.from_env()
+        ),
         max_stuck_actions=(
             max_stuck_actions
             if max_stuck_actions is not None

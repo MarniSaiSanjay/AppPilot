@@ -13,6 +13,7 @@ Public surface (import from here or via the ``flows.login`` compatibility shim):
     CompositeTerminalEvaluator
   * Builder/CLI: resolve_decision_provider, build_login_agent, _parse_args, main
   * Flow adapter: SharedLoginFlow, LoginCapability
+  * Profile adapter: ProfiledLoginFlowFactory
   * Constants: PROTOTYPE_GOAL, DEFAULT_GUIDANCE
 """
 
@@ -39,6 +40,7 @@ from .builder import (
     _parse_args,
 )
 from .flow import LoginCapability, SharedLoginFlow, _SignInTracer
+from .profiled import ProfiledLoginFlowFactory
 
 __all__ = [
     "AuthoritativeLoginGoalEvaluator",
@@ -49,6 +51,7 @@ __all__ = [
     "LoginCapability",
     "LoginPolicy",
     "PROTOTYPE_GOAL",
+    "ProfiledLoginFlowFactory",
     "SemanticStateEvaluator",
     "SemanticTerminalState",
     "SharedLoginFlow",

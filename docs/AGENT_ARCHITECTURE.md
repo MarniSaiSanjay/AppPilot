@@ -155,6 +155,12 @@ classified by the login judge. Once login completion is true, the agent stops
 before asking the Brain and hands the current UI to deeplink verification. Login
 PASS never implies deeplink PASS.
 
+Credentials remain in `RuntimeContext`, outside observations and model requests.
+The standalone login builder retains the default global environment context,
+while use cases may inject a resolved context. Deeplink normalizes each Excel
+License to profile-specific environment-variable names, validates all profiles
+before APK/device work, and caches one shared login flow per profile.
+
 ## Code layering (shared nodes and use cases)
 
 The code is organized in three one-way layers:
@@ -215,10 +221,11 @@ Boundaries:
   Installed retries stop, wait 2 seconds, and reopen the same deeplink;
   uninstalled retries recreate the complete fresh-install sequence. Any
   matching attempt is a PASS; exhausted attempts are a FAIL.
-- **Warm-up runs once for the installed batch** (skippable), never for
-  uninstalled cases and never on retries.
+- **Warm-up runs once for a single-License installed batch** (skippable), never
+  for uninstalled cases and never on retries. A multi-License installed batch
+  is rejected before installation until account grouping/switching is enabled.
 
-The Excel has four required fields (Test ID, Deep Link, User Type, Expected
+The Excel has four required fields (Test ID, Deep Link, License, Expected
 Result) and an optional Installed field. Recognized headers may be reordered;
 otherwise columns A-D are used.
 

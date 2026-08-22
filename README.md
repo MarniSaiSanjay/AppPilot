@@ -116,8 +116,10 @@ environment variables always take precedence).
 | `APPPILOT_MODEL` | yes* | Decision-model deployment/name (e.g. `gpt-4.1-mini`). |
 | `APPPILOT_MODEL_API_KEY` | yes* | API key for the model endpoint. |
 | `APPPILOT_MODEL_BASE_URL` | no | OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint). |
-| `APPPILOT_USERNAME` | for login goals | Sign-in username/email for the **app under test** — resolved locally and injected into Maestro, never sent to the model. |
-| `APPPILOT_PASSWORD` | for login goals | Sign-in password for the app under test, handled the same secure way. |
+| `APPPILOT_USERNAME` | for standalone login | Default sign-in username/email for the standalone login prototype and legacy non-profile callers. |
+| `APPPILOT_PASSWORD` | for standalone login | Default sign-in password, handled with the same local credential isolation. |
+| `APPPILOT_USERNAME_<LICENSE>` | for Deeplink login | Username for an Excel License profile, where `<LICENSE>` is uppercase and separators become `_` (for example `Entra Premium` → `ENTRA_PREMIUM`). |
+| `APPPILOT_PASSWORD_<LICENSE>` | for Deeplink login | Password paired with the corresponding License profile. |
 | `APPPILOT_MAX_ACTIONS` | no | Absolute upper bound on actions per run (default `30`). |
 | `APPPILOT_MAX_STUCK_ACTIONS` | no | Consecutive actions with no meaningful UI change before an early controlled FAIL (default `5`). |
 | `APPPILOT_EMAIL_API_URL` | for email | HTTPS relay endpoint used to send the suite report. |
@@ -142,7 +144,17 @@ APPPILOT_MODEL_API_KEY=your-key-here
 APPPILOT_MODEL_BASE_URL=https://your-endpoint.openai.azure.com/openai/v1
 APPPILOT_USERNAME=you@example.com
 APPPILOT_PASSWORD=your-password
+APPPILOT_USERNAME_PREMIUM=premium-user@example.com
+APPPILOT_PASSWORD_PREMIUM=your-premium-password
+APPPILOT_USERNAME_ENTRA_STARTER=starter-user@example.com
+APPPILOT_PASSWORD_ENTRA_STARTER=your-starter-password
 ```
+
+Deeplink suites resolve every workbook `License` before touching the APK or
+device. License values are trimmed, compared case-insensitively, and converted
+to an environment suffix by replacing non-alphanumeric separators with `_`.
+Missing profile variables and ambiguous labels that map to the same suffix fail
+configuration explicitly; Deeplink never falls back to the global credentials.
 
 ## Running AppPilot
 
@@ -188,7 +200,7 @@ Options: `--device`, `--max-actions`, `--max-stuck-actions`, `--guidance`.
 
 The data-driven runner executes deeplink test cases from an Excel workbook,
 reusing the same Maestro executor, UI observer, and model configuration as the
-agent. The workbook requires **Test ID**, **Deep Link**, **User Type**, and
+agent. The workbook requires **Test ID**, **Deep Link**, **License**, and
 **Expected Result**, with optional **Installed**. Test suites live in
 `testcases/deeplinks/`; when `--excel` is omitted the runner auto-runs the only
 workbook there, prompts to choose when several exist, and exits cleanly (code

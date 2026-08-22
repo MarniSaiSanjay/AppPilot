@@ -18,12 +18,16 @@ from pathlib import Path
 
 
 # --------------------------------------------------------------------------- #
-# Test cases (Excel is the source of truth; keep it simple: 4 columns)
+# Test cases (Excel is the source of truth)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class DeeplinkTestCase:
-    """One row of the Excel: the four core columns plus the deterministic
-    INSTALLED scenario selector (optional, defaults to installed=True)."""
+    """One row of the Excel plus the deterministic INSTALLED selector.
+
+    ``user_type`` remains the stored field for compatibility with existing
+    callers and reports. The workbook's License value is exposed explicitly via
+    :attr:`license` for credential-profile selection.
+    """
 
     test_id: str
     deep_link: str
@@ -33,6 +37,11 @@ class DeeplinkTestCase:
     # blank preserves the legacy contract (installed=True). The model NEVER
     # decides this - it comes straight from the workbook.
     installed: bool = True
+
+    @property
+    def license(self) -> str:
+        """Return the workbook's License value without changing its spelling."""
+        return self.user_type
 
 
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
@@ -218,9 +227,9 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
     extra columns are all handled. When no header is present it falls back to the
     positional layout A=Test ID, B=Deep Link, C=User Type, D=Expected Result.
 
-    Every data row must provide a Test ID, a Deep Link and an Expected Result.
-    The INSTALLED scenario is taken from an explicit INSTALLED column when
-    present, otherwise derived deterministically from the deeplink.
+    Every data row must provide a Test ID, a Deep Link, a License and an Expected
+    Result. The INSTALLED scenario is taken from an explicit INSTALLED column
+    when present, otherwise derived deterministically from the deeplink.
     """
     path = Path(path)
     with zipfile.ZipFile(path) as archive:
@@ -269,12 +278,14 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
         }
         test_id = values.get("test_id", "")
         deep_link = values.get("deep_link", "")
+        license_name = values.get("user_type", "")
         expected = values.get("expected_result", "")
         missing = [
             name
             for name, present in (
                 ("Test ID", test_id),
                 ("Deep Link", deep_link),
+                ("License", license_name),
                 ("Expected Result", expected),
             )
             if not present
@@ -293,7 +304,7 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
             DeeplinkTestCase(
                 test_id=test_id,
                 deep_link=deep_link,
-                user_type=values.get("user_type", ""),
+                user_type=license_name,
                 expected_result=expected,
                 installed=installed,
             )
