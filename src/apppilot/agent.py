@@ -124,6 +124,10 @@ class AppPilotAgent:
             if reached:
                 self._log_pass()
                 return True
+            failure_reason = self._terminal_failure_reason(observation)
+            if failure_reason is not None:
+                self._log_fail(failure_reason)
+                return False
 
             # Loading/transition invariant: when the goal is not reached and no
             # actionable step exists, wait and re-observe (never invent an action
@@ -154,6 +158,10 @@ class AppPilotAgent:
                 if reached:
                     self._log_pass()
                     return True
+                failure_reason = self._terminal_failure_reason(observation)
+                if failure_reason is not None:
+                    self._log_fail(failure_reason)
+                    return False
                 available_actions, filled_fingerprint = self._offer_actions(
                     observation, filled_credential_keys, filled_fingerprint
                 )
@@ -306,6 +314,14 @@ class AppPilotAgent:
             return bool(self._actionable_step_check(observation))
         return True
 
+    def _terminal_failure_reason(self, observation: UIObservation) -> "str | None":
+        """Return a domain evaluator's explicit terminal failure, if any."""
+        failure_reason = getattr(self._goal_evaluator, "failure_reason", None)
+        if not callable(failure_reason):
+            return None
+        reason = failure_reason(observation)
+        return str(reason) if reason else None
+
     def _reobserve_before_action(self) -> UIObservation:
         reobserve = getattr(self._observer, "reobserve", None)
         if callable(reobserve):
@@ -450,20 +466,28 @@ class AppPilotAgent:
 
     def _offer_actions(self, observation, filled_keys, filled_fingerprint):
         """Safe actions for this screen, withholding already-entered credential
-        fields until the screen changes.
+        fields until that credential field leaves the UI.
 
         A credential input whose field was already filled on this same screen is
         removed, so the model advances to submit instead of re-typing a field
-        that still looks empty. The set is cleared whenever the MEANINGFUL UI
-        changes (decorative/animated churn is ignored, matching the rest of the
-        agent). Withholding is skipped if it would leave no actionable (non-Back)
-        step, so the agent is never stranded on a screen whose only action was
-        the already-entered field.
+        that still looks empty. Credential memory follows the stable field key
+        itself rather than the whole-screen fingerprint: transient Android
+        overlays such as Autofill can appear/disappear without making the
+        password field new. A key is forgotten only after its field is absent,
+        so returning to a later password screen can legitimately enter it again.
+        Withholding is skipped if it would leave no actionable (non-Back) step,
+        so the agent is never stranded on a screen whose only action was the
+        already-entered field.
         """
         current_fingerprint = self._meaningful_fingerprint(observation)
-        if current_fingerprint != filled_fingerprint:
-            filled_keys.clear()
         actions = self._safety_validator.available_actions(observation)
+        present_credential_keys = {
+            self._credential_field_key(action, observation)
+            for action in actions
+            if action.kind == ActionKind.INPUT_TEXT
+            and action.credential_kind is not None
+        }
+        filled_keys.intersection_update(present_credential_keys)
         if filled_keys:
             withheld = tuple(
                 action

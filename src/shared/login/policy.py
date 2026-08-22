@@ -121,6 +121,15 @@ class CompositeTerminalEvaluator:
                 return bool(verdict)
         return True
 
+    def failure_reason(self, observation: object) -> "str | None":
+        for terminal in self._terminals:
+            get_reason = getattr(terminal, "failure_reason", None)
+            if callable(get_reason):
+                reason = get_reason(observation)
+                if reason:
+                    return str(reason)
+        return None
+
 
 class LoginPolicy:
     """A use case's runtime intent for the shared login node.

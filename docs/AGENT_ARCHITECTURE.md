@@ -45,6 +45,8 @@ hardcoded Maestro scripts and **not** a fixed A→B→C test script.
 The loop ends when:
 
 - the goal is reached &rarr; **PASS**;
+- the goal evaluator recognizes a definitive terminal failure (for example,
+  rejected credentials) &rarr; **FAIL** immediately with the actionable reason;
 - the model cannot safely propose a next action &rarr; **FAIL** (controlled);
 - the meaningful UI state does not change for too many consecutive actions
   &rarr; **FAIL** (controlled, stuck detection — see below);
@@ -145,10 +147,13 @@ invalid environment values falling back safely to the default.
 Login is preparation, not deeplink verification. The authoritative evaluator
 first recognizes deterministic blockers and terminal states: authentication
 controls, loading/no-actionable states, Chat/composer, Search, restricted-access
-states, and the suggested-prompt interruption. Ambiguous actionable screens may
-be semantically classified by the login judge. Once login completion is true,
-the agent stops before asking the Brain and hands the current UI to deeplink
-verification. Login PASS never implies deeplink PASS.
+states, rejected credentials, and the suggested-prompt interruption. Rejected
+credentials are terminal failures: the agent reports the configuration problem
+immediately instead of retrying the same secret or asking the Brain to choose
+another sign-in route. Ambiguous actionable screens may be semantically
+classified by the login judge. Once login completion is true, the agent stops
+before asking the Brain and hands the current UI to deeplink verification. Login
+PASS never implies deeplink PASS.
 
 ## Code layering (shared nodes and use cases)
 
@@ -258,6 +263,10 @@ boundary from pretending to be intelligent.
   handler. Unexpected screens are handled by reasoning, not by pre-scripting
   every screen.
 - **Maestro is the execution layer only.**
+- **Credential fidelity.** Username/password values are resolved locally, placed
+  in Maestro's internal clipboard through an environment placeholder, and
+  pasted into the focused field. This avoids Android key-event corruption of
+  punctuation while keeping secrets out of generated flow files and logs.
 - **Deterministic PASS.** Goal evaluation is separate and never delegated to
   the model.
 - **Independent safety.** Validation is separate from decision-making and gates

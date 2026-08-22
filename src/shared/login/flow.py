@@ -110,3 +110,10 @@ class _SignInTracer:
             logtags.trace("Login goal reached: true", logtags.LOGIN)
             logtags.trace("Returning control to use case", logtags.LOGIN)
         return reached
+
+    def failure_reason(self, observation: UIObservation) -> "str | None":
+        get_reason = getattr(self._inner, "failure_reason", None)
+        if not callable(get_reason):
+            return None
+        reason = get_reason(observation)
+        return str(reason) if reason else None

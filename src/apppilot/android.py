@@ -713,22 +713,28 @@ class MaestroExecutor:
             self._run_flow(f"- inputText: {json.dumps(action.input_text)}\n")
             return
 
-        # Credential / replace entry: empty the field, then RE-FOCUS and type in
+        # Credential / replace entry: empty the field, then RE-FOCUS and paste in
         # a single Maestro flow. Each ``maestro test`` runs in its own subprocess
         # and tears down its driver on exit, which drops the soft keyboard and
-        # the field's focus - a standalone ``inputText`` then types into nothing,
+        # the field's focus - a standalone paste then targets nothing,
         # leaving the field empty (seen as an unfilled password entry and an
         # "enter your password" validation error). Re-focusing in the same flow
-        # as the type keeps the field focused so the secret always lands. The
-        # field is already cleared here, so the re-tap's caret position - the
-        # reason the earlier clear moves the caret to the end - no longer matters.
+        # as the paste keeps the field focused so the secret always lands.
+        #
+        # Use Maestro's internal clipboard rather than inputText: Android
+        # inputText synthesizes key events and can corrupt punctuation in
+        # passwords. setClipboard + pasteText inserts the exact value while the
+        # secret remains an environment placeholder in the generated YAML.
         self._clear_focused_field()
-        input_line = f"- inputText: ${{{MAESTRO_SECRET_ENV}}}\n"
+        input_commands = (
+            f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
+            "- pasteText\n"
+        )
         if kind == "point":
             self._tap_point(*payload)
-            self._run_flow(input_line, secret=secret)
+            self._run_flow(input_commands, secret=secret)
         else:
-            self._run_flow(payload + input_line, secret=secret)
+            self._run_flow(payload + input_commands, secret=secret)
 
     def _clear_focused_field(self) -> None:
         """Deterministically empty the currently focused text field.

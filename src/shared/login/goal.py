@@ -124,6 +124,12 @@ class SignedInCopilotGoalEvaluator:
         "couldn't sign you in",
         "authentication failed",
         "not authorized",
+        "password is incorrect",
+        "incorrect password",
+        "wrong password",
+        "invalid password",
+        "username or password is incorrect",
+        "account or password is incorrect",
     )
     _NEGATIVE_AUTH_RESOURCE = (
         "access_denied",
@@ -233,6 +239,15 @@ class SignedInCopilotGoalEvaluator:
         if self._foreground_check is not None and not self._foreground_check():
             return False
         return self._blocked(observation)
+
+    def failure_reason(self, observation: UIObservation) -> "str | None":
+        """Explain a definitive authentication rejection without retrying it."""
+        if not self._negative_auth_terminal(observation):
+            return None
+        return (
+            "authentication was rejected by the sign-in service; verify "
+            "APPPILOT_USERNAME and APPPILOT_PASSWORD"
+        )
 
     def _settled_inside(self, observation: UIObservation) -> bool:
         # Positive evidence we are in the authenticated app (not mid-transition).
@@ -547,6 +562,9 @@ class AuthoritativeLoginGoalEvaluator:
         if self._semantic is not None:
             return self._semantic.has_actionable_step(observation)
         return self._deterministic.has_actionable_step(observation)
+
+    def failure_reason(self, observation: UIObservation) -> "str | None":
+        return self._deterministic.failure_reason(observation)
 
 
 
