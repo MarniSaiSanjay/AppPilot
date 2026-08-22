@@ -155,6 +155,12 @@ device. License values are trimmed, compared case-insensitively, and converted
 to an environment suffix by replacing non-alphanumeric separators with `_`.
 Missing profile variables and ambiguous labels that map to the same suffix fail
 configuration explicitly; Deeplink never falls back to the global credentials.
+For installed cases, AppPilot installs the APK once and processes normalized
+License groups contiguously. It verifies the active account, switches to an
+existing account or uses **Add an account** with the cached profile login flow,
+then performs exactly two stabilization cycles before that group's cases.
+Account email matching stays local and is never sent to the decision model or
+written to reports.
 
 ## Running AppPilot
 

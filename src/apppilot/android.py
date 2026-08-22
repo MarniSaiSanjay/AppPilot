@@ -315,6 +315,7 @@ class MaestroHierarchyObserver:
                     is_input=is_input,
                     label=label,
                     bounds=self._parse_bounds(attributes.get("bounds")),
+                    checked=self._optional_bool(attributes.get("checked")),
                 )
             )
 
@@ -350,6 +351,14 @@ class MaestroHierarchyObserver:
         if isinstance(value, str):
             return value.lower() == "true"
         return default
+
+    @staticmethod
+    def _optional_bool(value: object) -> "bool | None":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.lower() in ("true", "false"):
+            return value.lower() == "true"
+        return None
 
     @staticmethod
     def _unique(values: Sequence[str]) -> list[str]:

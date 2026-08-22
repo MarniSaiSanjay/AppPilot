@@ -22,8 +22,8 @@ try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     from ...apppilot.agent import _load_dotenv
     from ...apppilot import apk_config, device_config, email_delivery, logtags
     from ...apppilot import telemetry
-    from ...shared.warmup import MaestroWarmUp
     from ...shared.installer import LocalApkInstaller
+    from ...shared.account.session import AndroidAccountSession
     from ...shared.credentials import (
         CredentialConfigurationError,
         CredentialProfile,
@@ -39,8 +39,8 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.agent import _load_dotenv
     from apppilot import apk_config, device_config, email_delivery, logtags
     from apppilot import telemetry
-    from shared.warmup import MaestroWarmUp
     from shared.installer import LocalApkInstaller
+    from shared.account.session import AndroidAccountSession
     from shared.credentials import (
         CredentialConfigurationError,
         CredentialProfile,
@@ -60,6 +60,7 @@ from .runner import (
     DeeplinkTestRunner,
 )
 from .orchestrator import DeeplinkSuiteOrchestrator
+from .stabilization import build_license_group_stabilizer
 
 
 # --------------------------------------------------------------------------- #
@@ -259,7 +260,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     executor = MaestroExecutor(APP_ID, device_id)
     observer = MaestroHierarchyObserver(device_id)
-    warm_up = None if args.no_warm_up else MaestroWarmUp(executor)
+    warm_up = (
+        None
+        if args.no_warm_up
+        else build_license_group_stabilizer(executor)
+    )
 
     # Build one cached shared-login flow per resolved License profile. All flows
     # reuse the same device dependencies and decision provider; only their local,
@@ -276,6 +281,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_context=runtime_context,
         ),
     )
+    account_session = AndroidAccountSession(
+        observer,
+        executor,
+        lambda profile: login_flows.for_license(profile.license_name),
+    )
 
     logtags.trace(f"using APK: {apk_path}", logtags.INSTALL)
     installer = LocalApkInstaller(executor, str(apk_path))
@@ -287,6 +297,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_attempts=args.max_attempts,
         verify_timeout_seconds=args.verify_timeout,
         login_flow_for_license=login_flows.for_license,
+        account_session=account_session,
+        profile_for_license=login_flows.profile_for_license,
         installer=installer,
     )
     # Ask UP FRONT whether to email the report and to whom, so the operator can

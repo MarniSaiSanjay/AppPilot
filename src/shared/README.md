@@ -39,6 +39,16 @@ A generic resolver converts a non-secret runtime label to a stable environment
 suffix and builds a secret-safe `RuntimeContext`. It validates missing values
 and ambiguous normalized labels without rendering usernames or passwords.
 
+### `account/` — account sessions
+The account contract and Android implementation prepare one resolved credential
+profile as the active app account. Navigation and account matching are
+deterministic and local; raw names/emails never cross the model, logging,
+exception, or result boundaries. A dedicated narrow validator allows only Menu,
+account navigation, exact account selection, Add account, and the optional
+overlay-permission return path while continuing to prohibit Sign Out and account
+removal. `account/__init__.py` owns the contract, `account/session.py` the
+Android implementation, and `account/safety.py` the scoped action policy.
+
 ### `model_client.py` — `ChatModelClient`
 The single OpenAI-compatible chat client. It owns endpoint configuration
 (environment resolution via `config_from_env`) and the HTTP transport

@@ -35,6 +35,7 @@ class UIElement:
     is_input: bool
     label: str
     bounds: "tuple[int, int, int, int] | None" = None
+    checked: "bool | None" = None
 
     @property
     def selector_text(self) -> str:

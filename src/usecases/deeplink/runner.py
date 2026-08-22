@@ -21,7 +21,13 @@ try:  # package-relative (python -m src.usecases.deeplink.runner) vs top-level
         MaestroHierarchyObserver,
     )
     from ...apppilot import logtags
+    from ...shared.account import (
+        AccountPreparationKind,
+        AccountPreparationResult,
+        AccountSessionCapability,
+    )
     from ...shared.credentials import CredentialConfigurationError
+    from ...shared.credentials import CredentialProfile
     from ...shared.installer import AppInstaller
     from ...shared.login import LoginCapability
     from ...shared.warmup import WarmUp
@@ -32,7 +38,13 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
         MaestroHierarchyObserver,
     )
     from apppilot import logtags
+    from shared.account import (
+        AccountPreparationKind,
+        AccountPreparationResult,
+        AccountSessionCapability,
+    )
     from shared.credentials import CredentialConfigurationError
+    from shared.credentials import CredentialProfile
     from shared.installer import AppInstaller
     from shared.login import LoginCapability
     from shared.warmup import WarmUp
@@ -77,6 +89,8 @@ class DeeplinkTestRunner:
         monotonic: Callable[[], float] = time.monotonic,
         login_flow: LoginCapability | None = None,
         login_flow_for_license: "Callable[[str], LoginCapability] | None" = None,
+        account_session: AccountSessionCapability | None = None,
+        profile_for_license: "Callable[[str], CredentialProfile] | None" = None,
         installer: AppInstaller | None = None,
     ) -> None:
         self._observer = observer
@@ -92,6 +106,8 @@ class DeeplinkTestRunner:
         self._monotonic = monotonic
         self._login_flow = login_flow
         self._login_flow_for_license = login_flow_for_license
+        self._account_session = account_session
+        self._profile_for_license = profile_for_license
         self._installer = installer
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
@@ -126,10 +142,25 @@ class DeeplinkTestRunner:
         return True
 
     def run_warm_up(self) -> None:
-        # The installed warm-up (launch -> wait -> stop, x3). Invoked once per
-        # installed batch by the orchestrator - never per case, never on retry.
+        # Installed stabilization (launch -> wait -> stop). Invoked once per
+        # successfully prepared License group - never per case or retry.
         if self._warm_up is not None:
             self._warm_up()
+
+    def prepare_account(
+        self, case: DeeplinkTestCase
+    ) -> AccountPreparationResult:
+        """Ensure the resolved License profile is the active app account."""
+        if self._account_session is None:
+            return AccountPreparationResult.ready(
+                AccountPreparationKind.ALREADY_ACTIVE
+            )
+        if self._profile_for_license is None:
+            raise RuntimeError(
+                "Account preparation requires resolved credential profiles"
+            )
+        profile = self._profile_for_license(case.license)
+        return self._account_session.ensure_active(profile)
 
     def install_local_build(self) -> None:
         # Put the freshly built local APK on the device (adb install -r). Used by
@@ -157,11 +188,34 @@ class DeeplinkTestRunner:
 
     def run_installed_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         """Run a single INSTALLED case (kill -> wait 2s -> reopen retry)."""
-        return self._run_case(case)
+        try:
+            return self._run_attempts(
+                case, logtags.INSTALLED, self._installed_prepare(case)
+            )
+        finally:
+            logtags.trace(
+                f"{case.test_id} stopping app (case cleanup)", logtags.INSTALLED
+            )
+            # Cleanup must never abort the suite nor mask the case result.
+            try:
+                self._executor.stop_app()
+            except AndroidOperationalError as exc:
+                logtags.trace(
+                    f"{case.test_id} cleanup stop_app failed (ignored): {exc}",
+                    logtags.INSTALLED,
+                )
 
     def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         """Run a single UNINSTALLED first-open case (fresh state every attempt)."""
-        return self._run_uninstalled_case(case)
+        return self._run_attempts(
+            case,
+            logtags.UNINSTALLED,
+            self._uninstalled_prepare(case),
+            on_start=lambda: logtags.trace(
+                f"{case.test_id} first-open flow - warm-up not applicable",
+                logtags.UNINSTALLED,
+            ),
+        )
 
     def _verify(self, case: DeeplinkTestCase, attempt: int):
         """Shared, bounded verification polling for a single attempt.
@@ -176,7 +230,6 @@ class DeeplinkTestRunner:
         at least one observe/judge call.
         """
         deadline = self._monotonic() + self._verify_timeout_seconds
-        verdict = None
         while True:
             logtags.trace(
                 f"{case.test_id} attempt "
@@ -289,31 +342,6 @@ class DeeplinkTestRunner:
         )
         return result
 
-    def _run_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        """INSTALLED scenario: retry recipe is kill -> wait -> reopen same deeplink.
-
-        Process-isolated: the app is always stopped when the case finishes (PASS,
-        FAIL, or error) via one finally boundary, so the next case's deeplink
-        launches a fresh process. Installed-only; uninstalled is untouched.
-        """
-        try:
-            return self._run_attempts(
-                case, logtags.INSTALLED, self._installed_prepare(case)
-            )
-        finally:
-            logtags.trace(
-                f"{case.test_id} stopping app (case cleanup)", logtags.INSTALLED
-            )
-            # Cleanup must never abort the suite nor mask the case result: an
-            # operational stop_app failure is logged and swallowed.
-            try:
-                self._executor.stop_app()
-            except AndroidOperationalError as exc:
-                logtags.trace(
-                    f"{case.test_id} cleanup stop_app failed (ignored): {exc}",
-                    logtags.INSTALLED,
-                )
-
     def _installed_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
         def prepare(attempt: int) -> None:
             if attempt > 1:  # retry recipe: kill -> wait -> reopen the same deeplink
@@ -334,20 +362,6 @@ class DeeplinkTestRunner:
             self._executor.open_link(case.deep_link)
 
         return prepare
-
-    def _run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        """UNINSTALLED first-open scenario: NO warm-up. Every attempt re-establishes
-        genuine fresh state (uninstall -> deeplink -> install/open -> shared login),
-        so a retry can never silently degrade into an installed run."""
-        return self._run_attempts(
-            case,
-            logtags.UNINSTALLED,
-            self._uninstalled_prepare(case),
-            on_start=lambda: logtags.trace(
-                f"{case.test_id} first-open flow - warm-up not applicable",
-                logtags.UNINSTALLED,
-            ),
-        )
 
     def _uninstalled_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
         login_flow: LoginCapability | None = None

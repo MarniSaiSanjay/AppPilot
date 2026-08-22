@@ -159,7 +159,10 @@ Credentials remain in `RuntimeContext`, outside observations and model requests.
 The standalone login builder retains the default global environment context,
 while use cases may inject a resolved context. Deeplink normalizes each Excel
 License to profile-specific environment-variable names, validates all profiles
-before APK/device work, and caches one shared login flow per profile.
+before APK/device work, and caches one shared login flow per profile. Installed
+multi-License execution uses a deterministic account-session capability:
+account names/emails are inspected only in local observations for exact matching
+and are never rendered into model prompts, traces, exceptions, or reports.
 
 ## Code layering (shared nodes and use cases)
 
@@ -221,9 +224,15 @@ Boundaries:
   Installed retries stop, wait 2 seconds, and reopen the same deeplink;
   uninstalled retries recreate the complete fresh-install sequence. Any
   matching attempt is a PASS; exhausted attempts are a FAIL.
-- **Warm-up runs once for a single-License installed batch** (skippable), never
-  for uninstalled cases and never on retries. A multi-License installed batch
-  is rejected before installation until account grouping/switching is enabled.
+- **Installed cases are grouped by normalized License** in first-seen order.
+  The APK is installed once; each group re-foregrounds the app, ensures login,
+  verifies/adds/switches the exact local account, runs two stabilization cycles,
+  and executes its cases contiguously. Group setup failures do not block later
+  groups. Report results are restored to workbook order.
+- **Stabilization runs exactly twice per successfully prepared License group**
+  (skippable), never for failed groups, uninstalled cases, or per-case retries.
+- **Uninstalled cases remain independent fresh-install flows** and are never
+  grouped or account-switched.
 
 The Excel has four required fields (Test ID, Deep Link, License, Expected
 Result) and an optional Installed field. Recognized headers may be reordered;

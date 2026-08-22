@@ -38,6 +38,17 @@ class ProfiledLoginFlowFactory:
         self._flows: dict[str, LoginCapability] = {}
 
     def for_license(self, license_name: str) -> LoginCapability:
+        profile = self.profile_for_license(license_name)
+        key = profile.key
+        flow = self._flows.get(key)
+        if flow is None:
+            agent = self._agent_builder(profile.runtime_context)
+            flow = self._flow_builder(agent)
+            self._flows[key] = flow
+        return flow
+
+    def profile_for_license(self, license_name: str) -> CredentialProfile:
+        """Return the resolved profile without exposing its credentials."""
         key = normalize_profile_key(license_name)
         profile = self._profiles.get(key)
         if profile is None:
@@ -45,9 +56,4 @@ class ProfiledLoginFlowFactory:
                 f"No resolved credential profile is available for License "
                 f"{license_name!r} (profile key {key!r})"
             )
-        flow = self._flows.get(key)
-        if flow is None:
-            agent = self._agent_builder(profile.runtime_context)
-            flow = self._flow_builder(agent)
-            self._flows[key] = flow
-        return flow
+        return profile

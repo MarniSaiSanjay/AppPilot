@@ -8,16 +8,16 @@ individual case execution, semantic judging, retry and reporting.
 
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from typing import Sequence, TYPE_CHECKING
 
 try:  # package-relative (python -m src.usecases.deeplink.orchestrator) vs top-level
     from ...apppilot import logtags
-    from ...shared.credentials import normalize_profile_key
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot import logtags
-    from shared.credentials import normalize_profile_key
 
 from .deeplink_testcase_loader import DeeplinkTestCase
+from .grouping import LicenseCaseGroup, group_cases_by_license
 from .results import (
     SuiteReport,
     TestCaseResult,
@@ -97,46 +97,21 @@ class DeeplinkSuiteOrchestrator:
             self.run_installed_batch(installed, report)
         for case in uninstalled:
             report.results.append(self.run_uninstalled_case(case))
+        self._restore_workbook_order(report, cases)
         # Only reached when the startup precondition held and cases executed; a
         # setup failure is recorded above and returns early, so "Completed" is
         # never misleading.
         logtags.trace("Completed", logtags.SUITE)
         return report
 
-    def prepare_installed_batch(self, case: DeeplinkTestCase) -> bool:
-        # Once per batch: install the local APK, launch it, log in, then warm up
-        # (never per case / retry). Returns True iff login succeeded; on failure
-        # skip warm-up and don't proceed to verification.
-        logtags.trace("Installing local build", logtags.INSTALLED_BATCH)
-        self._runner.install_local_build()
-        logtags.trace("Launching app before login", logtags.INSTALLED_BATCH)
-        self._runner.open_installed_app()
-        logtags.trace("Ensuring login", logtags.INSTALLED_BATCH)
-        if not self._runner.ensure_logged_in(case):
-            logtags.trace("login failed", logtags.INSTALLED_BATCH)
-            return False
-        self._runner.run_warm_up()
-        return True
-
     def run_installed_batch(
         self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
     ) -> None:
         logtags.trace("Starting", logtags.INSTALLED_BATCH)
         try:
-            profile_keys = {
-                normalize_profile_key(case.license)
-                for case in cases
-            }
-            if len(profile_keys) > 1:
-                reason = (
-                    "multiple License credential profiles are present in the "
-                    "installed batch; account grouping and switching are required"
-                )
-                logtags.trace(reason, logtags.INSTALLED_BATCH)
-                for case in cases:
-                    report.results.append(_batch_setup_failed_result(case, reason))
-                return
-            prepared = self.prepare_installed_batch(cases[0])
+            groups = group_cases_by_license(cases)
+            logtags.trace("Installing local build", logtags.INSTALLED_BATCH)
+            self._runner.install_local_build()
         except RuntimeError as exc:
             # Operational install/launch/setup failure (includes
             # AndroidOperationalError): record every case as a batch-setup failure
@@ -150,19 +125,64 @@ class DeeplinkSuiteOrchestrator:
                 )
                 report.results.append(_batch_setup_failed_result(case, str(exc)))
             return
-        if not prepared:
-            # Batch login failed: record every case as a login-prep failure
-            # (no _verify()), so each is FAIL like the uninstalled flow.
-            for case in cases:
-                logtags.trace(f"{case.test_id} login failed", logtags.INSTALLED)
-                logtags.trace(
-                    f"{case.test_id} skipping deeplink verification",
-                    logtags.INSTALLED,
-                )
-                report.results.append(_login_failed_result(case))
+        for group in groups:
+            self._run_installed_group(group, report)
+
+    def _run_installed_group(
+        self, group: LicenseCaseGroup, report: SuiteReport
+    ) -> None:
+        representative = group.cases[0]
+        try:
+            logtags.trace(
+                "Launching app before account preparation",
+                logtags.INSTALLED_BATCH,
+            )
+            self._runner.open_installed_app()
+            logtags.trace("Ensuring login", logtags.INSTALLED_BATCH)
+            if not self._runner.ensure_logged_in(representative):
+                for case in group.cases:
+                    report.results.append(_login_failed_result(case))
+                return
+            preparation = self._runner.prepare_account(representative)
+            if not preparation.succeeded:
+                for case in group.cases:
+                    report.results.append(
+                        _batch_setup_failed_result(case, preparation.reason)
+                    )
+                return
+            self._runner.run_warm_up()
+        except RuntimeError as exc:
+            logtags.trace(
+                f"License group setup failed: {exc}",
+                logtags.INSTALLED_BATCH,
+            )
+            for case in group.cases:
+                report.results.append(_batch_setup_failed_result(case, str(exc)))
             return
-        for case in cases:
+        for case in group.cases:
             report.results.append(self._runner.run_installed_case(case))
+
+    @staticmethod
+    def _restore_workbook_order(
+        report: SuiteReport,
+        cases: Sequence[DeeplinkTestCase],
+    ) -> None:
+        results_by_case = defaultdict(deque)
+        for result in report.results:
+            results_by_case[id(result.case)].append(result)
+        ordered = []
+        for case in cases:
+            case_results = results_by_case[id(case)]
+            if not case_results:
+                raise RuntimeError(
+                    "suite execution did not produce exactly one result per case"
+                )
+            ordered.append(case_results.popleft())
+        if any(results_by_case.values()):
+            raise RuntimeError(
+                "suite execution did not produce exactly one result per case"
+            )
+        report.results = ordered
 
     def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         # First-open-after-install: NO warm-up. The runner re-establishes the
