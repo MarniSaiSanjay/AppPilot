@@ -226,10 +226,12 @@ Boundaries:
   uninstalled retries recreate the complete fresh-install sequence. Any
   matching attempt is a PASS; exhausted attempts are a FAIL.
 - **Installed cases are grouped by normalized License** in first-seen order.
-  The APK is installed once; each group re-foregrounds the app, ensures login,
-  verifies/adds/switches the exact local account, runs two stabilization cycles,
-  and executes its cases contiguously. Group setup failures do not block later
-  groups. Report results are restored to workbook order.
+  The APK is installed once. After the first successful login, Android
+  supported-link routing is configured once for the installed package. Each
+  group then verifies/adds/switches the exact local account, runs two
+  stabilization cycles, and executes its cases contiguously. Account switches
+  do not repeat package link preparation. Group setup failures do not block
+  later groups. Report results are restored to workbook order.
 - **Stabilization runs exactly twice per successfully prepared License group**
   (skippable), never for failed groups, uninstalled cases, or per-case retries.
 - **Uninstalled cases remain independent fresh-install flows** and are never

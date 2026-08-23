@@ -1,9 +1,10 @@
 """Deeplink suite orchestrator (use-case-specific top-level lifecycle).
 
 Makes the deeplink suite lifecycle explicit: split cases by the deterministic
-INSTALLED value, prepare the installed batch (login-if-needed + one-time
-warm-up), and drive each case - while COMPOSING the DeeplinkTestRunner for
-individual case execution, semantic judging, retry and reporting.
+INSTALLED value, prepare the installed batch (login, one-time supported links,
+and per-License warm-up), and drive each case while COMPOSING the
+DeeplinkTestRunner for individual case execution, semantic judging, retry and
+reporting.
 """
 
 from __future__ import annotations
@@ -30,6 +31,10 @@ if TYPE_CHECKING:  # avoid an import cycle (runner.run imports the orchestrator)
     from .runner import DeeplinkTestRunner
 
 
+class _SupportedLinkPreparationError(Exception):
+    """Installed-batch supported-link configuration failed."""
+
+
 # --------------------------------------------------------------------------- #
 # Suite orchestrator (explicit top-level lifecycle; composes the runner)
 # --------------------------------------------------------------------------- #
@@ -37,12 +42,12 @@ class DeeplinkSuiteOrchestrator:
     """Makes the deeplink suite lifecycle explicit and readable.
 
     It owns only the top-level flow - splitting cases by the deterministic
-    INSTALLED value, preparing the installed batch (login-if-needed + one-time
-    warm-up), and driving each case - while COMPOSING the existing
-    DeeplinkTestRunner for individual case execution, semantic judging, retry
-    behavior, and reporting. Nothing here duplicates the runner, the shared
-    login capability, the judge, the app installer, or Maestro/Android
-    behavior.
+    INSTALLED value, preparing the installed batch (login, one-time supported
+    links, and per-License warm-up), and driving each case while COMPOSING the
+    existing DeeplinkTestRunner for individual case execution, semantic
+    judging, retry behavior, and reporting. Nothing here duplicates the runner,
+    the shared login capability, the judge, the app installer, or
+    Maestro/Android behavior.
 
         run()
             -> INSTALLED batch: prepare_installed_batch() then run each case
@@ -125,13 +130,36 @@ class DeeplinkSuiteOrchestrator:
                 )
                 report.results.append(_batch_setup_failed_result(case, str(exc)))
             return
-        for group in groups:
-            self._run_installed_group(group, report)
+        supported_links_prepared = False
+        for index, group in enumerate(groups):
+            try:
+                if self._run_installed_group(
+                    group,
+                    report,
+                    prepare_supported_links=not supported_links_prepared,
+                ):
+                    supported_links_prepared = True
+            except _SupportedLinkPreparationError as exc:
+                logtags.trace(
+                    f"supported-link preparation failed: {exc}",
+                    logtags.INSTALLED_BATCH,
+                )
+                for remaining_group in groups[index:]:
+                    for case in remaining_group.cases:
+                        report.results.append(
+                            _batch_setup_failed_result(case, str(exc))
+                        )
+                return
 
     def _run_installed_group(
-        self, group: LicenseCaseGroup, report: SuiteReport
-    ) -> None:
+        self,
+        group: LicenseCaseGroup,
+        report: SuiteReport,
+        *,
+        prepare_supported_links: bool,
+    ) -> bool:
         representative = group.cases[0]
+        prepared_supported_links = False
         try:
             logtags.trace(
                 "Launching app before account preparation",
@@ -142,14 +170,20 @@ class DeeplinkSuiteOrchestrator:
             if not self._runner.ensure_logged_in(representative):
                 for case in group.cases:
                     report.results.append(_login_failed_result(case))
-                return
+                return False
+            if prepare_supported_links:
+                try:
+                    self._runner.prepare_supported_links()
+                except (RuntimeError, ValueError) as exc:
+                    raise _SupportedLinkPreparationError(str(exc)) from exc
+                prepared_supported_links = True
             preparation = self._runner.prepare_account(representative)
             if not preparation.succeeded:
                 for case in group.cases:
                     report.results.append(
                         _batch_setup_failed_result(case, preparation.reason)
                     )
-                return
+                return prepared_supported_links
             self._runner.run_warm_up()
         except RuntimeError as exc:
             logtags.trace(
@@ -158,9 +192,10 @@ class DeeplinkSuiteOrchestrator:
             )
             for case in group.cases:
                 report.results.append(_batch_setup_failed_result(case, str(exc)))
-            return
+            return prepared_supported_links
         for case in group.cases:
             report.results.append(self._runner.run_installed_case(case))
+        return prepared_supported_links
 
     @staticmethod
     def _restore_workbook_order(

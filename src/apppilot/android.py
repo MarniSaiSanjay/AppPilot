@@ -41,6 +41,24 @@ _DRIVER_STARTUP_TIMEOUT_ENV = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
 _DRIVER_STARTUP_TIMEOUT_MS = "120000"
 _ADB_SAFE_USERNAME = re.compile(r"[A-Za-z0-9._+@-]+\Z")
 _ADB_USERNAME_CHARACTER_DELAY_SECONDS = 0.10
+_APP_LINK_DOMAIN = re.compile(
+    r"(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
+_APP_LINK_APPROVED_STATES = {
+    "approved",
+    "migrated",
+    "pre_verified",
+    "restored",
+    "system_configured",
+    "verified",
+    "1",
+    "2",
+    "4",
+    "5",
+    "7",
+    "8",
+}
 
 
 class AndroidOperationalError(RuntimeError):
@@ -674,6 +692,117 @@ class MaestroExecutor:
             raise AndroidOperationalError(
                 f"adb install failed for {apk_path}: {combined.strip()}"
             )
+
+    def enable_supported_links(self, domains: Sequence[str]) -> None:
+        """Approve declared App Link domains for the current Android user."""
+        normalized = tuple(
+            dict.fromkeys(domain.strip().casefold() for domain in domains)
+        )
+        if not normalized:
+            raise ValueError("At least one supported-link domain is required")
+        if invalid := tuple(
+            domain
+            for domain in normalized
+            if not _APP_LINK_DOMAIN.fullmatch(domain)
+        ):
+            raise ValueError(
+                "Invalid supported-link domain(s): " + ", ".join(invalid)
+            )
+
+        user_result = self._run_adb_checked(
+            ["shell", "am", "get-current-user"],
+            operation="query current Android user",
+        )
+        user_id = (user_result.stdout or "").strip()
+        if not user_id.isdigit():
+            raise AndroidOperationalError(
+                "adb query current Android user returned an invalid user id"
+            )
+
+        def run_pm(operation: str, *args: str) -> subprocess.CompletedProcess:
+            return self._run_adb_checked(
+                ["shell", "pm", *args], operation=operation
+            )
+
+        run_pm(
+            "enable supported-link handling",
+            "set-app-links-allowed",
+            "--user",
+            user_id,
+            "--package",
+            self._app_id,
+            "true",
+        )
+        run_pm(
+            "approve supported-link domains",
+            "set-app-links",
+            "--package",
+            self._app_id,
+            "2",
+            *normalized,
+        )
+        run_pm(
+            "select supported-link domains",
+            "set-app-links-user-selection",
+            "--user",
+            user_id,
+            "--package",
+            self._app_id,
+            "true",
+            *normalized,
+        )
+        status = run_pm(
+            "verify supported-link configuration",
+            "get-app-links",
+            "--user",
+            user_id,
+            self._app_id,
+        )
+        self._verify_supported_links(status.stdout or "", normalized)
+
+    @staticmethod
+    def _verify_supported_links(status: str, domains: Sequence[str]) -> None:
+        approved: set[str] = set()
+        enabled: set[str] = set()
+        section = ""
+        handling_allowed = False
+        for raw_line in status.splitlines():
+            line = raw_line.strip().casefold()
+            if line == "domain verification state:":
+                section = "verification"
+            elif line == "selection state:":
+                section = "selection"
+            elif line == "enabled:" and section == "selection":
+                section = "enabled"
+            elif line == "disabled:":
+                section = "disabled"
+            elif line == "verification link handling allowed: true":
+                handling_allowed = True
+            elif section == "verification" and ":" in line:
+                domain, state = (part.strip() for part in line.rsplit(":", 1))
+                if state in _APP_LINK_APPROVED_STATES:
+                    approved.add(domain)
+            elif section == "enabled" and line:
+                enabled.add(line)
+
+        missing_approval = set(domains) - approved
+        missing_selection = set(domains) - enabled
+        if handling_allowed and not missing_approval and not missing_selection:
+            return
+        problems = []
+        if not handling_allowed:
+            problems.append("link handling is not allowed")
+        if missing_approval:
+            problems.append(
+                "not approved: " + ", ".join(sorted(missing_approval))
+            )
+        if missing_selection:
+            problems.append(
+                "not enabled: " + ", ".join(sorted(missing_selection))
+            )
+        raise AndroidOperationalError(
+            "supported-link verification failed (" + "; ".join(problems) + ")"
+        )
 
     def _run_adb(
         self, args: Sequence[str], timeout: float = 180

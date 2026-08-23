@@ -52,6 +52,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
 from .deeplink_testcase_loader import DeeplinkTestCase
 from .verification import ExpectationJudge, ExpectationJudgeOperationalError
 from .results import AttemptResult, SuiteReport, TestCaseResult
+from .supported_links import SUPPORTED_LINK_DOMAINS
 
 # Deterministic bounds for the deeplink suite (separate from the agent's
 # action/stuck limits). A failed test is retried once (1 attempt + 1 retry).
@@ -146,6 +147,14 @@ class DeeplinkTestRunner:
         # successfully prepared License group - never per case or retry.
         if self._warm_up is not None:
             self._warm_up()
+
+    def prepare_supported_links(self) -> None:
+        """Prepare installed-app link routing after login."""
+        logtags.trace(
+            f"Enabling {len(SUPPORTED_LINK_DOMAINS)} supported-link domain(s)",
+            logtags.INSTALLED_BATCH,
+        )
+        self._executor.enable_supported_links(SUPPORTED_LINK_DOMAINS)
 
     def prepare_account(
         self, case: DeeplinkTestCase

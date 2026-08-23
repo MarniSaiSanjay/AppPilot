@@ -36,10 +36,13 @@ selects the scenario:
 
 - **INSTALLED=TRUE** — the APK is installed once, then cases are grouped by
   normalized License in first-seen order. Each group brings the app foreground,
-  adds or switches to the required account when necessary, verifies the active
-  account, runs exactly two launch/settle/stop stabilization cycles, then runs
-  that group's cases contiguously. Per-case retry is *kill → wait → reopen* the
-  same deeplink. Final report order is restored to workbook order.
+  and ensures login. After the first successful login, supported-link routing is
+  configured once for the installed app. Each group then adds or switches to the
+  required account when necessary, verifies the active account, runs exactly two
+  launch/settle/stop stabilization cycles, and runs that group's cases
+  contiguously. Account switches and retries do not repeat supported-link
+  preparation. Per-case retry is *kill → wait → reopen* the same deeplink. Final
+  report order is restored to workbook order.
 - **INSTALLED=FALSE** — the genuine first-open-after-install: uninstall, fire the
   deeplink (routes to the store window), install the local APK via adb, then open
   via the store's Open button. No warm-up; every retry re-establishes fresh state.
@@ -64,6 +67,9 @@ selects the scenario:
 - **Model client** — the expectation judge (`verification.py`) delegates HTTP
   transport to `shared.model_client.ChatModelClient`; only the prompt and
   match/verdict semantics are Deeplink's own.
+- **Supported links** — `supported_links.py` owns the extensible domain list.
+  Android approval and user selection run once after the first successful
+  installed-batch login; uninstalled cases never run this preparation.
 
 ## Verification
 
