@@ -1,9 +1,9 @@
 """Shared login agent builder and CLI entry point.
 
-Assembles the generic AppPilotAgent for login/onboarding from a LoginPolicy. No
-UI steps are hardcoded: the model decides each action. The policy supplies the
-goal/guidance and the ordered terminal states; this builder turns them into the
-agent's goal evaluator. By default it reproduces today's login behavior exactly.
+Assembles the generic AppPilotAgent for login/onboarding from a LoginPolicy.
+Recurring, unambiguous login controls use the adaptive fast path; every unknown
+or ambiguous screen remains model-driven. The policy supplies goal/guidance and
+ordered terminal states.
 """
 
 from __future__ import annotations
@@ -58,6 +58,7 @@ from .goal import (
     SemanticStateEvaluator,
     SignedInCopilotGoalEvaluator,
 )
+from .login_decision_cache import LoginDecisionCache
 from .policy import (
     CompositeTerminalEvaluator,
     LoginPolicy,
@@ -96,7 +97,8 @@ def build_login_agent(
 ) -> AppPilotAgent:
     """Build the single, shared login/onboarding agent (AppPilotAgent + Brain).
 
-    No UI steps are hardcoded: the model decides each action. The policy (default
+    The adaptive provider reuses only safe, uniquely matched login actions; the
+    model decides every cache miss and ambiguous screen. The policy (default
     ``LoginPolicy.default()``) supplies the ordered terminal states. The built-in
     login-completion terminal - deterministic terminal/blocker evidence first,
     semantic evaluator only for ambiguous screens - is the sensible default and,
@@ -143,7 +145,9 @@ def build_login_agent(
     return AppPilotAgent(
         observer=observer or MaestroHierarchyObserver(device),
         goal_evaluator=goal_evaluator,
-        decision_provider=resolve_decision_provider(provider),
+        decision_provider=LoginDecisionCache(
+            resolve_decision_provider(provider)
+        ),
         safety_validator=SafetyValidator(),
         executor=executor or MaestroExecutor(APP_ID, device),
         max_actions=max_actions if max_actions is not None else _default_max_actions(),
@@ -157,6 +161,7 @@ def build_login_agent(
             if max_stuck_actions is not None
             else _default_max_stuck_actions()
         ),
+        nonactionable_wait_seconds=0.5,
         actionable_step_check=actionable_step_check,
         log_tag=logtags.LOGIN,
     )

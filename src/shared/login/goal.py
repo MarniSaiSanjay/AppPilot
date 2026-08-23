@@ -99,6 +99,13 @@ class SignedInCopilotGoalEvaluator:
     _COMPOSER_INPUT_RESOURCE = ("copilot", "composer")
     _SEARCH_INPUT_TEXT = ("search",)
     _SEARCH_INPUT_RESOURCE = ("search_box", "search_input", "search_field")
+    _CURRENT_ACCOUNT_RESOURCE = ("current-account-custom-link",)
+    _SIGN_OUT_RESOURCE = ("sign-out-item-button",)
+    _AUTH_WEBVIEW_RESOURCE = (
+        "oneauth_navigation_web_view",
+        "common_auth_webview",
+    )
+    _AUTH_LOADING_TEXT = ("looking for accounts", "reviewing accounts")
     # Explicit negative authentication terminals: restricted/denied access,
     # blocked/disabled accounts and outright sign-in failures. These are NOT a
     # successful login - the login form merely disappearing behind such a screen
@@ -130,6 +137,11 @@ class SignedInCopilotGoalEvaluator:
         "invalid password",
         "username or password is incorrect",
         "account or password is incorrect",
+        "couldn't find a microsoft account",
+        "could not find a microsoft account",
+        "couldn't find an account with that email address or phone number",
+        "could not find an account with that email address or phone number",
+        "too many times with an incorrect account or password",
     )
     _NEGATIVE_AUTH_RESOURCE = (
         "access_denied",
@@ -146,6 +158,13 @@ class SignedInCopilotGoalEvaluator:
         "suggestion_card",
         "prompt_starter",
         "intro_suggestion",
+    )
+    _REQUIRED_ONBOARDING = (
+        "microsoft respects your privacy",
+        "getting better together",
+        "powering your experiences",
+        "don't miss anything",
+        "don’t miss anything",
     )
     # Sign-in affordances. Kept specific so an authenticated screen is not
     # misread. Generic auth patterns (incl. the federated "Continue with
@@ -182,6 +201,12 @@ class SignedInCopilotGoalEvaluator:
         """Return a definite login verdict, or None for an ambiguous app screen."""
         if self._foreground_check is not None and not self._foreground_check():
             return False
+        if self._auth_webview_shell(observation):
+            return False
+        if self._matches(observation, text=self._AUTH_LOADING_TEXT):
+            return False
+        if self._signed_in_account_sheet(observation):
+            return True
         if self._blocked(observation):
             return False
         # An explicit restricted/denied/failed authentication screen is a
@@ -205,6 +230,12 @@ class SignedInCopilotGoalEvaluator:
         """Return whether a definite login step exists, or None if ambiguous."""
         if self._foreground_check is not None and not self._foreground_check():
             return False
+        if self._auth_webview_shell(observation):
+            return False
+        if self._matches(observation, text=self._AUTH_LOADING_TEXT):
+            return False
+        if self._signed_in_account_sheet(observation):
+            return True
         if self._blocked(observation):
             return True
         # A negative-auth terminal offers no login/onboarding step to act on: the
@@ -223,7 +254,11 @@ class SignedInCopilotGoalEvaluator:
 
     def _blocked(self, observation: UIObservation) -> bool:
         # Not yet past authentication + onboarding.
-        return self._authenticating(observation) or self._intro_present(observation)
+        return (
+            self._authenticating(observation)
+            or self._intro_present(observation)
+            or self._matches(observation, text=self._REQUIRED_ONBOARDING)
+        )
 
     def has_actionable_step(self, observation: UIObservation) -> bool:
         """Whether this screen presents a genuine login/onboarding step to act on.
@@ -278,6 +313,29 @@ class SignedInCopilotGoalEvaluator:
             text=self._SEARCH_INPUT_TEXT,
             resource=self._SEARCH_INPUT_RESOURCE,
             require_input=True,
+        )
+
+    def _signed_in_account_sheet(self, observation: UIObservation) -> bool:
+        return self._matches(
+            observation,
+            resource=self._CURRENT_ACCOUNT_RESOURCE,
+        ) and self._matches(
+            observation,
+            resource=self._SIGN_OUT_RESOURCE,
+        )
+
+    def _auth_webview_shell(self, observation: UIObservation) -> bool:
+        actionable = [
+            element
+            for element in observation.elements
+            if element.clickable or element.is_input
+        ]
+        return bool(actionable) and all(
+            any(
+                marker in element.resource_id.casefold()
+                for marker in self._AUTH_WEBVIEW_RESOURCE
+            )
+            for element in actionable
         )
 
     def _negative_auth_terminal(self, observation: UIObservation) -> bool:

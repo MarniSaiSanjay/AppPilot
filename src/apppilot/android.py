@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import time
+from xml.etree import ElementTree
 from pathlib import Path
 from typing import Sequence
 
 from . import logtags
-from .models import Action, ActionKind, UIElement, UIObservation
+from .models import Action, ActionKind, CredentialKind, UIElement, UIObservation
 from .safety import infer_credential_kind
 
 APP_ID = "com.microsoft.office.officehubrow"
@@ -24,7 +26,7 @@ MAESTRO_SECRET_ENV = "MAESTRO_APPPILOT_INPUT_SECRET"
 
 # Characters to erase from a credential field before entry so repeats replace
 # rather than append. Generous upper bound.
-CREDENTIAL_FIELD_ERASE_CHARS = 128
+CREDENTIAL_FIELD_ERASE_CHARS = 100
 
 # Maestro spins up an on-device driver app per invocation; on a busy/slow
 # emulator it can miss its startup window. This is an infra flake, not a real
@@ -37,6 +39,8 @@ _DRIVER_STARTUP_RETRY_DELAY = 3.0
 # is often too short on a loaded emulator right after install/uninstall/build.
 _DRIVER_STARTUP_TIMEOUT_ENV = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
 _DRIVER_STARTUP_TIMEOUT_MS = "120000"
+_ADB_SAFE_USERNAME = re.compile(r"[A-Za-z0-9._+@-]+\Z")
+_ADB_USERNAME_CHARACTER_DELAY_SECONDS = 0.10
 
 
 class AndroidOperationalError(RuntimeError):
@@ -87,7 +91,11 @@ class MaestroHierarchyObserver:
     def observe(self) -> UIObservation:
         self._ensure_excluded_prefixes()
         observation = self._capture()
-        if self._is_blank(observation):
+        if self._is_autofill_overlay(observation):
+            recovered = self._dismiss_autofill_overlay()
+            if recovered is not None:
+                observation = recovered
+        elif self._is_blank(observation):
             recovered = self._unblock_blank_screen()
             if recovered is not None:
                 observation = recovered
@@ -98,6 +106,93 @@ class MaestroHierarchyObserver:
         return self.observe()
 
     def _capture(self) -> UIObservation:
+        error: AndroidOperationalError | None = None
+        for attempt in range(2):
+            try:
+                return self._capture_uiautomator()
+            except AndroidOperationalError as current_error:
+                error = current_error
+                if (
+                    attempt == 0
+                    and "invalid UI hierarchy" in str(current_error)
+                ):
+                    time.sleep(0.25)
+                    continue
+                break
+        print(
+            logtags.prefix(
+                logtags.MAESTRO,
+                f"direct hierarchy unavailable; using Maestro fallback: {error}",
+            )
+        )
+        return self._capture_maestro()
+
+    def _capture_uiautomator(self) -> UIObservation:
+        command = [
+            "adb",
+            "-s",
+            self._device_id,
+            "exec-out",
+            "uiautomator",
+            "dump",
+            "/dev/tty",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise AndroidOperationalError(
+                f"Android hierarchy observation failed: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise AndroidOperationalError(
+                "Android hierarchy observation failed"
+                + (f": {detail}" if detail else "")
+            )
+
+        end = result.stdout.rfind("</hierarchy>")
+        if end < 0:
+            raise AndroidOperationalError(
+                "Android returned an invalid UI hierarchy"
+            )
+        xml = result.stdout[: end + len("</hierarchy>")]
+        try:
+            root = ElementTree.fromstring(xml)
+        except ElementTree.ParseError as error:
+            raise AndroidOperationalError(
+                "Android returned an invalid UI hierarchy"
+            ) from error
+
+        elements: list[UIElement] = []
+        self._collect(
+            self._xml_as_maestro_node(root),
+            (),
+            None,
+            False,
+            elements,
+        )
+        return UIObservation(tuple(elements[: self._max_elements]))
+
+    @classmethod
+    def _xml_as_maestro_node(cls, element: ElementTree.Element) -> dict:
+        attributes = dict(element.attrib)
+        attributes["accessibilityText"] = attributes.pop("content-desc", "")
+        attributes["hintText"] = attributes.pop("hint", "")
+        return {
+            "attributes": attributes,
+            "children": [
+                cls._xml_as_maestro_node(child)
+                for child in element
+            ],
+        }
+
+    def _capture_maestro(self) -> UIObservation:
         command = [
             "maestro",
             "--no-ansi",
@@ -147,6 +242,31 @@ class MaestroHierarchyObserver:
             e.label or e.resource_id or e.clickable or e.is_input
             for e in observation.elements
         )
+
+    @staticmethod
+    def _is_autofill_overlay(observation: UIObservation) -> bool:
+        """True for Android's focused autofill-settings overlay.
+
+        The overlay can own the UIAutomator hierarchy while the password field
+        remains visible underneath. It is incidental to login and exposes no
+        credential action, so dismiss it exactly as the existing blank focused
+        popup recovery does.
+        """
+        labels = {
+            element.label.casefold()
+            for element in observation.elements
+            if element.label
+        }
+        return bool(labels) and labels <= {"autofill settings"}
+
+    def _dismiss_autofill_overlay(self) -> "UIObservation | None":
+        if self._popup_unblock_budget <= 0:
+            return None
+        self._popup_unblock_budget -= 1
+        if not self._press_back():
+            return None
+        time.sleep(0.2)
+        return self._capture()
 
     def _unblock_blank_screen(self) -> "UIObservation | None":
         """Recover a blank observation caused by a separate focused window.
@@ -392,6 +512,34 @@ class MaestroExecutor:
             self._input_text(action, target, secret)
             return
         raise ValueError(f"Unsupported action kind: {action.kind}")
+
+    def execute_fast(
+        self,
+        action: Action,
+        observation: UIObservation,
+        secret: str | None = None,
+    ) -> None:
+        """Execute an action selected from the current observation directly.
+
+        Adaptive decisions have already matched the current screen and still
+        pass SafetyValidator. Deliver their taps through the observed bounds to
+        avoid starting a Maestro driver solely to rediscover the same target.
+        """
+        if action.kind == ActionKind.PRESS_BACK:
+            self._run_adb_checked(
+                ["shell", "input", "keyevent", "4"],
+                operation="press back",
+            )
+            return
+        target = observation.find(action.target_id)
+        if (
+            action.kind == ActionKind.TAP
+            and target is not None
+            and target.center is not None
+        ):
+            self._tap_point(*target.center)
+            return
+        self.execute(action, observation, secret=secret)
 
     def open_link(self, deep_link: str) -> None:
         """Launch an exact deep link deterministically via Maestro ``openLink``.
@@ -710,43 +858,227 @@ class MaestroExecutor:
         replace_existing = action.credential_kind is not None or use_secret
 
         kind, payload = self._tap_command(target)
-        # Focus the target field first. Coordinate taps go through adb; text
-        # matches run a Maestro tapOn. Either way the field ends up focused so
-        # the subsequent clear/type acts on it.
-        if kind == "point":
-            self._tap_point(*payload)
-        else:
-            self._run_flow(payload)
-
         if not replace_existing:
+            if kind == "point":
+                self._tap_point(*payload)
+            else:
+                self._run_flow(payload)
             self._run_flow(f"- inputText: {json.dumps(action.input_text)}\n")
             return
 
-        # Credential / replace entry: empty the field, then RE-FOCUS and paste in
-        # a single Maestro flow. Each ``maestro test`` runs in its own subprocess
-        # and tears down its driver on exit, which drops the soft keyboard and
-        # the field's focus - a standalone paste then targets nothing,
-        # leaving the field empty (seen as an unfilled password entry and an
-        # "enter your password" validation error). Re-focusing in the same flow
-        # as the paste keeps the field focused so the secret always lands.
-        #
-        # Use Maestro's internal clipboard rather than inputText: Android
-        # inputText synthesizes key events and can corrupt punctuation in
-        # passwords. setClipboard + pasteText inserts the exact value while the
-        # secret remains an environment placeholder in the generated YAML.
-        self._clear_focused_field()
+        if (
+            action.credential_kind == CredentialKind.USERNAME
+            and secret is not None
+            and self._input_username_via_adb(target, secret)
+        ):
+            return
+
+        # Focus + caret positioning uses one adb process, then erase + exact
+        # clipboard paste uses one Maestro process. Maestro starts and tears down
+        # its driver per invocation, so reducing 4-5 launches to 2 materially
+        # shortens every known credential step.
+        center = target.center
+        if center is not None:
+            self._focus_field_at_end(*center)
+            if kind == "flow":
+                # Starting Maestro can drop the keyboard/focus. Re-focus inside
+                # the same process as paste so the exact clipboard value lands.
+                focus_commands = payload
+            else:
+                self._run_flow(
+                    f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n"
+                )
+                self._tap_point(*center)
+                self._run_flow(
+                    f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
+                    "- pasteText\n",
+                    secret=secret,
+                )
+                self._verify_credential_field(action, target, secret)
+                return
+        else:
+            # Keep the selector fallback for observations without bounds.
+            if kind == "point":
+                raise ValueError("Observed point target has no bounds")
+            self._run_flow(payload)
+            self._move_focused_cursor_to_end()
+            focus_commands = payload
+
         input_commands = (
+            f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n"
+            f"{focus_commands}"
             f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
             "- pasteText\n"
         )
-        if kind == "point":
-            self._tap_point(*payload)
+        for _ in range(2):
             self._run_flow(input_commands, secret=secret)
-        else:
-            self._run_flow(payload + input_commands, secret=secret)
+            if self._credential_field_matches(action, target, secret):
+                return
+        raise AndroidOperationalError(
+            f"{action.credential_kind.value} input verification failed"
+        )
 
-    def _clear_focused_field(self) -> None:
-        """Deterministically empty the currently focused text field.
+    def _verify_credential_field(
+        self,
+        action: Action,
+        target: UIElement,
+        secret: "str | None",
+    ) -> None:
+        if (
+            action.credential_kind is not None
+            and secret is not None
+            and not self._field_text_matches(target, secret)
+        ):
+            raise AndroidOperationalError(
+                f"{action.credential_kind.value} input verification failed"
+            )
+
+    def _credential_field_matches(
+        self,
+        action: Action,
+        target: UIElement,
+        secret: "str | None",
+    ) -> bool:
+        return (
+            action.credential_kind is None
+            or secret is None
+            or self._field_text_matches(target, secret)
+        )
+
+    def _input_username_via_adb(
+        self,
+        target: UIElement,
+        username: str,
+    ) -> bool:
+        """Replace a simple ASCII username through one adb process.
+
+        The value is sent over stdin to the device shell, never placed in host
+        argv. Complex or unsupported usernames return False and retain the exact
+        Maestro clipboard path.
+        """
+        center = target.center
+        if center is None or not _ADB_SAFE_USERNAME.fullmatch(username):
+            return False
+        x, y = center
+        commands = [
+            f"input tap {x} {y}",
+            "input keycombination 113 29",
+            "input keyevent 67",
+        ]
+        for character in username:
+            commands.extend(
+                (
+                    f"input text {shlex.quote(character)}",
+                    f"sleep {_ADB_USERNAME_CHARACTER_DELAY_SECONDS}",
+                )
+            )
+        script = "\n".join(commands) + "\n"
+        try:
+            result = subprocess.run(
+                ["adb", "-s", self._device_id, "shell", "sh"],
+                input=script,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise AndroidOperationalError(
+                f"adb username input failed: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").replace(
+                username,
+                "***",
+            ).strip()
+            raise AndroidOperationalError(
+                "adb username input failed"
+                + (f": {detail}" if detail else "")
+            )
+        return self._field_text_matches(target, username)
+
+    def _field_text_matches(
+        self,
+        target: UIElement,
+        expected: str,
+    ) -> bool:
+        """Verify native credential entry before allowing the flow to submit."""
+        if not target.resource_id:
+            return False
+        for attempt in range(2):
+            try:
+                result = subprocess.run(
+                    [
+                        "adb",
+                        "-s",
+                        self._device_id,
+                        "exec-out",
+                        "uiautomator",
+                        "dump",
+                        "/dev/tty",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                end = result.stdout.rfind("</hierarchy>")
+                if result.returncode != 0 or end < 0:
+                    return False
+                root = ElementTree.fromstring(
+                    result.stdout[: end + len("</hierarchy>")]
+                )
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                ValueError,
+                ElementTree.ParseError,
+            ):
+                return False
+
+            fields = [
+                node
+                for node in root.iter("node")
+                if node.attrib.get("resource-id") == target.resource_id
+            ]
+            if fields:
+                return any(
+                    node.attrib.get("text") == expected
+                    for node in fields
+                )
+            labels = {
+                value
+                for node in root.iter("node")
+                for value in (
+                    node.attrib.get("text"),
+                    node.attrib.get("content-desc"),
+                )
+                if value
+            }
+            if attempt == 0 and labels == {"Autofill settings"}:
+                self._run_adb_checked(
+                    ["shell", "input", "keyevent", "4"],
+                    operation="dismiss autofill settings",
+                )
+                time.sleep(0.2)
+                continue
+            return False
+        return False
+
+    def _focus_field_at_end(self, x: int, y: int) -> None:
+        """Focus a bounded field and move its caret to the end in one adb call."""
+        self._run_adb_checked(
+            [
+                "shell",
+                "sh",
+                "-c",
+                f"input tap {x} {y} && input keyevent 123",
+            ],
+            operation="focus text field",
+        )
+
+    def _move_focused_cursor_to_end(self) -> None:
+        """Move the caret to the end of the currently focused text field.
 
         ``eraseText`` only deletes to the LEFT of the caret, so when the focus
         tap lands in the middle of pre-filled text the characters to its right
@@ -760,7 +1092,6 @@ class MaestroExecutor:
             ["shell", "input", "keyevent", "123"],
             operation="move text cursor",
         )
-        self._run_flow(f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n")
 
     def _tap_point(self, x: int, y: int) -> None:
         """Deliver a coordinate tap through adb's input pipeline.

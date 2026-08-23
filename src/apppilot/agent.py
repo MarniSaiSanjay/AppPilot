@@ -7,7 +7,7 @@ import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
 from .android import MaestroExecutor, MaestroHierarchyObserver
 from .brain import DecisionRequest, ModelDecisionProvider
@@ -38,6 +38,7 @@ DEFAULT_MAX_STUCK_ACTIONS = 5
 # forever. These are deliberately generic (no string/coordinate detection).
 DEFAULT_NONACTIONABLE_WAIT_SECONDS = 2.0
 DEFAULT_MAX_NONACTIONABLE_WAITS = 10
+_T = TypeVar("_T")
 
 
 class AppPilotAgent:
@@ -77,6 +78,7 @@ class AppPilotAgent:
         # the trace is greppable and this run's PASS is never read as a whole test
         # case passing. Empty => untagged lines (generic reuse).
         self._log_tag = log_tag
+        self._timing_enabled = os.environ.get("APPPILOT_TIMING") == "1"
 
     def _emit(self, text: str) -> None:
         """Print one log entry, prefixed with the subsystem tag when set."""
@@ -91,7 +93,31 @@ class AppPilotAgent:
     def _log_fail(self, detail: str) -> None:
         self._emit(f"RESULT:\nFAIL - {detail}")
 
+    def _timed_call(self, label: str, callback: "Callable[[], _T]") -> _T:
+        if not self._timing_enabled:
+            return callback()
+        started = time.monotonic()
+        try:
+            return callback()
+        finally:
+            self._emit(
+                f"TIMING:\n{label} {time.monotonic() - started:.3f}s\n"
+            )
+
     def run(self, goal: str, guidance: str | None = None) -> bool:
+        begin = getattr(self._decision_provider, "begin_run", None)
+        if callable(begin):
+            begin()
+        succeeded = False
+        try:
+            succeeded = self._run(goal, guidance)
+            return succeeded
+        finally:
+            finish = getattr(self._decision_provider, "finish_run", None)
+            if callable(finish):
+                finish(succeeded)
+
+    def _run(self, goal: str, guidance: str | None = None) -> bool:
         reset_recovery = getattr(self._observer, "reset_recovery_budget", None)
         if callable(reset_recovery):
             reset_recovery()
@@ -115,11 +141,15 @@ class AppPilotAgent:
         # Track consecutive actions that leave the meaningful UI unchanged.
         last_acted_fingerprint: tuple | None = None
         consecutive_stuck = 0
+        pending_fast_submit_waits = 0
         for step in range(self._max_actions + 1):
-            observation = self._observer.observe()
+            observation = self._timed_call("observe", self._observer.observe)
             self._emit(f"OBSERVE:\n{observation.describe()}\n")
 
-            reached = self._goal_evaluator.is_reached(goal, observation)
+            reached = self._timed_call(
+                "goal evaluation",
+                lambda: self._goal_evaluator.is_reached(goal, observation),
+            )
             self._log_goal_reached(reached)
             if reached:
                 self._log_pass()
@@ -151,9 +181,15 @@ class AppPilotAgent:
                     f"({waits}/{self._max_nonactionable_waits})\n"
                 )
                 self._sleep(self._nonactionable_wait_seconds)
-                observation = self._observer.observe()
+                observation = self._timed_call(
+                    "observe after wait",
+                    self._observer.observe,
+                )
                 self._emit(f"OBSERVE:\n{observation.describe()}\n")
-                reached = self._goal_evaluator.is_reached(goal, observation)
+                reached = self._timed_call(
+                    "goal evaluation",
+                    lambda: self._goal_evaluator.is_reached(goal, observation),
+                )
                 self._log_goal_reached(reached)
                 if reached:
                     self._log_pass()
@@ -165,6 +201,19 @@ class AppPilotAgent:
                 available_actions, filled_fingerprint = self._offer_actions(
                     observation, filled_credential_keys, filled_fingerprint
                 )
+
+            if (
+                pending_fast_submit_waits > 0
+                and self._has_credential_field(observation)
+            ):
+                pending_fast_submit_waits -= 1
+                self._emit(
+                    "WAIT:\nsubmitted credentials; waiting for authentication "
+                    "transition\n"
+                )
+                self._sleep(0.5)
+                continue
+            pending_fast_submit_waits = 0
 
             # Advance the stuck counter when the last action left the meaningful
             # UI unchanged; a meaningful change resets it. Only counts once an
@@ -182,7 +231,6 @@ class AppPilotAgent:
                     f"{consecutive_stuck} consecutive actions"
                 )
                 return False
-
             if step == self._max_actions:
                 self._log_fail(f"action/step limit reached ({self._max_actions})")
                 return False
@@ -197,7 +245,10 @@ class AppPilotAgent:
                 ),
             )
             # The model is the decision-maker; the agent only asks and validates.
-            decision = self._decision_provider.decide(request)
+            decision = self._timed_call(
+                "decision",
+                lambda: self._decision_provider.decide(request),
+            )
 
             if decision.action is None:
                 self._emit(
@@ -212,18 +263,27 @@ class AppPilotAgent:
                 f"Reason: {decision.reason}\n"
             )
 
-            fresh_observation = self._reobserve_before_action()
-            self._emit(f"RE-OBSERVE:\n{fresh_observation.describe()}\n")
-            current_action = self._rebind_current_action(
-                decision.action, observation, fresh_observation
-            )
-            if current_action is None:
-                self._emit(
-                    "STALE DECISION:\ndiscarded because the UI changed before "
-                    "execution\n"
+            current_action = decision.action
+            if decision.reobserve_required:
+                fresh_observation = self._timed_call(
+                    "pre-action observe",
+                    self._reobserve_before_action,
                 )
-                continue
-            observation = fresh_observation
+                self._emit(
+                    f"RE-OBSERVE:\n{fresh_observation.describe()}\n"
+                )
+                current_action = self._rebind_current_action(
+                    current_action, observation, fresh_observation
+                )
+                if current_action is None:
+                    self._emit(
+                        "STALE DECISION:\ndiscarded because the UI changed before "
+                        "execution\n"
+                    )
+                    continue
+                observation = fresh_observation
+            else:
+                self._emit("FAST DECISION:\nusing the current observation\n")
             meaningful_fingerprint = self._meaningful_fingerprint(observation)
 
             try:
@@ -275,7 +335,20 @@ class AppPilotAgent:
                 last_credential_fingerprint = fingerprint
 
             self._emit(f"ACTION:\n{action.describe(observation)}\n")
-            self._executor.execute(action, observation, secret=secret)
+            execute = self._executor.execute
+            if not decision.reobserve_required:
+                fast_execute = getattr(self._executor, "execute_fast", None)
+                if callable(fast_execute):
+                    execute = fast_execute
+            self._timed_call(
+                "action",
+                lambda: execute(action, observation, secret=secret),
+            )
+            record_executed = getattr(
+                self._decision_provider, "record_executed", None
+            )
+            if callable(record_executed):
+                record_executed(action)
             if action.credential_kind is not None:
                 # Withhold this field's input next turn (until the meaningful UI
                 # changes) so the model proceeds to submit rather than re-typing
@@ -290,8 +363,37 @@ class AppPilotAgent:
             history.append(action.describe(observation))
             # Remember the state we just acted on, to detect progress next step.
             last_acted_fingerprint = meaningful_fingerprint
+            if (
+                not decision.reobserve_required
+                and self._is_submit_action(action, observation)
+            ):
+                pending_fast_submit_waits = 2
 
         raise AssertionError("Agent loop exited unexpectedly")
+
+    @staticmethod
+    def _has_credential_field(observation: UIObservation) -> bool:
+        return any(
+            SafetyValidator.credential_kind(element) is not None
+            for element in observation.elements
+        )
+
+    @staticmethod
+    def _is_submit_action(
+        action: Action,
+        observation: UIObservation,
+    ) -> bool:
+        if action.kind != ActionKind.TAP:
+            return False
+        target = observation.find(action.target_id)
+        if target is None:
+            return False
+        label = (target.own_text or target.label).strip().casefold()
+        resource_id = target.resource_id.strip().casefold()
+        return label in ("next", "sign in") or resource_id in (
+            "nextbutton",
+            "idsibutton9",
+        )
 
     def _has_actionable_step(self, observation, available_actions) -> bool:
         """Whether the agent should act now, or wait/re-observe instead.

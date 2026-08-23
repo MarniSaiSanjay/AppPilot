@@ -6,11 +6,34 @@ by *reasoning over the live UI* — it is **not** a fixed A→B→C script and *
 a collection of hardcoded Maestro flows.
 
 The agent runs a simple loop: observe the UI → check whether the goal is reached
-→ ask the decision model for one action → validate it for safety → execute it
-via Maestro → observe again. The LLM is the **brain**, the Android UI hierarchy
-is the **eyes**, Maestro is the **hands** (execution only), and the test goal is
-the **objective**. It reaches **PASS** when the goal evaluator recognizes the
-goal state and **FAIL** when it cannot safely proceed or an action limit is hit.
+→ select a known, successfully learned, or model-decided action → validate it
+for safety → execute it → observe again. UIAutomator is the fast primary
+observer, ADB handles simple deterministic actions, and Maestro remains the
+secure/complex-action fallback. It reaches **PASS** when the goal evaluator
+recognizes the goal state and **FAIL** when it cannot safely proceed or an
+action limit is hit.
+
+## Runtime behavior
+
+- **`AppPilotAgent` is the orchestrator:** observe → evaluate expected output →
+  decide → validate → execute → repeat.
+- **UIAutomator observes every run**, including the first; Maestro hierarchy is
+  used automatically in the same observation step if direct capture times out,
+  errors, or returns invalid XML, without restarting the run.
+- **`AdaptiveDecisionCache` chooses and learns decisions; it is not the
+  orchestrator.** It tries seeded known decisions, then decisions learned from
+  successful runs, then the model.
+- With an empty cache, the first unknown state uses the model. Its decision stays
+  pending and is cached only if the complete run reaches its expected output.
+  Later matching states reuse it; new states use the model and follow the same
+  success-only learning rule.
+- **Execution:** seeded/cached taps and Back use fast ADB against the current
+  observation. Model decisions are re-observed through the same UIAutomator-first
+  observer, then the normal executor uses Maestro selectors or ADB coordinates
+  as appropriate. Username entry can use verified paced ADB input; password
+  entry uses Maestro's secure clipboard path.
+- Every action still passes safety validation. Failed or incomplete runs save no
+  new decisions.
 
 See [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md) for the full
 architecture, decision-model contract, safety model, and design principles.

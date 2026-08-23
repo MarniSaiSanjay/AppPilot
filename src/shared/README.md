@@ -59,10 +59,12 @@ the model decision provider, the deeplink expectation judge, and the login goal
 evaluator previously duplicated.
 
 ### `login/` — the shared login node
-A generic AppPilotAgent-based login/onboarding capability. No UI steps are
-hardcoded: the model decides each action. A use case describes what it wants via
-a **`LoginPolicy`**; the node drives sign-in and stops at the first terminal
-state the policy declares, before offering any action.
+A generic AppPilotAgent-based login/onboarding capability. Unique known login
+controls are handled deterministically; successful model decisions can be
+learned through the generic adaptive replay core, and unknown states still use
+the model. A use case describes what it wants via a **`LoginPolicy`**; the node
+drives sign-in and stops at the first terminal state the policy declares,
+before offering any action.
 
 - `policy.py` — `LoginPolicy` plus the terminal abstractions
   (`DeterministicTerminalState`, `SemanticTerminalState`,
@@ -76,6 +78,8 @@ state the policy declares, before offering any action.
 - `builder.py` — `build_login_agent(...)` (assembles the agent from a policy;
   default = today's behavior), `resolve_decision_provider`, and the CLI entry
   point.
+- `login_decision_cache.py` — `LoginDecisionCache`, containing only validated
+  login-specific seeded states over the generic `AdaptiveDecisionCache`.
 - `flow.py` — `SharedLoginFlow` / `LoginCapability`: a small adapter the caller
   invokes to prepare login, plus the `[LOGIN]` execution-trace observability.
 - `profiled.py` — `ProfiledLoginFlowFactory`: binds resolved credential profiles

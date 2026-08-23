@@ -40,6 +40,7 @@ class ModelDecision:
 
     action: Action | None
     reason: str
+    reobserve_required: bool = True
 
 
 

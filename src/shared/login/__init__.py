@@ -40,6 +40,7 @@ from .builder import (
     _parse_args,
 )
 from .flow import LoginCapability, SharedLoginFlow, _SignInTracer
+from .login_decision_cache import LoginDecisionCache
 from .profiled import ProfiledLoginFlowFactory
 
 __all__ = [
@@ -49,6 +50,7 @@ __all__ = [
     "DeterministicTerminalState",
     "LLMLoginGoalEvaluator",
     "LoginCapability",
+    "LoginDecisionCache",
     "LoginPolicy",
     "PROTOTYPE_GOAL",
     "ProfiledLoginFlowFactory",

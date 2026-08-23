@@ -14,9 +14,9 @@ hardcoded Maestro scripts and **not** a fixed A→B→C test script.
 
 | Role | Responsibility |
 | --- | --- |
-| **Brain** | The LLM decision model — chooses the next action by reasoning over the current UI and the goal. |
-| **Eyes** | The Android UI hierarchy (via Maestro/ADB), reduced to a small, useful observation. |
-| **Hands** | Maestro — executes the chosen action. Execution layer only. |
+| **Brain** | Seeded and successfully cached decisions first; the LLM reasons over unknown states. |
+| **Eyes** | UIAutomator hierarchy first, with automatic same-step Maestro fallback. |
+| **Hands** | ADB for fast deterministic actions; Maestro for selector, secure, and complex actions. |
 | **Objective** | The test goal (and optional guidance) that defines success. |
 
 ## Core loop
@@ -31,11 +31,11 @@ hardcoded Maestro scripts and **not** a fixed A→B→C test script.
                    /          \
                  YES           NO
                   |             |
-                PASS      ASK THE MODEL what to do next
+                PASS      SELECT known/cached/model decision
                               |
                      VALIDATE the proposed action  (safety validator)
                               |
-                     EXECUTE through Maestro
+                       EXECUTE through ADB/Maestro
                               |
                           OBSERVE again
                               |
@@ -65,9 +65,10 @@ being hardcoded.
 | --- | --- | --- |
 | **Observer** | Turning the raw UI hierarchy into a bounded, relevant observation (text, accessibility text, resource ids, clickable/enabled/input state, useful relationships). | Deciding actions. |
 | **Login goal evaluator** | Owning the login-stop boundary: deterministic terminal/blocker evidence first, semantic classification only for ambiguous screens. | Choosing or executing actions. |
-| **Decision model (provider)** | Proposing the single next action, or declaring "cannot safely proceed", given the goal, guidance, observation, available safe actions, and execution context. | Executing anything; declaring PASS; inventing elements. |
+| **Adaptive decision cache** | Trying seeded rules, then decisions learned from successful runs, then the model fallback. | Executing actions or declaring PASS. |
+| **Decision model (provider)** | Proposing the next action for an unknown state, or declaring "cannot safely proceed". | Executing anything; declaring PASS; inventing elements. |
 | **Safety validator** | Enumerating safe actions and validating every proposed action before execution. | Deciding intent. |
-| **Maestro executor** | Executing a validated action against the device. | Orchestration or decision-making. |
+| **Android executor** | Executing a validated action through ADB or Maestro as appropriate. | Orchestration or decision-making. |
 | **Agent loop** | Sequencing observe &rarr; evaluate &rarr; decide &rarr; validate &rarr; execute; enforcing limits; printing the trace. | Any UI-specific knowledge. |
 
 ## Decision model contract
@@ -274,22 +275,21 @@ boundary from pretending to be intelligent.
 
 ## Design principles
 
-- **The model is the decision-maker.** Do not grow a hardcoded list of
-  popup labels (Accept / Continue / OK / Never / ...) or a deterministic popup
-  handler. Unexpected screens are handled by reasoning, not by pre-scripting
-  every screen.
-- **Maestro is the execution layer only.**
-- **Credential fidelity.** Username/password values are resolved locally, placed
-  in Maestro's internal clipboard through an environment placeholder, and
-  pasted into the focused field. This avoids Android key-event corruption of
-  punctuation while keeping secrets out of generated flow files and logs.
+- **Adaptive decisions.** Use validated seeded rules and decisions cached only
+  after complete success; unknown or ambiguous states still use the model.
+- **Hybrid Android tooling.** UIAutomator observes first; ADB executes fast
+  deterministic actions; Maestro handles hierarchy fallback, selectors, secure
+  input, and complex actions.
+- **Credential fidelity.** Credentials are resolved locally. Username entry may
+  use verified paced ADB input; password entry uses Maestro's secure clipboard
+  path. Secrets stay out of model requests, generated flow files, and logs.
 - **Deterministic PASS.** Goal evaluation is separate and never delegated to
   the model.
 - **Independent safety.** Validation is separate from decision-making and gates
   every action.
 - **Replaceable model boundary.** The real model can be connected via
   configuration without changing the agent loop, observer, goal evaluator,
-  safety validator, or Maestro executor.
+  safety validator, or Android executor.
 - **Small and modular.** Introduce components only when the current milestone
   needs them.
 
