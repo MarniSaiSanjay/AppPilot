@@ -218,7 +218,9 @@ Boundaries:
 - **The AI only judges** whether the observed UI *semantically* satisfies the
   natural-language Expected Result. Named destinations such as Researcher,
   Cowork, and Chat are distinct, and prompt presence, absence, or specified
-  content must agree. No hardcoded selectors or app-specific success rules; an
+  content must agree. Before judging, installed and first-install flows
+  deterministically add the Researcher agent only when a Researcher screen
+  explicitly offers that action; unknown screens are left untouched. An
   expected error that is correctly observed is a PASS, because the result is
   *observed vs expected*, not *did the deeplink succeed*.
 - **Retry and reporting are deterministic.** Two attempts per case by default.

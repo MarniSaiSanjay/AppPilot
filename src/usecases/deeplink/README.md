@@ -76,9 +76,12 @@ selects the scenario:
 `LLMExpectationJudge` is given only the Expected Result and the redacted observed
 UI and returns a match/mismatch verdict. The runner polls observe→judge within a
 bounded window (PASS on first match; mismatch only after the window elapses) and
-retries deterministically. Named destinations are distinct: an expected
-Researcher screen cannot match Cowork or generic Chat, and vice versa. Prompt
-presence, absence, and any specified prompt content must also match.
+retries deterministically. In both installed and first-install flows, a
+Researcher screen that explicitly offers an Add action is handled
+deterministically before final verification; unknown screens go directly to the
+judge. Named destinations are distinct: an expected Researcher screen cannot
+match Cowork or generic Chat, and vice versa. Prompt presence, absence, and any
+specified prompt content must also match.
 
 ## Entry point
 

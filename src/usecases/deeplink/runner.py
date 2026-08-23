@@ -21,6 +21,7 @@ try:  # package-relative (python -m src.usecases.deeplink.runner) vs top-level
         MaestroHierarchyObserver,
     )
     from ...apppilot import logtags
+    from ...apppilot.models import Action, ActionKind, UIElement, UIObservation
     from ...shared.account import (
         AccountPreparationKind,
         AccountPreparationResult,
@@ -38,6 +39,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
         MaestroHierarchyObserver,
     )
     from apppilot import logtags
+    from apppilot.models import Action, ActionKind, UIElement, UIObservation
     from shared.account import (
         AccountPreparationKind,
         AccountPreparationResult,
@@ -69,6 +71,7 @@ DEFAULT_SETTLE_SECONDS = 3.0
 # (which re-opens the deeplink and, when uninstalled, re-installs the app).
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 30.0
 DEFAULT_VERIFY_POLL_INTERVAL_SECONDS = 2.0
+_RESEARCHER_ADD_VERBS = {"add", "get", "install"}
 
 
 # --------------------------------------------------------------------------- #
@@ -230,15 +233,16 @@ class DeeplinkTestRunner:
         """Shared, bounded verification polling for a single attempt.
 
         Used IDENTICALLY by installed and uninstalled cases. After the deeplink
-        has been executed and the app is ready to be observed, repeatedly
-        observe -> judge until the expected result matches (PASS immediately) or
-        the bounded verification window elapses (genuine mismatch -> caller
-        retries). A deeplink destination may take several seconds to appear, so a
-        first non-matching observation is NOT a failure. Uses a monotonic clock
-        so the window can never be skewed by wall-clock jumps, and always makes
-        at least one observe/judge call.
+        has been executed and the app is ready to be observed, add Researcher
+        when its own screen explicitly offers that action, then repeatedly
+        observe -> judge the resulting destination until the expected result
+        matches (PASS immediately) or the bounded verification window elapses
+        (genuine mismatch -> caller retries). Unknown screens go directly to the
+        judge. Uses a monotonic clock so the window can never be skewed by
+        wall-clock jumps, and always makes at least one observe/judge call.
         """
         deadline = self._monotonic() + self._verify_timeout_seconds
+        researcher_add_attempted = False
         while True:
             logtags.trace(
                 f"{case.test_id} attempt "
@@ -246,6 +250,21 @@ class DeeplinkTestRunner:
                 logtags.VERIFY,
             )
             observation = self._observer.observe()
+            if not researcher_add_attempted and (
+                add_researcher := self._find_researcher_add_control(observation)
+            ) is not None:
+                logtags.trace(
+                    f"{case.test_id}: adding Researcher agent",
+                    logtags.VERIFY,
+                )
+                self._executor.execute(
+                    Action(ActionKind.TAP, target_id=add_researcher.element_id),
+                    observation,
+                )
+                researcher_add_attempted = True
+                deadline = self._monotonic() + self._verify_timeout_seconds
+                self._sleep(self._verify_poll_interval_seconds)
+                continue
             verdict = self._judge.evaluate(case.expected_result, observation)
             if verdict.matched:
                 logtags.trace(
@@ -263,6 +282,28 @@ class DeeplinkTestRunner:
                 logtags.VERIFY,
             )
             self._sleep(self._verify_poll_interval_seconds)
+
+    @staticmethod
+    def _find_researcher_add_control(
+        observation: UIObservation,
+    ) -> UIElement | None:
+        if any(element.is_input for element in observation.elements) or not any(
+            "researcher" in element.label.casefold()
+            for element in observation.elements
+        ):
+            return None
+        for element in observation.elements:
+            label = " ".join(element.selector_text.casefold().split())
+            words = set(label.split())
+            if element.clickable and element.enabled and (
+                label in _RESEARCHER_ADD_VERBS
+                or (
+                    words & _RESEARCHER_ADD_VERBS
+                    and words & {"agent", "researcher"}
+                )
+            ):
+                return element
+        return None
 
     def _run_attempts(
         self,
