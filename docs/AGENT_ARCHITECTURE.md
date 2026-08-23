@@ -206,7 +206,7 @@ not the action loop):
 
 ```
 Excel test case  ->  launch EXACT deeplink (Maestro openLink, deterministic)
-                 ->  observe resulting UI (Maestro, deterministic)
+                 ->  observe resulting UI (UIAutomator, Maestro fallback)
                  ->  AI judges observed-vs-Expected-Result (semantic)
                  ->  PASS, or kill + wait 2s + relaunch (deterministic retry)
 ```
@@ -216,11 +216,11 @@ Boundaries:
 - **The test case decides which deeplink to run**; it is executed verbatim. The
   model never invents, modifies, or chooses a deeplink.
 - **The AI only judges** whether the observed UI *semantically* satisfies the
-  natural-language Expected Result (e.g. "Chat screen", "Chat screen with
-  prompt", "Researcher screen with prompt", or an expected error/failure). No
-  hardcoded selectors or app-specific success rules; an expected error that is
-  correctly observed is a PASS, because the result is *observed vs expected*,
-  not *did the deeplink succeed*.
+  natural-language Expected Result. Named destinations such as Researcher,
+  Cowork, and Chat are distinct, and prompt presence, absence, or specified
+  content must agree. No hardcoded selectors or app-specific success rules; an
+  expected error that is correctly observed is a PASS, because the result is
+  *observed vs expected*, not *did the deeplink succeed*.
 - **Retry and reporting are deterministic.** Two attempts per case by default.
   Installed retries stop, wait 2 seconds, and reopen the same deeplink;
   uninstalled retries recreate the complete fresh-install sequence. Any
