@@ -26,15 +26,22 @@ except ImportError:
 # The agent reasons over the observed UI and drives Maestro action-by-action;
 # it does not execute any prewritten Maestro flow.
 PROTOTYPE_GOAL = (
-    "Complete authentication and the minimum required first-launch onboarding. "
-    "Once the initial suggested-prompt/welcome interruption has been dismissed "
-    "(or was never shown because the app is already signed in), login is "
-    "complete: stop and return control to the caller. Do NOT navigate further "
-    "into Copilot, do NOT tap suggested actions or 'Ask Copilot', and do NOT "
-    "open files or send prompts to prove Copilot is usable."
+    "Complete authentication and all required first-launch or post-authentication "
+    "onboarding. Dismiss every blocking dialog, bottom sheet, popup, privacy "
+    "notice, notification prompt, and suggested-prompt/welcome interruption. "
+    "Login is complete only after an unobstructed normal destination such as "
+    "Chat, Search, or Researcher remains visible and usable. Then stop and return "
+    "control to the caller. Do NOT navigate further into Copilot, do NOT tap "
+    "suggested actions or 'Ask Copilot', and do NOT open files or send prompts "
+    "to prove Copilot is usable."
 )
 DEFAULT_GUIDANCE = (
-    "Advance ONLY through sign-in and required first-launch onboarding. When a "
+    "Advance ONLY through sign-in and required first-launch or post-authentication "
+    "onboarding. Treat every blocking dialog, bottom sheet, popup, privacy notice, "
+    "notification prompt, and welcome interruption as part of login; acknowledge "
+    "or dismiss it with the safest non-destructive control and keep going until "
+    "the normal Chat, Search, or Researcher destination is visible without an "
+    "overlay. When a "
     "sign-in email/username or password field is shown, choose the matching "
     "credential input action and set input_kind accordingly; AppPilot supplies "
     "the actual value securely, so never type a credential yourself. Enter the "
@@ -52,10 +59,9 @@ DEFAULT_GUIDANCE = (
     "incidental interruptions (for example a 'Save password' prompt) with the "
     "safest non-destructive option and keep going. If the introductory screen "
     "shows a random suggested prompt with a Send button and a close (X) control, "
-    "close it with the X instead of sending the suggestion - that dismissal "
-    "completes onboarding. Do NOT continue into the app afterwards: once past "
-    "sign-in and that initial interruption, take no further actions - the next "
-    "screen belongs to the caller, not to login."
+    "close it with the X instead of sending the suggestion. Do NOT continue into "
+    "the app afterwards: once the unobstructed destination is stable, take no "
+    "further actions - that screen belongs to the caller, not to login."
 )
 
 
@@ -161,6 +167,7 @@ class SignedInCopilotGoalEvaluator:
     )
     _REQUIRED_ONBOARDING = (
         "microsoft respects your privacy",
+        "your privacy option",
         "getting better together",
         "powering your experiences",
         "don't miss anything",
@@ -205,8 +212,6 @@ class SignedInCopilotGoalEvaluator:
             return False
         if self._matches(observation, text=self._AUTH_LOADING_TEXT):
             return False
-        if self._signed_in_account_sheet(observation):
-            return True
         if self._blocked(observation):
             return False
         # An explicit restricted/denied/failed authentication screen is a
@@ -215,11 +220,10 @@ class SignedInCopilotGoalEvaluator:
         # usable in-app screen (and never reach the semantic judge to be flipped).
         if self._negative_auth_terminal(observation):
             return False
-        if (
-            self._signed_in_home(observation)
-            or self._search_screen(observation)
-        ):
-            return True
+        # A normal destination is positive evidence, but the semantic judge must
+        # still inspect the whole screen for a dialog/bottom sheet overlay.
+        if self._signed_in_home(observation) or self._search_screen(observation):
+            return None
         if not self._has_actionable_ui(observation):
             return False
         return None
@@ -234,8 +238,6 @@ class SignedInCopilotGoalEvaluator:
             return False
         if self._matches(observation, text=self._AUTH_LOADING_TEXT):
             return False
-        if self._signed_in_account_sheet(observation):
-            return True
         if self._blocked(observation):
             return True
         # A negative-auth terminal offers no login/onboarding step to act on: the
@@ -243,11 +245,8 @@ class SignedInCopilotGoalEvaluator:
         # rather than hand the dead-end screen to the Brain.
         if self._negative_auth_terminal(observation):
             return False
-        if (
-            self._signed_in_home(observation)
-            or self._search_screen(observation)
-        ):
-            return True
+        if self._signed_in_home(observation) or self._search_screen(observation):
+            return None
         if not self._has_actionable_ui(observation):
             return False
         return None
@@ -258,6 +257,7 @@ class SignedInCopilotGoalEvaluator:
             self._authenticating(observation)
             or self._intro_present(observation)
             or self._matches(observation, text=self._REQUIRED_ONBOARDING)
+            or self._signed_in_account_sheet(observation)
         )
 
     def has_actionable_step(self, observation: UIObservation) -> bool:
@@ -430,19 +430,23 @@ class LLMLoginGoalEvaluator:
         "screen (including 'Continue with <provider>' buttons), an account "
         "picker or consent/permission prompt, an email or password field, an "
         "MFA/verification prompt, OR the optional initial suggested-prompt / "
-        "welcome / onboarding interruption that should be dismissed first, OR a "
+        "welcome / onboarding interruption that should be dismissed first, any "
+        "blocking post-authentication dialog, bottom sheet, popup, privacy "
+        "notice, or notification prompt, OR a "
         "transient loading / splash / 'looking for account' screen that has not "
         "settled yet.\n"
         "   - reached=true ONLY when the screen is clearly a normal, usable "
         "IN-APP screen that belongs to the signed-in user (for example a home / "
         "chat / composer / search / content screen) with no sign-in affordance "
-        "and no pending onboarding interruption.\n"
+        "and no pending onboarding or post-authentication interruption.\n"
         "\n"
         "2) actionable_step: is there a CONCRETE sign-in / authentication / "
         "onboarding control that the automation should act on RIGHT NOW - for "
         "example a sign-in or 'Continue with <provider>' button, an account to "
         "pick, a visible email/password field, or an intro/suggested-prompt to "
-        "dismiss?\n"
+        "dismiss, including a safe acknowledgement/close action on a blocking "
+        "post-authentication dialog, bottom sheet, popup, privacy notice, or "
+        "notification prompt?\n"
         "   - actionable_step=false when the screen is a transient loading / "
         "splash / 'looking for accounts' / syncing / fetching state that has no "
         "such control yet, EVEN IF it carries incidental links (like a 'Terms of "
@@ -591,7 +595,14 @@ class LLMLoginGoalEvaluator:
 
 
 class AuthoritativeLoginGoalEvaluator:
-    """Production login boundary: deterministic evidence first, AI if ambiguous."""
+    """Production login boundary: deterministic evidence first, AI if ambiguous.
+
+    A positive completion verdict must remain positive across three observations.
+    This gives delayed post-authentication sheets time to appear before control is
+    returned to the caller.
+    """
+
+    _REQUIRED_COMPLETION_OBSERVATIONS = 3
 
     def __init__(
         self,
@@ -600,20 +611,41 @@ class AuthoritativeLoginGoalEvaluator:
     ) -> None:
         self._deterministic = deterministic
         self._semantic = semantic
+        self._completion_observations = 0
+        self._confirming_current_observation = False
 
     def begin_run(self) -> None:
+        self._completion_observations = 0
+        self._confirming_current_observation = False
         if self._semantic is not None:
             self._semantic.begin_run()
 
     def is_reached(self, goal: str, observation: UIObservation) -> bool:
+        self._confirming_current_observation = False
         verdict = self._deterministic.deterministic_verdict(observation)
-        if verdict is not None:
-            return verdict
-        if self._semantic is not None:
-            return self._semantic.is_reached(goal, observation)
-        return self._deterministic.is_reached(goal, observation)
+        if verdict is None:
+            if self._semantic is not None:
+                verdict = self._semantic.is_reached(goal, observation)
+            else:
+                verdict = self._deterministic.is_reached(goal, observation)
+        if not verdict:
+            self._completion_observations = 0
+            return False
+
+        self._completion_observations += 1
+        if (
+            self._completion_observations
+            < self._REQUIRED_COMPLETION_OBSERVATIONS
+        ):
+            self._confirming_current_observation = True
+            return False
+
+        self._completion_observations = 0
+        return True
 
     def has_actionable_step(self, observation: UIObservation) -> bool:
+        if self._confirming_current_observation:
+            return False
         verdict = self._deterministic.deterministic_actionable_verdict(observation)
         if verdict is not None:
             return verdict

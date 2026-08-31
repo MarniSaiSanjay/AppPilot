@@ -79,6 +79,11 @@ class AppPilotAgent:
         # case passing. Empty => untagged lines (generic reuse).
         self._log_tag = log_tag
         self._timing_enabled = os.environ.get("APPPILOT_TIMING") == "1"
+        self._last_failure_reason: str | None = None
+
+    @property
+    def last_failure_reason(self) -> str | None:
+        return self._last_failure_reason
 
     def _emit(self, text: str) -> None:
         """Print one log entry, prefixed with the subsystem tag when set."""
@@ -91,6 +96,7 @@ class AppPilotAgent:
         self._emit("RESULT:\nPASS")
 
     def _log_fail(self, detail: str) -> None:
+        self._last_failure_reason = detail
         self._emit(f"RESULT:\nFAIL - {detail}")
 
     def _timed_call(self, label: str, callback: "Callable[[], _T]") -> _T:
@@ -105,6 +111,7 @@ class AppPilotAgent:
             )
 
     def run(self, goal: str, guidance: str | None = None) -> bool:
+        self._last_failure_reason = None
         begin = getattr(self._decision_provider, "begin_run", None)
         if callable(begin):
             begin()

@@ -13,10 +13,10 @@ import time
 from typing import Callable, Protocol
 
 try:  # package-relative (python -m src.shared.installer) vs top-level
-    from ..apppilot.android import MaestroExecutor
+    from ..apppilot.android import AndroidOperationalError, MaestroExecutor
     from ..apppilot import logtags
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
-    from apppilot.android import MaestroExecutor
+    from apppilot.android import AndroidOperationalError, MaestroExecutor
     from apppilot import logtags
 
 # Bounded wait for the app to become foreground after an adb launch (a returning
@@ -87,6 +87,8 @@ class LocalApkInstaller:
         # on the store window); otherwise launch via a deterministic adb LAUNCHER
         # intent (no store window). Neither re-issues any pending intent. Return
         # once foreground.
+        if via_store_button and self._executor.is_foreground():
+            return
         if via_store_button:
             logtags.trace(
                 "tapping store Open button via Maestro", logtags.INSTALL
@@ -95,7 +97,14 @@ class LocalApkInstaller:
         else:
             logtags.trace("launching app via adb", logtags.INSTALL)
             launch = self._executor.launch_app_via_adb
-        launch()
+        try:
+            launch()
+        except AndroidOperationalError:
+            # APK installation can complete the pending deeplink and foreground
+            # the app while Maestro is waiting for the store button.
+            if via_store_button and self._executor.is_foreground():
+                return
+            raise
         self._wait_until_foreground(launch)
 
     def _wait_until_foreground(self, relaunch: Callable[[], None]) -> None:

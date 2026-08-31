@@ -32,7 +32,10 @@ CREDENTIAL_FIELD_ERASE_CHARS = 100
 # emulator it can miss its startup window. This is an infra flake, not a real
 # action failure, so give the driver a longer startup budget and, on timeout,
 # reset the adb connection and retry a bounded number of times.
-_DRIVER_STARTUP_TIMEOUT_MARKER = "driver did not start up in time"
+_TRANSIENT_DRIVER_FAILURE_MARKERS = (
+    "driver did not start up in time",
+    "device server died during 'deviceinfo'",
+)
 _DRIVER_STARTUP_MAX_ATTEMPTS = 3
 _DRIVER_STARTUP_RETRY_DELAY = 3.0
 # Maestro reads this (milliseconds) to size its driver-startup wait; the default
@@ -143,7 +146,17 @@ class MaestroHierarchyObserver:
                 f"direct hierarchy unavailable; using Maestro fallback: {error}",
             )
         )
-        return self._capture_maestro()
+        try:
+            return self._capture_maestro()
+        except AndroidOperationalError as maestro_error:
+            # Both providers are read-only. If Maestro itself times out while
+            # the Android hierarchy is settling, one final direct capture can
+            # recover without replaying any user action.
+            time.sleep(0.5)
+            try:
+                return self._capture_uiautomator()
+            except AndroidOperationalError as recovery_error:
+                raise maestro_error from recovery_error
 
     def _capture_uiautomator(self) -> UIObservation:
         command = [
@@ -516,7 +529,10 @@ class MaestroExecutor:
         secret: str | None = None,
     ) -> None:
         if action.kind == ActionKind.PRESS_BACK:
-            self._run_flow("- pressKey: BACK\n")
+            self._run_adb_checked(
+                ["shell", "input", "keyevent", "KEYCODE_BACK"],
+                operation="press back",
+            )
             return
 
         target = observation.find(action.target_id)
@@ -524,7 +540,7 @@ class MaestroExecutor:
             raise ValueError("Cannot execute an action without an observed target")
 
         if action.kind == ActionKind.TAP:
-            self._tap(target)
+            self._tap(target, observation)
             return
         if action.kind == ActionKind.INPUT_TEXT:
             self._input_text(action, target, secret)
@@ -555,22 +571,49 @@ class MaestroExecutor:
             and target is not None
             and target.center is not None
         ):
-            self._tap_point(*target.center)
+            try:
+                point = self._safe_tap_point(target, observation)
+            except AndroidOperationalError:
+                kind, _ = self._tap_command(target)
+                if kind != "flow":
+                    raise
+                # A stable id/text selector can still resolve a target when a
+                # flat hierarchy makes another clickable node look obstructive.
+                self._tap(target, observation)
+                return
+            self._tap_point(*point)
             return
         self.execute(action, observation, secret=secret)
 
     def open_link(self, deep_link: str) -> None:
-        """Launch an exact deep link deterministically via Maestro ``openLink``.
+        """Launch an exact deep link through Android's VIEW intent.
 
         The link is executed verbatim as supplied by the test case; nothing about
-        it is inferred, modified, or chosen by a model.
+        it is inferred, modified, or chosen by a model. ADB avoids starting a
+        fresh Maestro device server for every case and retry.
         """
-        commands = f"- openLink: {json.dumps(deep_link)}\n"
-        self._run_flow(commands)
+        result = self._run_adb_checked(
+            [
+                "shell",
+                "am",
+                "start",
+                "-W",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                shlex.quote(deep_link),
+            ],
+            operation="open deeplink",
+        )
+        combined = f"{result.stdout or ''}{result.stderr or ''}"
+        if "Error:" in combined or "unable to resolve Intent" in combined:
+            raise AndroidOperationalError(
+                f"adb open deeplink failed: {combined.strip()}"
+            )
 
     def launch_app(self) -> None:
         """Launch the app (used e.g. by first-install warm-up)."""
-        self._run_flow(f"- launchApp: {json.dumps(self._app_id)}\n")
+        self.launch_app_via_adb()
 
     def launch_app_via_open_btn_click(self, timeout: float = 60) -> None:
         """Launch the app by tapping the store's "Open" button via Maestro.
@@ -612,7 +655,10 @@ class MaestroExecutor:
 
     def stop_app(self) -> None:
         """Force-stop (kill) the app."""
-        self._run_flow(f"- stopApp: {json.dumps(self._app_id)}\n")
+        self._run_adb_checked(
+            ["shell", "am", "force-stop", self._app_id],
+            operation="stop app",
+        )
 
     def is_installed(self) -> bool:
         """Return whether the app package is currently installed (via adb)."""
@@ -807,8 +853,9 @@ class MaestroExecutor:
     def _run_adb(
         self, args: Sequence[str], timeout: float = 180
     ) -> subprocess.CompletedProcess:
+        command = ["adb", "-s", self._device_id, *args]
         return subprocess.run(
-            ["adb", "-s", self._device_id, *args],
+            command,
             check=False,
             capture_output=True,
             text=True,
@@ -918,13 +965,16 @@ class MaestroExecutor:
                     # Retry only the Maestro driver-startup flake; real action
                     # failures still raise on the first attempt.
                     if (
-                        _DRIVER_STARTUP_TIMEOUT_MARKER in error.lower()
+                        any(
+                            marker in error.lower()
+                            for marker in _TRANSIENT_DRIVER_FAILURE_MARKERS
+                        )
                         and attempt < _DRIVER_STARTUP_MAX_ATTEMPTS
                     ):
                         print(
                             logtags.prefix(
                                 logtags.MAESTRO,
-                                f"driver startup timeout "
+                                f"driver transport failure "
                                 f"(attempt {attempt}/{_DRIVER_STARTUP_MAX_ATTEMPTS}); "
                                 "resetting adb and retrying",
                             )
@@ -940,10 +990,16 @@ class MaestroExecutor:
             if flow_path:
                 flow_path.unlink(missing_ok=True)
 
-    def _tap(self, target: UIElement) -> None:
+    def _tap(
+        self,
+        target: UIElement,
+        observation: UIObservation,
+    ) -> None:
         kind, payload = self._tap_command(target)
         if kind == "point":
-            self._tap_point(*payload)
+            self._tap_point(
+                *self._safe_tap_point(target, observation)
+            )
             return
         try:
             self._run_flow(payload)
@@ -957,16 +1013,104 @@ class MaestroExecutor:
             # coordinate tap via adb (the most reliable delivery on Compose)
             # instead of letting one flaky tap crash the whole suite. Without
             # bounds there is no safe fallback, so the error propagates.
-            center = target.center
-            if center is None:
+            if target.bounds is None:
                 raise
+            safe_point = self._safe_tap_point(target, observation)
             print(
                 logtags.prefix(
                     logtags.MAESTRO,
                     "selector tap failed; retrying via coordinate tap",
                 )
             )
-            self._tap_point(*center)
+            self._tap_point(*safe_point)
+
+    @classmethod
+    def _safe_tap_point(
+        cls,
+        target: UIElement,
+        observation: UIObservation,
+    ) -> tuple[int, int]:
+        bounds = target.bounds
+        if bounds is None:
+            raise ValueError("Observed target has no tappable bounds")
+
+        elements = {
+            element.element_id: element
+            for element in observation.elements
+        }
+        blockers = tuple(
+            element
+            for element in observation.elements
+            if element.element_id != target.element_id
+            and element.clickable
+            and element.enabled
+            and element.bounds is not None
+            and not cls._is_related(target, element, elements)
+        )
+        left, top, right, bottom = bounds
+        center = ((left + right) // 2, (top + bottom) // 2)
+        if not cls._contains(bounds, center):
+            raise AndroidOperationalError(
+                "Observed target has invalid tappable bounds"
+            )
+        if not any(cls._contains(element.bounds, center) for element in blockers):
+            return center
+
+        x_mid = center[0]
+        y_margin = max(1, (bottom - top) // 10)
+        x_margin = max(1, (right - left) // 10)
+        candidates = (
+            (x_mid, top + y_margin),
+            (left + x_margin, (top + bottom) // 2),
+            (right - x_margin, (top + bottom) // 2),
+            (x_mid, bottom - y_margin),
+        )
+        safe_point = next(
+            (
+                point
+                for point in candidates
+                if cls._contains(bounds, point)
+                and not any(
+                    cls._contains(element.bounds, point)
+                    for element in blockers
+                )
+            ),
+            None,
+        )
+        if safe_point is None:
+            raise AndroidOperationalError(
+                "Observed target has no unobstructed tap point"
+            )
+        return safe_point
+
+    @staticmethod
+    def _contains(
+        bounds: tuple[int, int, int, int],
+        point: tuple[int, int],
+    ) -> bool:
+        left, top, right, bottom = bounds
+        x, y = point
+        return left <= x < right and top <= y < bottom
+
+    @staticmethod
+    def _is_related(
+        first: UIElement,
+        second: UIElement,
+        elements: dict[str, UIElement],
+    ) -> bool:
+        def has_ancestor(element: UIElement, ancestor_id: str) -> bool:
+            parent_id = element.parent_id
+            while parent_id is not None:
+                if parent_id == ancestor_id:
+                    return True
+                parent = elements.get(parent_id)
+                parent_id = parent.parent_id if parent is not None else None
+            return False
+
+        return has_ancestor(first, second.element_id) or has_ancestor(
+            second,
+            first.element_id,
+        )
 
     @staticmethod
     def _is_selector_miss(error: RuntimeError) -> bool:

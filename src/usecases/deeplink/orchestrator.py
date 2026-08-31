@@ -185,6 +185,11 @@ class DeeplinkSuiteOrchestrator:
                     )
                 return prepared_supported_links
             self._runner.run_warm_up()
+            self._runner.open_installed_app()
+            if not self._runner.ensure_logged_in(representative):
+                for case in group.cases:
+                    report.results.append(_login_failed_result(case))
+                return prepared_supported_links
         except RuntimeError as exc:
             logtags.trace(
                 f"License group setup failed: {exc}",
@@ -220,6 +225,6 @@ class DeeplinkSuiteOrchestrator:
         report.results = ordered
 
     def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        # First-open-after-install: NO warm-up. The runner re-establishes the
-        # genuine fresh/uninstalled state on every attempt.
+        # First-open-after-install: NO warm-up. The runner preserves authenticated
+        # state only when the exact link can be replayed; otherwise retries rebuild.
         return self._runner.run_uninstalled_case(case)

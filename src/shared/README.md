@@ -64,7 +64,10 @@ controls are handled deterministically; successful model decisions can be
 learned through the generic adaptive replay core, and unknown states still use
 the model. A use case describes what it wants via a **`LoginPolicy`**; the node
 drives sign-in and stops at the first terminal state the policy declares,
-before offering any action.
+before offering any action. The default login boundary includes blocking
+post-authentication dialogs, bottom sheets, privacy notices, and welcome
+prompts; it completes only after an unobstructed app destination remains usable
+across consecutive observations.
 
 - `policy.py` — `LoginPolicy` plus the terminal abstractions
   (`DeterministicTerminalState`, `SemanticTerminalState`,

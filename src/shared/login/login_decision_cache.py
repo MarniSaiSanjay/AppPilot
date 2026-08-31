@@ -101,6 +101,7 @@ class LoginDecisionCache(AdaptiveDecisionCache):
 
         for screen_markers, control_phrases in (
             (("microsoft respects your privacy",), ("next",)),
+            (("your privacy option",), ("close", "ok", "got it")),
             (
                 ("getting better together",),
                 ("don't send optional data", "don’t send optional data"),

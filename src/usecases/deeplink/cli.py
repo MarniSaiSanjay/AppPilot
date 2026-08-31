@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -20,7 +21,12 @@ from typing import Sequence
 try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     from ...apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from ...apppilot.agent import _load_dotenv
-    from ...apppilot import apk_config, device_config, email_delivery, logtags
+    from ...apppilot import (
+        apk_config,
+        device_config,
+        email_delivery,
+        logtags,
+    )
     from ...apppilot import telemetry
     from ...shared.installer import LocalApkInstaller
     from ...shared.account.session import AndroidAccountSession
@@ -31,6 +37,7 @@ try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     )
     from ...shared.login import (
         ProfiledLoginFlowFactory,
+        SharedLoginFlow,
         build_login_agent,
         resolve_decision_provider,
     )
@@ -48,6 +55,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     )
     from shared.login import (
         ProfiledLoginFlowFactory,
+        SharedLoginFlow,
         build_login_agent,
         resolve_decision_provider,
     )
@@ -257,7 +265,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if device_id is None:
         return 2
-
     executor = MaestroExecutor(APP_ID, device_id)
     observer = MaestroHierarchyObserver(device_id)
     warm_up = (
@@ -270,6 +277,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     # reuse the same device dependencies and decision provider; only their local,
     # secret RuntimeContext differs.
     login_provider = resolve_decision_provider()
+
+    def recover_login_loading() -> None:
+        executor.stop_app()
+        time.sleep(3.0)
+        executor.launch_app()
+
     login_flows = ProfiledLoginFlowFactory(
         credential_profiles,
         lambda runtime_context: build_login_agent(
@@ -279,6 +292,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             observer=observer,
             foreground_check=executor.is_foreground,
             runtime_context=runtime_context,
+        ),
+        flow_builder=lambda agent: SharedLoginFlow(
+            agent,
+            loading_recovery=recover_login_loading,
         ),
     )
     account_session = AndroidAccountSession(

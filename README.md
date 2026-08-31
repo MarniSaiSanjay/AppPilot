@@ -236,7 +236,8 @@ workbook there, prompts to choose when several exist, and exits cleanly (code
 `2`) when none is found.
 
 For each case, the suite establishes a clean state, launches the **exact**
-deeplink via Maestro `openLink`, observes the resulting UI, and the **AI judges**
+deeplink through an Android VIEW intent over ADB, observes the resulting UI,
+and the **AI judges**
 whether it semantically satisfies the natural-language Expected Result (expected
 error/failure states count as PASS). Failed cases retry (default **2 attempts**
 total) and the suite continues to the next case, ending with a per-test report

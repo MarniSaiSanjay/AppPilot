@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 from typing import Callable, Sequence
+from urllib.parse import urlsplit
 
 try:  # package-relative (python -m src.usecases.deeplink.runner) vs top-level
     from ...apppilot.android import (
@@ -74,6 +75,10 @@ DEFAULT_VERIFY_POLL_INTERVAL_SECONDS = 2.0
 _RESEARCHER_ADD_VERBS = {"add", "get", "install"}
 
 
+class _ReplayRecoveryError(RuntimeError):
+    """A restart-and-replay recovery failed before verification could resume."""
+
+
 # --------------------------------------------------------------------------- #
 # The runner (deterministic orchestration; AI only judges)
 # --------------------------------------------------------------------------- #
@@ -113,6 +118,7 @@ class DeeplinkTestRunner:
         self._account_session = account_session
         self._profile_for_license = profile_for_license
         self._installer = installer
+        self._supported_links_prepared = False
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
         # Delegate the top-level lifecycle to the explicit orchestrator, which
@@ -158,6 +164,7 @@ class DeeplinkTestRunner:
             logtags.INSTALLED_BATCH,
         )
         self._executor.enable_supported_links(SUPPORTED_LINK_DOMAINS)
+        self._supported_links_prepared = True
 
     def prepare_account(
         self, case: DeeplinkTestCase
@@ -199,7 +206,7 @@ class DeeplinkTestRunner:
             self._installer.open()
 
     def run_installed_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        """Run a single INSTALLED case (kill -> wait 2s -> reopen retry)."""
+        """Run an INSTALLED case with ready-state restoration on retry."""
         try:
             return self._run_attempts(
                 case, logtags.INSTALLED, self._installed_prepare(case)
@@ -218,15 +225,17 @@ class DeeplinkTestRunner:
                 )
 
     def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        """Run a single UNINSTALLED first-open case (fresh state every attempt)."""
+        """Run an UNINSTALLED first-open case with phase-aware retries."""
+        prepare, invalidate_recovery = self._uninstalled_prepare(case)
         return self._run_attempts(
             case,
             logtags.UNINSTALLED,
-            self._uninstalled_prepare(case),
+            prepare,
             on_start=lambda: logtags.trace(
                 f"{case.test_id} first-open flow - warm-up not applicable",
                 logtags.UNINSTALLED,
             ),
+            on_replay_recovery_failure=invalidate_recovery,
         )
 
     def _verify(self, case: DeeplinkTestCase, attempt: int):
@@ -243,27 +252,40 @@ class DeeplinkTestRunner:
         """
         deadline = self._monotonic() + self._verify_timeout_seconds
         researcher_add_attempted = False
+        transient_recovery_used = False
         while True:
             logtags.trace(
                 f"{case.test_id} attempt "
                 f"{attempt}/{self._max_attempts}: checking expected result",
                 logtags.VERIFY,
             )
-            observation = self._observer.observe()
-            if not researcher_add_attempted and (
-                add_researcher := self._find_researcher_add_control(observation)
-            ) is not None:
-                logtags.trace(
-                    f"{case.test_id}: adding Researcher agent",
-                    logtags.VERIFY,
-                )
-                self._executor.execute(
-                    Action(ActionKind.TAP, target_id=add_researcher.element_id),
-                    observation,
-                )
-                researcher_add_attempted = True
+            try:
+                observation = self._observer.observe()
+                if not researcher_add_attempted and (
+                    add_researcher := self._find_researcher_add_control(observation)
+                ) is not None:
+                    logtags.trace(
+                        f"{case.test_id}: adding Researcher agent",
+                        logtags.VERIFY,
+                    )
+                    self._executor.execute(
+                        Action(ActionKind.TAP, target_id=add_researcher.element_id),
+                        observation,
+                    )
+                    researcher_add_attempted = True
+                    deadline = self._monotonic() + self._verify_timeout_seconds
+                    self._sleep(self._verify_poll_interval_seconds)
+                    continue
+            except AndroidOperationalError as exc:
+                if (
+                    transient_recovery_used
+                    or not self._can_restart_and_replay(case)
+                ):
+                    raise
+                self._recover_transient_attempt(case, str(exc))
+                transient_recovery_used = True
+                researcher_add_attempted = False
                 deadline = self._monotonic() + self._verify_timeout_seconds
-                self._sleep(self._verify_poll_interval_seconds)
                 continue
             verdict = self._judge.evaluate(case.expected_result, observation)
             if verdict.matched:
@@ -272,6 +294,19 @@ class DeeplinkTestRunner:
                 )
                 return verdict
             if self._monotonic() >= deadline:
+                if (
+                    not transient_recovery_used
+                    and self._can_restart_and_replay(case)
+                    and self._is_incomplete_destination(observation)
+                ):
+                    self._recover_transient_attempt(
+                        case,
+                        "expected destination shell remained incomplete",
+                    )
+                    transient_recovery_used = True
+                    researcher_add_attempted = False
+                    deadline = self._monotonic() + self._verify_timeout_seconds
+                    continue
                 logtags.trace(
                     f"{case.test_id}: verification timeout reached", logtags.VERIFY
                 )
@@ -282,6 +317,125 @@ class DeeplinkTestRunner:
                 logtags.VERIFY,
             )
             self._sleep(self._verify_poll_interval_seconds)
+
+    def _recover_transient_attempt(
+        self,
+        case: DeeplinkTestCase,
+        reason: str,
+    ) -> None:
+        """Restart once and replay the exact deeplink after a transient failure."""
+        logtags.trace(
+            f"{case.test_id}: transient recovery triggered: {reason}",
+            logtags.VERIFY,
+        )
+        try:
+            self._restart_ready_and_replay(case)
+        except CredentialConfigurationError:
+            raise
+        except RuntimeError as exc:
+            raise _ReplayRecoveryError(str(exc)) from exc
+        reset_recovery = getattr(self._observer, "reset_recovery_budget", None)
+        if callable(reset_recovery):
+            reset_recovery()
+        if self._settle_seconds:
+            self._sleep(self._settle_seconds)
+        logtags.trace(
+            f"{case.test_id}: transient recovery replayed exact deeplink",
+            logtags.VERIFY,
+        )
+
+    def _restart_ready_and_replay(self, case: DeeplinkTestCase) -> None:
+        """Restart the installed app, restore prerequisites, and replay its link."""
+        self._executor.stop_app()
+        if self._retry_wait_seconds:
+            self._sleep(self._retry_wait_seconds)
+        if self._installer is not None:
+            self._installer.open()
+        else:
+            self._executor.launch_app()
+        self._ensure_login_after_restart(case)
+        self._prepare_supported_link_if_needed(case.deep_link)
+        self._executor.open_link(case.deep_link)
+
+    def _ensure_login_after_restart(self, case: DeeplinkTestCase) -> None:
+        """Confirm readiness after restart and act only when login is required."""
+        login_flow = self._login_flow_for_case(case)
+        if login_flow is None:
+            return
+        logtags.trace(
+            f"{case.test_id}: checking login after restart",
+            logtags.VERIFY,
+        )
+        ensure_without_relaunch = getattr(
+            login_flow, "ensure_ready_without_relaunch", None
+        )
+        login_ready = (
+            ensure_without_relaunch()
+            if callable(ensure_without_relaunch)
+            else login_flow.ensure_ready()
+        )
+        if not login_ready:
+            reason = getattr(login_flow, "last_failure_reason", None)
+            detail = f": {reason}" if reason else ""
+            raise AndroidOperationalError(
+                f"login preparation failed after restart{detail}"
+            )
+
+    def _prepare_supported_link_if_needed(self, deep_link: str) -> None:
+        if (
+            self._needs_supported_link_replay(deep_link)
+            and not self._supported_links_prepared
+        ):
+            self._executor.enable_supported_links(SUPPORTED_LINK_DOMAINS)
+            self._supported_links_prepared = True
+
+    def _can_restart_and_replay(self, case: DeeplinkTestCase) -> bool:
+        return case.installed or self._needs_supported_link_replay(case.deep_link)
+
+    @staticmethod
+    def _is_incomplete_destination(observation: UIObservation) -> bool:
+        """Recognize an app shell that has not produced an interactive composer."""
+        if any(element.is_input for element in observation.elements):
+            return False
+        destination_labels = {"new chat", "chat", "cowork", "researcher"}
+        has_destination = False
+        has_incomplete_signal = False
+        has_blocking_control = False
+        for element in observation.elements:
+            selector_text = element.selector_text
+            parts = (
+                selector_text.split("|")
+                if selector_text == element.label
+                else (selector_text,)
+            )
+            labels = {
+                " ".join(part.casefold().split())
+                for part in parts
+                if part.strip()
+            }
+            if (
+                element.enabled
+                and element.clickable
+                and any(label.startswith("message copilot") for label in labels)
+            ):
+                return False
+            loading_labels = {
+                label for label in labels if label.startswith("loading")
+            }
+            has_destination |= bool(labels & destination_labels)
+            has_incomplete_signal |= "new chat" in labels or bool(loading_labels)
+            shell_labels = destination_labels | loading_labels
+            has_blocking_control |= (
+                element.enabled
+                and element.clickable
+                and bool(labels)
+                and not labels <= shell_labels
+            )
+        return (
+            has_destination
+            and has_incomplete_signal
+            and not has_blocking_control
+        )
 
     @staticmethod
     def _find_researcher_add_control(
@@ -311,6 +465,7 @@ class DeeplinkTestRunner:
         label: str,
         prepare: Callable[[int], None],
         on_start: "Callable[[], None] | None" = None,
+        on_replay_recovery_failure: "Callable[[], None] | None" = None,
     ) -> TestCaseResult:
         """Generic attempt loop shared by every scenario.
 
@@ -357,6 +512,21 @@ class DeeplinkTestRunner:
             logtags.trace(f"{case.test_id} verifying deeplink expected result", label)
             try:
                 verdict = self._verify(case, attempt)
+            except _ReplayRecoveryError as exc:
+                if on_replay_recovery_failure is not None:
+                    on_replay_recovery_failure()
+                logtags.trace(
+                    f"{case.test_id} verification recovery failed: {exc}",
+                    label,
+                )
+                result.attempts.append(
+                    AttemptResult(
+                        attempt=attempt,
+                        matched=False,
+                        reason=f"verification recovery failed: {exc}",
+                    )
+                )
+                continue
             except (
                 AndroidOperationalError,
                 ExpectationJudgeOperationalError,
@@ -394,37 +564,63 @@ class DeeplinkTestRunner:
 
     def _installed_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
         def prepare(attempt: int) -> None:
-            if attempt > 1:  # retry recipe: kill -> wait -> reopen the same deeplink
-                logtags.trace(f"{case.test_id} retry: stopping app", logtags.INSTALLED)
-                self._executor.stop_app()
+            if attempt > 1:
                 logtags.trace(
-                    f"{case.test_id} retry: "
-                    f"waiting {self._retry_wait_seconds:g}s",
+                    f"{case.test_id} retry: rebuilding ready app state",
                     logtags.INSTALLED,
                 )
-                self._sleep(self._retry_wait_seconds)
-                logtags.trace(
-                    f"{case.test_id} retry: reopening same deeplink",
-                    logtags.INSTALLED,
-                )
-            else:
-                logtags.trace(f"{case.test_id} opening deeplink", logtags.INSTALLED)
+                self._restart_ready_and_replay(case)
+                return
+            logtags.trace(f"{case.test_id} opening deeplink", logtags.INSTALLED)
             self._executor.open_link(case.deep_link)
 
         return prepare
 
-    def _uninstalled_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
-        login_flow: LoginCapability | None = None
-        login_flow_selected = False
+    def _uninstalled_prepare(
+        self, case: DeeplinkTestCase
+    ) -> tuple[Callable[[int], None], Callable[[], None]]:
+        login_flow = self._login_flow_for_case(case)
+        replay_supported_link = (
+            self._installer is not None and self._can_restart_and_replay(case)
+        )
+        login_completed = False
+        restart_replay_failed = False
+
+        def invalidate_recovery() -> None:
+            nonlocal login_completed, restart_replay_failed
+            login_completed = False
+            restart_replay_failed = True
 
         def prepare(attempt: int) -> None:
-            nonlocal login_flow, login_flow_selected
-            if not login_flow_selected:
-                login_flow = self._login_flow_for_case(case)
-                login_flow_selected = True
-            if attempt > 1:  # every retry rebuilds genuine fresh state
+            nonlocal login_completed, restart_replay_failed
+            if attempt > 1 and login_completed and replay_supported_link:
                 logtags.trace(
-                    f"{case.test_id} retry: recreating fresh-install state",
+                    f"{case.test_id} retry: preserving authenticated install",
+                    logtags.UNINSTALLED,
+                )
+                try:
+                    self._restart_ready_and_replay(case)
+                except CredentialConfigurationError:
+                    raise
+                except RuntimeError:
+                    invalidate_recovery()
+                else:
+                    logtags.trace(
+                        f"{case.test_id} retry: replayed exact deeplink",
+                        logtags.UNINSTALLED,
+                    )
+                    return
+            if attempt > 1:
+                retry_reason = (
+                    "restart-and-replay recovery failed"
+                    if restart_replay_failed
+                    else "login was not completed"
+                    if not login_completed
+                    else "the deferred link cannot be replayed"
+                )
+                logtags.trace(
+                    f"{case.test_id} retry: {retry_reason}; "
+                    "recreating fresh-install state",
                     logtags.UNINSTALLED,
                 )
             if self._installer is not None:
@@ -433,6 +629,7 @@ class DeeplinkTestRunner:
                     logtags.UNINSTALLED,
                 )
                 self._installer.ensure_absent()
+                self._supported_links_prepared = False
                 logtags.trace(f"{case.test_id} app is uninstalled", logtags.UNINSTALLED)
             # 1) The EXACT deeplink routes to the store window while absent.
             logtags.trace(f"{case.test_id} opening deeplink", logtags.UNINSTALLED)
@@ -458,17 +655,73 @@ class DeeplinkTestRunner:
                 # On login failure, raise into the per-attempt setup-failure path
                 # (failed attempt -> skip _verify() -> retry fresh / else FAIL)
                 # instead of reporting ready.
-                if not login_flow.ensure_ready():
-                    logtags.trace(f"{case.test_id} login failed", logtags.UNINSTALLED)
+                # Relaunch recovery is safe when this attempt will replay the
+                # exact supported link after login. Other URLs still depend on
+                # the store's deferred handoff and must not relaunch.
+                if replay_supported_link:
+                    login_ready = login_flow.ensure_ready()
+                else:
+                    ensure_without_relaunch = getattr(
+                        login_flow, "ensure_ready_without_relaunch", None
+                    )
+                    login_ready = (
+                        ensure_without_relaunch()
+                        if callable(ensure_without_relaunch)
+                        else login_flow.ensure_ready()
+                    )
+                if not login_ready:
+                    failure_reason = getattr(
+                        login_flow, "last_failure_reason", None
+                    )
+                    detail = (
+                        f"login preparation failed: {failure_reason}"
+                        if failure_reason
+                        else "login preparation failed"
+                    )
+                    logtags.trace(
+                        f"{case.test_id} {detail}", logtags.UNINSTALLED
+                    )
                     logtags.trace(
                         f"{case.test_id} skipping deeplink verification",
                         logtags.UNINSTALLED,
                     )
-                    raise RuntimeError("login preparation failed")
+                    raise RuntimeError(detail)
+                if (
+                    getattr(login_flow, "restarted_last_run", False)
+                    and not replay_supported_link
+                ):
+                    raise RuntimeError(
+                        "login recovery invalidated deferred deeplink"
+                    )
                 logtags.trace(f"{case.test_id} login ready", logtags.UNINSTALLED)
+            login_completed = True
+            restart_replay_failed = False
+            if replay_supported_link:
+                # Android cannot associate an App Link with a package that was
+                # absent when the original URL opened. After installation and
+                # login, approve the declared domain and replay the exact URL so
+                # the destination intent reaches the app instead of Chrome.
                 logtags.trace(
-                    f"{case.test_id} handing current UI to deeplink verification",
+                    f"{case.test_id} enabling supported-link handoff",
                     logtags.UNINSTALLED,
                 )
+                self._prepare_supported_link_if_needed(case.deep_link)
+                logtags.trace(
+                    f"{case.test_id} replaying exact deeplink after login",
+                    logtags.UNINSTALLED,
+                )
+                self._executor.open_link(case.deep_link)
+            logtags.trace(
+                f"{case.test_id} handing current UI to deeplink verification",
+                logtags.UNINSTALLED,
+            )
 
-        return prepare
+        return prepare, invalidate_recovery
+
+    @staticmethod
+    def _needs_supported_link_replay(deep_link: str) -> bool:
+        hostname = (urlsplit(deep_link).hostname or "").casefold()
+        return any(
+            hostname == domain.casefold()
+            for domain in SUPPORTED_LINK_DOMAINS
+        )

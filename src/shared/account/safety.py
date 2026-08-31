@@ -90,9 +90,17 @@ class AccountSafetyValidator:
         elif purpose == AccountActionPurpose.SETTINGS_ACCOUNT:
             allowed = self._is_settings_account(target)
         elif purpose == AccountActionPurpose.EXISTING_ACCOUNT:
-            allowed = _matches_identifier(target, target_identifier)
+            allowed = _matches_identifier(target, target_identifier) or any(
+                _matches_identifier(item, target_identifier)
+                and self._is_descendant(item, target, observation)
+                for item in observation.elements
+            )
         elif purpose == AccountActionPurpose.ADD_ACCOUNT:
-            allowed = self._is_add_account(target)
+            allowed = self._is_add_account(target) or any(
+                self._is_add_account(item)
+                and self._is_descendant(item, target, observation)
+                for item in observation.elements
+            )
         elif purpose == AccountActionPurpose.OVERLAY_PERMISSION:
             allowed = self._is_overlay_enable(target, observation)
         else:

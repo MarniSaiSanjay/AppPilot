@@ -171,10 +171,27 @@ class AndroidAccountSession:
         observation = self._observer.observe()
         if self._is_overlay_settings(observation):
             overlay_control = self._find_overlay_switch(observation)
+            for _ in range(2):
+                if overlay_control is not None:
+                    break
+                # Android Settings can expose the page title before its switch
+                # has appeared in the accessibility hierarchy.
+                self._sleep(self._settle_seconds)
+                observation = self._observer.observe()
+                if not self._is_overlay_settings(observation):
+                    return observation
+                overlay_control = self._find_overlay_switch(observation)
             if overlay_control is None:
-                raise _NavigationError(
-                    "overlay permission state is unavailable"
+                # Permission state is not required to identify or verify the
+                # requested account. Leave Settings and let the existing
+                # account-sheet and final active-account checks decide.
+                self._execute(
+                    observation,
+                    Action(ActionKind.PRESS_BACK),
+                    AccountActionPurpose.OVERLAY_BACK,
                 )
+                self._sleep(self._settle_seconds)
+                return self._observer.observe()
             switch, enabled = overlay_control
             if not enabled:
                 self._tap(

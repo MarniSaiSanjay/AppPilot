@@ -205,7 +205,7 @@ Its per-case shape is deliberately narrow (a single launch + observe + judge,
 not the action loop):
 
 ```
-Excel test case  ->  launch EXACT deeplink (Maestro openLink, deterministic)
+Excel test case  ->  launch EXACT deeplink (ADB VIEW intent, deterministic)
                  ->  observe resulting UI (UIAutomator, Maestro fallback)
                  ->  AI judges observed-vs-Expected-Result (semantic)
                  ->  PASS, or kill + wait 2s + relaunch (deterministic retry)
@@ -243,14 +243,14 @@ The Excel has four required fields (Test ID, Deep Link, License, Expected
 Result) and an optional Installed field. Recognized headers may be reordered;
 otherwise columns A-D are used.
 
-## Maestro as the execution layer
+## Android execution layer
 
-Maestro is used purely as the UI **execution layer**: the agent observes the UI,
-the model chooses one action, and the agent drives Maestro to perform that single
-action before observing again. The agent does **not** execute any prewritten
-Maestro flow. Login, onboarding, and unexpected interruptions are all handled by
-reasoning over the current UI and issuing individual Maestro actions, with the
-goal coming from the test.
+ADB handles high-frequency deterministic operations such as deeplink dispatch,
+app launch/stop, coordinate taps, and Back. Maestro is reserved for hierarchy
+fallback, selector-only controls, store-button interaction, and secure password
+entry. The agent does **not** execute any prewritten end-to-end Maestro flow.
+Login, onboarding, and unexpected interruptions are handled by reasoning over
+the current UI and issuing one validated action at a time.
 
 ## Prototype execution
 
