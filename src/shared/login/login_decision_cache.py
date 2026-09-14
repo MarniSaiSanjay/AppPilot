@@ -77,6 +77,13 @@ class LoginDecisionCache(AdaptiveDecisionCache):
             if match is not None:
                 return match
 
+        match = self._unique_matching_resource_tap(
+            request,
+            ("permission_deny",),
+        )
+        if match is not None:
+            return match
+
         for phrases in (
             ("use your password", "use password instead"),
             ("continue with microsoft",),
@@ -102,6 +109,12 @@ class LoginDecisionCache(AdaptiveDecisionCache):
         for screen_markers, control_phrases in (
             (("microsoft respects your privacy",), ("next",)),
             (("your privacy option",), ("close", "ok", "got it")),
+            (
+                ("your privacy matters", "diagnostic data for microsoft 365"),
+                ("ok",),
+            ),
+            (("privacy settings applied",), ("ok",)),
+            (("meet the latest copilot",), ("continue",)),
             (
                 ("getting better together",),
                 ("don't send optional data", "don’t send optional data"),
@@ -164,6 +177,25 @@ class LoginDecisionCache(AdaptiveDecisionCache):
 
         return cls._unique(
             action for action in request.available_actions if is_submit(action)
+        )
+
+    @classmethod
+    def _unique_matching_resource_tap(
+        cls,
+        request: DecisionRequest,
+        markers: tuple[str, ...],
+    ) -> Action | None:
+        return cls._unique(
+            action
+            for action in request.available_actions
+            if action.kind == ActionKind.TAP
+            and (
+                target := request.observation.find(action.target_id)
+            ) is not None
+            and any(
+                marker in target.resource_id.casefold()
+                for marker in markers
+            )
         )
 
     @staticmethod

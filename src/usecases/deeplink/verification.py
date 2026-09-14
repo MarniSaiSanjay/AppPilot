@@ -110,9 +110,14 @@ class LLMExpectationJudge:
     ) -> None:
         self._model = model
         self._client = ChatModelClient(
-            model=model, api_key=api_key, base_url=base_url, timeout=timeout
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
         )
         self._transport = transport or self._http_transport
+        self._cache_key: tuple | None = None
+        self._cache_val: ExpectationVerdict | None = None
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "LLMExpectationJudge | None":
@@ -124,6 +129,9 @@ class LLMExpectationJudge:
     def evaluate(
         self, expected_result: str, observation: UIObservation
     ) -> ExpectationVerdict:
+        cache_key = (expected_result, self._fingerprint(observation))
+        if self._cache_key == cache_key and self._cache_val is not None:
+            return self._cache_val
         payload = {
             "model": self._model,
             "temperature": 0,
@@ -148,7 +156,26 @@ class LLMExpectationJudge:
                 reason="Judge response field 'match' must be a JSON boolean.",
             )
         reason = str(decoded.get("reason") or "").strip() or "(no reason given)"
-        return ExpectationVerdict(matched=matched, reason=reason)
+        verdict = ExpectationVerdict(matched=matched, reason=reason)
+        self._cache_key = cache_key
+        self._cache_val = verdict
+        return verdict
+
+    @staticmethod
+    def _fingerprint(observation: UIObservation) -> tuple:
+        return tuple(
+            sorted(
+                (
+                    element.label,
+                    element.resource_id,
+                    element.class_name,
+                    element.clickable,
+                    element.enabled,
+                    element.is_input,
+                )
+                for element in observation.elements
+            )
+        )
 
     @staticmethod
     def _render(expected_result: str, observation: UIObservation) -> str:

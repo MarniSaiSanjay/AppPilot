@@ -21,6 +21,29 @@ class CredentialKind(str, Enum):
     PASSWORD = "password"
 
 
+class CredentialInputMethod(str, Enum):
+    """Local mechanism used to enter a configured credential."""
+
+    ADB = "adb"
+    CLIPBOARD = "clipboard"
+
+
+class CredentialVerificationStatus(str, Enum):
+    """Secret-free result from checking a pending credential input locally."""
+
+    MATCHED = "matched"
+    MISMATCHED = "mismatched"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class CredentialVerification:
+    kind: CredentialKind
+    field_id: str
+    element_id: str | None
+    status: CredentialVerificationStatus
+
+
 @dataclass(frozen=True)
 class UIElement:
     element_id: str
@@ -62,6 +85,7 @@ class UIElement:
 @dataclass(frozen=True)
 class UIObservation:
     elements: tuple[UIElement, ...]
+    credential_verification: CredentialVerification | None = None
 
     def find(self, element_id: str | None) -> UIElement | None:
         if element_id is None:

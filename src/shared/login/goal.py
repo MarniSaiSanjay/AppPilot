@@ -9,18 +9,28 @@ about Deeplink, FRI, or any specific use case.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import re
+from pathlib import Path
 from typing import Callable
 
 try:  # package-relative (python -m src.shared.login.goal) vs top-level (src on path)
+    from ...apppilot import logtags
     from ...apppilot.models import UIElement, UIObservation
     from ...apppilot.safety import infer_credential_kind
     from ..model_client import ChatModelClient, ModelTransportError, DEFAULT_BASE_URL
 except ImportError:
+    from apppilot import logtags
     from apppilot.models import UIElement, UIObservation
     from apppilot.safety import infer_credential_kind
     from shared.model_client import ChatModelClient, ModelTransportError, DEFAULT_BASE_URL
 
+
+_LOGIN_GOAL_CACHE_VERSION = 2
+_DEFAULT_MAX_LOGIN_GOAL_CACHE_ENTRIES = 200
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 # The agent reasons over the observed UI and drives Maestro action-by-action;
@@ -112,6 +122,7 @@ class SignedInCopilotGoalEvaluator:
         "common_auth_webview",
     )
     _AUTH_LOADING_TEXT = ("looking for accounts", "reviewing accounts")
+    _SAFE_PERMISSION_DISMISS_RESOURCE = ("permission_deny",)
     # Explicit negative authentication terminals: restricted/denied access,
     # blocked/disabled accounts and outright sign-in failures. These are NOT a
     # successful login - the login form merely disappearing behind such a screen
@@ -168,6 +179,10 @@ class SignedInCopilotGoalEvaluator:
     _REQUIRED_ONBOARDING = (
         "microsoft respects your privacy",
         "your privacy option",
+        "your privacy matters",
+        "diagnostic data for microsoft 365",
+        "privacy settings applied",
+        "meet the latest copilot",
         "getting better together",
         "powering your experiences",
         "don't miss anything",
@@ -232,6 +247,11 @@ class SignedInCopilotGoalEvaluator:
         self, observation: UIObservation
     ) -> "bool | None":
         """Return whether a definite login step exists, or None if ambiguous."""
+        if self._matches(
+            observation,
+            resource=self._SAFE_PERMISSION_DISMISS_RESOURCE,
+        ):
+            return True
         if self._foreground_check is not None and not self._foreground_check():
             return False
         if self._auth_webview_shell(observation):
@@ -271,6 +291,11 @@ class SignedInCopilotGoalEvaluator:
         handled by ``is_reached`` returning True before the wait-gate runs, so
         here a step exists iff the screen is a login BLOCKER. If the target app is
         not yet foreground, there is nothing to act on - wait."""
+        if self._matches(
+            observation,
+            resource=self._SAFE_PERMISSION_DISMISS_RESOURCE,
+        ):
+            return True
         if self._foreground_check is not None and not self._foreground_check():
             return False
         return self._blocked(observation)
@@ -473,20 +498,40 @@ class LLMLoginGoalEvaluator:
         foreground_check: "Callable[[], bool] | None" = None,
         transport: "Callable[[dict], dict] | None" = None,
         timeout: float = 60.0,
+        cache_path: "Path | None" = None,
+        max_cache_entries: int = _DEFAULT_MAX_LOGIN_GOAL_CACHE_ENTRIES,
     ) -> None:
         self._client = ChatModelClient(
-            model=model, api_key=api_key, base_url=base_url, timeout=timeout
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
         )
         self._model = model
         self._foreground_check = foreground_check
         self._transport = transport or self._http_transport
-        # 1-entry cache so is_reached() and has_actionable_step(), which the agent
-        # calls on the SAME observation each step, share ONE model call. Keyed by
-        # a stable, secret-free fingerprint of the screen.
+        self._cache_path = cache_path or self._default_cache_path()
+        self._max_cache_entries = max(1, max_cache_entries)
+        self._persistent_cache = self._load_cache()
+        self._pending_cache: dict[str, dict[str, bool]] = {}
+        # 1-entry cache for repeated evaluation of the same goal and observation.
+        # The goal remains part of the key because is_reached() and
+        # has_actionable_step() intentionally render different prompts.
         self._cache_key: tuple | None = None
         self._cache_val: dict | None = None
 
     def begin_run(self) -> None:
+        self._cache_key = None
+        self._cache_val = None
+        self._pending_cache.clear()
+
+    def finish_run(self, succeeded: bool) -> None:
+        if succeeded and self._pending_cache:
+            self._persistent_cache.update(self._pending_cache)
+            while len(self._persistent_cache) > self._max_cache_entries:
+                self._persistent_cache.pop(next(iter(self._persistent_cache)))
+            self._save_cache()
+        self._pending_cache.clear()
         self._cache_key = None
         self._cache_val = None
 
@@ -531,12 +576,25 @@ class LLMLoginGoalEvaluator:
         return bool(verdict.get("actionable_step")) or bool(verdict.get("reached"))
 
     def _evaluate(self, goal: str, observation: UIObservation) -> dict:
-        key = self._fingerprint(observation)
+        fingerprint = self._fingerprint(observation)
+        key = (goal, fingerprint)
         if self._cache_key == key and self._cache_val is not None:
             return self._cache_val
+        persistent_key = self._persistent_key(goal, fingerprint)
+        persisted = self._pending_cache.get(
+            persistent_key,
+            self._persistent_cache.get(persistent_key),
+        )
+        if persisted is not None:
+            self._cache_key = key
+            self._cache_val = dict(persisted)
+            return self._cache_val
         verdict = self._request(goal, observation)
+        cacheable = verdict.pop("_cacheable", False) is True
         self._cache_key = key
         self._cache_val = verdict
+        if cacheable:
+            self._pending_cache[persistent_key] = dict(verdict)
         return verdict
 
     def _request(self, goal: str, observation: UIObservation) -> dict:
@@ -558,21 +616,124 @@ class LLMLoginGoalEvaluator:
             # actionable_step=True so a transient judge/transport failure does not
             # trap a real sign-in screen in the wait loop - the Brain (a separate
             # model) can still be asked to drive login, as it was before.
-            return {"reached": False, "actionable_step": True}
+            return {
+                "reached": False,
+                "actionable_step": True,
+                "_cacheable": False,
+            }
         reached = decoded.get("reached")
         actionable_step = decoded.get("actionable_step")
         if type(reached) is not bool or type(actionable_step) is not bool:
-            return {"reached": False, "actionable_step": False}
-        return {"reached": reached, "actionable_step": actionable_step}
+            return {
+                "reached": False,
+                "actionable_step": False,
+                "_cacheable": False,
+            }
+        return {
+            "reached": reached,
+            "actionable_step": actionable_step,
+            "_cacheable": True,
+        }
 
     @staticmethod
     def _fingerprint(observation: UIObservation) -> tuple:
         # Stable, secret-free screen signature (credential values are already
         # redacted by the observer). Identical screens reuse one verdict.
         return tuple(
-            (element.resource_id, element.label, element.clickable, element.is_input)
+            (
+                element.element_id,
+                element.parent_id,
+                element.resource_id,
+                element.label,
+                element.clickable,
+                element.enabled,
+                element.is_input,
+            )
             for element in observation.elements
         )
+
+    def _persistent_key(self, goal: str, fingerprint: tuple) -> str:
+        raw = json.dumps(
+            {
+                "version": _LOGIN_GOAL_CACHE_VERSION,
+                "model": self._model,
+                "goal": goal,
+                "fingerprint": fingerprint,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def _default_cache_path() -> Path:
+        root = Path(
+            os.environ.get(
+                "XDG_CACHE_HOME",
+                Path.home() / ".cache",
+            )
+        )
+        return (
+            root
+            / "apppilot"
+            / f"login-goal-verdicts-v{_LOGIN_GOAL_CACHE_VERSION}.json"
+        )
+
+    def _load_cache(self) -> dict[str, dict[str, bool]]:
+        if not self._cache_path.exists():
+            return {}
+        try:
+            payload = json.loads(self._cache_path.read_text(encoding="utf-8"))
+            entries = payload.get("entries", {})
+            if (
+                payload.get("version") != _LOGIN_GOAL_CACHE_VERSION
+                or not isinstance(entries, dict)
+            ):
+                raise ValueError("unsupported cache format")
+            return {
+                key: {
+                    "reached": value["reached"],
+                    "actionable_step": value["actionable_step"],
+                }
+                for key, value in entries.items()
+                if isinstance(key, str)
+                and _SHA256.fullmatch(key)
+                and isinstance(value, dict)
+                and type(value.get("reached")) is bool
+                and type(value.get("actionable_step")) is bool
+            }
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as error:
+            logtags.trace(
+                f"login goal cache ignored: {error}",
+                logtags.LOGIN,
+            )
+            return {}
+
+    def _save_cache(self) -> None:
+        try:
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._cache_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "version": _LOGIN_GOAL_CACHE_VERSION,
+                        "entries": self._persistent_cache,
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            temporary.replace(self._cache_path)
+        except (OSError, UnicodeError) as error:
+            logtags.trace(
+                f"login goal cache was not saved: {error}",
+                logtags.LOGIN,
+            )
 
     @staticmethod
     def _render(goal: str, observation: UIObservation) -> str:
@@ -619,6 +780,10 @@ class AuthoritativeLoginGoalEvaluator:
         self._confirming_current_observation = False
         if self._semantic is not None:
             self._semantic.begin_run()
+
+    def finish_run(self, succeeded: bool) -> None:
+        if self._semantic is not None:
+            self._semantic.finish_run(succeeded)
 
     def is_reached(self, goal: str, observation: UIObservation) -> bool:
         self._confirming_current_observation = False
@@ -683,7 +848,10 @@ class SemanticStateEvaluator:
         timeout: float = 60.0,
     ) -> None:
         self._client = ChatModelClient(
-            model=model, api_key=api_key, base_url=base_url, timeout=timeout
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
         )
         self._model = model
         self._transport = transport or self._http_transport

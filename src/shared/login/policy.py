@@ -108,6 +108,12 @@ class CompositeTerminalEvaluator:
             if callable(begin):
                 begin()
 
+    def finish_run(self, succeeded: bool) -> None:
+        for terminal in self._terminals:
+            finish = getattr(terminal, "finish_run", None)
+            if callable(finish):
+                finish(succeeded)
+
     def is_reached(self, goal: str, observation: object) -> bool:
         for terminal in self._terminals:
             if terminal.is_reached(goal, observation):

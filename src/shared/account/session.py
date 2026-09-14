@@ -105,7 +105,13 @@ class AndroidAccountSession:
                 kind = AccountPreparationKind.SWITCHED
             else:
                 add_account = self._find_text_control(
-                    sheet, ("add an account", "add account")
+                    sheet,
+                    (
+                        "add an account",
+                        "add account",
+                        "sign in with another account",
+                        "use another account",
+                    ),
                 )
                 if add_account is None:
                     raise _NavigationError("account sheet has no add action")
@@ -130,18 +136,23 @@ class AndroidAccountSession:
             return AccountPreparationResult.ready(kind)
         except _NavigationError as error:
             return AccountPreparationResult.failed(str(error))
-        except RuntimeError:
+        except RuntimeError as error:
             return AccountPreparationResult.failed(
-                "account navigation failed"
+                f"account navigation failed: {error}"
             )
 
     def _open_settings(self) -> UIObservation:
         home = self._observer.observe()
-        menu = self._find_text_control(
+        menu = self._find_exact_text_control(
             home, ("menu", "navigation menu", "open navigation")
         )
         if menu is None:
-            raise _NavigationError("home menu is unavailable")
+            # The newer Copilot home replaces the hamburger menu with a bottom
+            # navigation "More" destination. It leads to the same account/profile
+            # entry used to switch the active account.
+            menu = self._find_exact_text_control(home, ("more",))
+        if menu is None:
+            raise _NavigationError("home menu or More navigation is unavailable")
         self._tap(home, menu, AccountActionPurpose.MENU)
         self._sleep(self._settle_seconds)
 
@@ -243,7 +254,11 @@ class AndroidAccountSession:
             )
         except ValueError as error:
             raise _NavigationError(str(error)) from error
-        self._executor.execute(action, observation)
+        execute = self._executor.execute
+        execute_fast = getattr(self._executor, "execute_fast", None)
+        if callable(execute_fast):
+            execute = execute_fast
+        execute(action, observation)
 
     @staticmethod
     def _contains(observation: UIObservation, value: str) -> bool:
@@ -268,6 +283,43 @@ class AndroidAccountSession:
         for element in observation.elements:
             text = _element_text(element)
             if any(label == text or label in text for label in normalized):
+                control = cls._clickable_ancestor(observation, element)
+                if control is not None:
+                    return control
+        return None
+
+    @classmethod
+    def _find_exact_text_control(
+        cls,
+        observation: UIObservation,
+        labels: tuple[str, ...],
+    ) -> UIElement | None:
+        normalized = tuple(label.casefold() for label in labels)
+        for element in observation.elements:
+            values = (
+                element.text,
+                element.accessibility_text,
+                element.hint_text,
+                element.label,
+            )
+            if element.enabled and element.clickable and any(
+                value.strip().casefold() in normalized
+                for value in values
+                if value
+            ):
+                return element
+        for element in observation.elements:
+            values = (
+                element.text,
+                element.accessibility_text,
+                element.hint_text,
+                element.label,
+            )
+            if any(
+                value.strip().casefold() in normalized
+                for value in values
+                if value
+            ):
                 control = cls._clickable_ancestor(observation, element)
                 if control is not None:
                     return control
@@ -306,6 +358,11 @@ class AndroidAccountSession:
     def _find_drawer_account_row(
         self, observation: UIObservation
     ) -> UIElement | None:
+        explicit = self._find_exact_text_control(
+            observation, ("account", "profile", "settings")
+        )
+        if explicit is not None and not self._safety.is_prohibited(explicit):
+            return explicit
         candidates = [
             element
             for element in observation.elements
@@ -315,9 +372,7 @@ class AndroidAccountSession:
             and not self._safety.is_prohibited(element)
         ]
         if not candidates:
-            return self._find_text_control(
-                observation, ("account", "profile")
-            )
+            return None
         return max(
             candidates,
             key=lambda element: (

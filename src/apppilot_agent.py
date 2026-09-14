@@ -29,7 +29,6 @@ try:  # package-relative (python -m src.apppilot_agent)
     from .apppilot.android import (
         APP_ID,
         AndroidOperationalError,
-        CREDENTIAL_FIELD_ERASE_CHARS,
         MAESTRO_SECRET_ENV,
         MaestroExecutor,
         MaestroHierarchyObserver,
@@ -74,7 +73,6 @@ except ImportError:  # top-level (src on sys.path)
     from apppilot.android import (
         APP_ID,
         AndroidOperationalError,
-        CREDENTIAL_FIELD_ERASE_CHARS,
         MAESTRO_SECRET_ENV,
         MaestroExecutor,
         MaestroHierarchyObserver,

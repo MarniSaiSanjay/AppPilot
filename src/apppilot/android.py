@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -14,7 +15,16 @@ from pathlib import Path
 from typing import Sequence
 
 from . import logtags
-from .models import Action, ActionKind, CredentialKind, UIElement, UIObservation
+from .models import (
+    Action,
+    ActionKind,
+    CredentialInputMethod,
+    CredentialKind,
+    CredentialVerification,
+    CredentialVerificationStatus,
+    UIElement,
+    UIObservation,
+)
 from .safety import infer_credential_kind
 
 APP_ID = "com.microsoft.office.officehubrow"
@@ -23,10 +33,6 @@ APP_ID = "com.microsoft.office.officehubrow"
 # Env var carrying a resolved secret to Maestro. The MAESTRO_ prefix lets Maestro
 # read it via ${...} interpolation, so the value never enters the YAML, argv, or logs.
 MAESTRO_SECRET_ENV = "MAESTRO_APPPILOT_INPUT_SECRET"
-
-# Characters to erase from a credential field before entry so repeats replace
-# rather than append. Generous upper bound.
-CREDENTIAL_FIELD_ERASE_CHARS = 100
 
 # Maestro spins up an on-device driver app per invocation; on a busy/slow
 # emulator it can miss its startup window. This is an infra flake, not a real
@@ -42,8 +48,9 @@ _DRIVER_STARTUP_RETRY_DELAY = 3.0
 # is often too short on a loaded emulator right after install/uninstall/build.
 _DRIVER_STARTUP_TIMEOUT_ENV = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
 _DRIVER_STARTUP_TIMEOUT_MS = "120000"
-_ADB_SAFE_USERNAME = re.compile(r"[A-Za-z0-9._+@-]+\Z")
+_ADB_SAFE_USERNAME = re.compile(r"[\x21-\x7e]+\Z")
 _ADB_USERNAME_CHARACTER_DELAY_SECONDS = 0.10
+_PASSWORD_MASK_CHARACTERS = frozenset("*•●·∙▪◦")
 _APP_LINK_DOMAIN = re.compile(
     r"(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
@@ -104,23 +111,44 @@ class MaestroHierarchyObserver:
         self._popup_unblock_settle_seconds = float(
             os.environ.get("APPPILOT_POPUP_UNBLOCK_SETTLE", "1.0")
         )
+        self._pending_credential_check: (
+            tuple[CredentialKind, str, bytes, int] | None
+        ) = None
+        self._capture_credential_verification: CredentialVerification | None = None
 
     def reset_recovery_budget(self) -> None:
         """Reset bounded blank-popup recovery for a new lifecycle attempt."""
         self._popup_unblock_budget = self._popup_unblock_budget_limit
 
+    def expect_credential(
+        self,
+        kind: CredentialKind,
+        field_id: str,
+        expected: str,
+    ) -> None:
+        """Verify one credential locally during the next normal observation."""
+        self._pending_credential_check = (
+            kind,
+            field_id,
+            hashlib.sha256(expected.encode("utf-8")).digest(),
+            len(expected),
+        )
+
     def observe(self) -> UIObservation:
         self._ensure_excluded_prefixes()
-        observation = self._capture()
-        if self._is_autofill_overlay(observation):
-            recovered = self._dismiss_autofill_overlay()
-            if recovered is not None:
-                observation = recovered
-        elif self._is_blank(observation):
-            recovered = self._unblock_blank_screen()
-            if recovered is not None:
-                observation = recovered
-        return observation
+        try:
+            observation = self._capture()
+            if self._is_autofill_overlay(observation):
+                recovered = self._dismiss_autofill_overlay()
+                if recovered is not None:
+                    observation = recovered
+            elif self._is_blank(observation):
+                recovered = self._unblock_blank_screen()
+                if recovered is not None:
+                    observation = recovered
+            return observation
+        finally:
+            self._pending_credential_check = None
 
     def reobserve(self) -> UIObservation:
         """Capture a fresh observation before executing a model decision."""
@@ -201,6 +229,7 @@ class MaestroHierarchyObserver:
             ) from error
 
         elements: list[UIElement] = []
+        self._capture_credential_verification = None
         self._collect(
             self._xml_as_maestro_node(root),
             (),
@@ -208,7 +237,7 @@ class MaestroHierarchyObserver:
             False,
             elements,
         )
-        return UIObservation(tuple(elements[: self._max_elements]))
+        return self._observation(elements)
 
     @classmethod
     def _xml_as_maestro_node(cls, element: ElementTree.Element) -> dict:
@@ -259,8 +288,24 @@ class MaestroHierarchyObserver:
             ) from error
 
         elements: list[UIElement] = []
+        self._capture_credential_verification = None
         self._collect(hierarchy, (), None, False, elements)
-        return UIObservation(tuple(elements[: self._max_elements]))
+        return self._observation(elements)
+
+    def _observation(self, elements: list[UIElement]) -> UIObservation:
+        verification = self._capture_credential_verification
+        if self._pending_credential_check is not None and verification is None:
+            kind, field_id, _, _ = self._pending_credential_check
+            verification = CredentialVerification(
+                kind=kind,
+                field_id=field_id,
+                element_id=None,
+                status=CredentialVerificationStatus.UNAVAILABLE,
+            )
+        return UIObservation(
+            tuple(elements[: self._max_elements]),
+            credential_verification=verification,
+        )
 
     @staticmethod
     def _is_blank(observation: UIObservation) -> bool:
@@ -427,6 +472,37 @@ class MaestroHierarchyObserver:
             if is_input
             else None
         )
+        if (
+            self._pending_credential_check is not None
+            and field_credential_kind is not None
+        ):
+            (
+                expected_kind,
+                expected_field_id,
+                expected_digest,
+                expected_length,
+            ) = (
+                self._pending_credential_check
+            )
+            if (
+                field_credential_kind == expected_kind
+                and expected_field_id in (resource_id, element_id)
+            ):
+                self._capture_credential_verification = CredentialVerification(
+                    kind=expected_kind,
+                    field_id=expected_field_id,
+                    element_id=element_id,
+                    status=(
+                        CredentialVerificationStatus.MATCHED
+                        if self._credential_value_matches(
+                            expected_kind,
+                            text,
+                            expected_digest,
+                            expected_length,
+                        )
+                        else CredentialVerificationStatus.MISMATCHED
+                    ),
+                )
         if field_credential_kind is not None:
             text = ""
             accessibility_text = field_credential_kind.value
@@ -471,6 +547,22 @@ class MaestroHierarchyObserver:
             )
 
         return [] if system_ui else self._unique(own_labels + child_labels)[:8]
+
+    @staticmethod
+    def _credential_value_matches(
+        kind: CredentialKind,
+        observed: str,
+        expected_digest: bytes,
+        expected_length: int,
+    ) -> bool:
+        if hashlib.sha256(observed.encode("utf-8")).digest() == expected_digest:
+            return True
+        return (
+            kind == CredentialKind.PASSWORD
+            and len(observed) == expected_length
+            and bool(observed)
+            and set(observed) <= _PASSWORD_MASK_CHARACTERS
+        )
 
     @staticmethod
     def _parse_bounds(value: object) -> "tuple[int, int, int, int] | None":
@@ -527,7 +619,7 @@ class MaestroExecutor:
         action: Action,
         observation: UIObservation,
         secret: str | None = None,
-    ) -> None:
+    ) -> CredentialInputMethod | None:
         if action.kind == ActionKind.PRESS_BACK:
             self._run_adb_checked(
                 ["shell", "input", "keyevent", "KEYCODE_BACK"],
@@ -543,8 +635,7 @@ class MaestroExecutor:
             self._tap(target, observation)
             return
         if action.kind == ActionKind.INPUT_TEXT:
-            self._input_text(action, target, secret)
-            return
+            return self._input_text(action, target, secret)
         raise ValueError(f"Unsupported action kind: {action.kind}")
 
     def execute_fast(
@@ -552,7 +643,7 @@ class MaestroExecutor:
         action: Action,
         observation: UIObservation,
         secret: str | None = None,
-    ) -> None:
+    ) -> CredentialInputMethod | None:
         """Execute an action selected from the current observation directly.
 
         Adaptive decisions have already matched the current screen and still
@@ -583,7 +674,22 @@ class MaestroExecutor:
                 return
             self._tap_point(*point)
             return
-        self.execute(action, observation, secret=secret)
+        return self.execute(action, observation, secret=secret)
+
+    def execute_credential_fallback(
+        self,
+        action: Action,
+        observation: UIObservation,
+        secret: str,
+    ) -> CredentialInputMethod:
+        """Replace one credential through the exact local clipboard path."""
+        if action.kind != ActionKind.INPUT_TEXT or action.credential_kind is None:
+            raise ValueError("Credential fallback requires a credential input action")
+        target = observation.find(action.target_id)
+        if target is None:
+            raise ValueError("Cannot replace a credential without an observed target")
+        self._input_credential_via_clipboard(target, secret)
+        return CredentialInputMethod.CLIPBOARD
 
     def open_link(self, deep_link: str) -> None:
         """Launch an exact deep link through Android's VIEW intent.
@@ -1126,7 +1232,7 @@ class MaestroExecutor:
 
     def _input_text(
         self, action: Action, target: UIElement, secret: str | None
-    ) -> None:
+    ) -> CredentialInputMethod | None:
         use_secret = secret is not None
         replace_existing = action.credential_kind is not None or use_secret
 
@@ -1144,78 +1250,42 @@ class MaestroExecutor:
             and secret is not None
             and self._input_username_via_adb(target, secret)
         ):
-            return
+            return CredentialInputMethod.ADB
 
-        # Focus + caret positioning uses one adb process, then erase + exact
-        # clipboard paste uses one Maestro process. Maestro starts and tears down
-        # its driver per invocation, so reducing 4-5 launches to 2 materially
-        # shortens every known credential step.
-        center = target.center
-        if center is not None:
-            self._focus_field_at_end(*center)
-            if kind == "flow":
-                # Starting Maestro can drop the keyboard/focus. Re-focus inside
-                # the same process as paste so the exact clipboard value lands.
-                focus_commands = payload
-            else:
-                self._run_flow(
-                    f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n"
-                )
-                self._tap_point(*center)
-                self._run_flow(
-                    f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
-                    "- pasteText\n",
-                    secret=secret,
-                )
-                self._verify_credential_field(action, target, secret)
-                return
-        else:
-            # Keep the selector fallback for observations without bounds.
-            if kind == "point":
-                raise ValueError("Observed point target has no bounds")
-            self._run_flow(payload)
-            self._move_focused_cursor_to_end()
-            focus_commands = payload
+        self._input_credential_via_clipboard(target, secret)
+        return CredentialInputMethod.CLIPBOARD
 
-        input_commands = (
-            f"- eraseText: {CREDENTIAL_FIELD_ERASE_CHARS}\n"
-            f"{focus_commands}"
-            f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
-            "- pasteText\n"
-        )
-        for _ in range(2):
-            self._run_flow(input_commands, secret=secret)
-            if self._credential_field_matches(action, target, secret):
-                return
-        raise AndroidOperationalError(
-            f"{action.credential_kind.value} input verification failed"
-        )
-
-    def _verify_credential_field(
+    def _input_credential_via_clipboard(
         self,
-        action: Action,
         target: UIElement,
-        secret: "str | None",
+        secret: str | None,
     ) -> None:
-        if (
-            action.credential_kind is not None
-            and secret is not None
-            and not self._field_text_matches(target, secret)
-        ):
-            raise AndroidOperationalError(
-                f"{action.credential_kind.value} input verification failed"
+        """Replace a credential exactly without putting its value in the flow."""
+        kind, payload = self._tap_command(target)
+        center = target.center
+        if center is None:
+            if kind != "flow":
+                raise AndroidOperationalError(
+                    "Exact credential replacement requires bounds or a selector"
+                )
+            self._run_flow(payload)
+            self._clear_focused_credential_field()
+            self._run_flow(
+                f"{payload}"
+                f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
+                "- pasteText\n",
+                secret=secret,
             )
-
-    def _credential_field_matches(
-        self,
-        action: Action,
-        target: UIElement,
-        secret: "str | None",
-    ) -> bool:
-        return (
-            action.credential_kind is None
-            or secret is None
-            or self._field_text_matches(target, secret)
+            return
+        self._clear_credential_field(*center)
+        if kind == "point":
+            x, y = center
+            payload = f'- tapOn:\n    point: "{x}, {y}"\n'
+        self._run_flow(
+            f"{payload}"
+            f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
+            "- pasteText\n",
+            secret=secret,
         )
 
     def _input_username_via_adb(
@@ -1223,11 +1293,12 @@ class MaestroExecutor:
         target: UIElement,
         username: str,
     ) -> bool:
-        """Replace a simple ASCII username through one adb process.
+        """Replace a printable ASCII username through one adb process.
 
         The value is sent over stdin to the device shell, never placed in host
-        argv. Complex or unsupported usernames return False and retain the exact
-        Maestro clipboard path.
+        argv. Unsupported usernames retain the exact Maestro clipboard path.
+        The next agent observation validates UI progress, avoiding a redundant
+        UIAutomator dump on every cached credential action.
         """
         center = target.center
         if center is None or not _ADB_SAFE_USERNAME.fullmatch(username):
@@ -1268,102 +1339,31 @@ class MaestroExecutor:
                 "adb username input failed"
                 + (f": {detail}" if detail else "")
             )
-        return self._field_text_matches(target, username)
+        return True
 
-    def _field_text_matches(
-        self,
-        target: UIElement,
-        expected: str,
-    ) -> bool:
-        """Verify native credential entry before allowing the flow to submit."""
-        if not target.resource_id:
-            return False
-        for attempt in range(2):
-            try:
-                result = subprocess.run(
-                    [
-                        "adb",
-                        "-s",
-                        self._device_id,
-                        "exec-out",
-                        "uiautomator",
-                        "dump",
-                        "/dev/tty",
-                    ],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                )
-                end = result.stdout.rfind("</hierarchy>")
-                if result.returncode != 0 or end < 0:
-                    return False
-                root = ElementTree.fromstring(
-                    result.stdout[: end + len("</hierarchy>")]
-                )
-            except (
-                OSError,
-                subprocess.SubprocessError,
-                ValueError,
-                ElementTree.ParseError,
-            ):
-                return False
-
-            fields = [
-                node
-                for node in root.iter("node")
-                if node.attrib.get("resource-id") == target.resource_id
-            ]
-            if fields:
-                return any(
-                    node.attrib.get("text") == expected
-                    for node in fields
-                )
-            labels = {
-                value
-                for node in root.iter("node")
-                for value in (
-                    node.attrib.get("text"),
-                    node.attrib.get("content-desc"),
-                )
-                if value
-            }
-            if attempt == 0 and labels == {"Autofill settings"}:
-                self._run_adb_checked(
-                    ["shell", "input", "keyevent", "4"],
-                    operation="dismiss autofill settings",
-                )
-                time.sleep(0.2)
-                continue
-            return False
-        return False
-
-    def _focus_field_at_end(self, x: int, y: int) -> None:
-        """Focus a bounded field and move its caret to the end in one adb call."""
+    def _clear_credential_field(self, x: int, y: int) -> None:
+        """Focus a bounded field and clear its current value through adb."""
         self._run_adb_checked(
             [
                 "shell",
                 "sh",
                 "-c",
-                f"input tap {x} {y} && input keyevent 123",
+                f"input tap {x} {y} && "
+                "input keycombination 113 29 && input keyevent 67",
             ],
-            operation="focus text field",
+            operation="clear credential field",
         )
 
-    def _move_focused_cursor_to_end(self) -> None:
-        """Move the caret to the end of the currently focused text field.
-
-        ``eraseText`` only deletes to the LEFT of the caret, so when the focus
-        tap lands in the middle of pre-filled text the characters to its right
-        survive - producing a garbled mix of old and new input (observed on the
-        sign-in email field). Moving the caret to the end first makes the erase
-        remove the whole field regardless of where the tap placed the caret.
-        """
-        # KEYCODE_MOVE_END (123): caret to end of the focused field, so the
-        # generous eraseText below clears everything to its left = the field.
+    def _clear_focused_credential_field(self) -> None:
+        """Clear the field already focused through a selector-only flow."""
         self._run_adb_checked(
-            ["shell", "input", "keyevent", "123"],
-            operation="move text cursor",
+            [
+                "shell",
+                "sh",
+                "-c",
+                "input keycombination 113 29 && input keyevent 67",
+            ],
+            operation="clear focused credential field",
         )
 
     def _tap_point(self, x: int, y: int) -> None:

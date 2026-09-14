@@ -125,16 +125,33 @@ class AccountSafetyValidator:
 
     @classmethod
     def _is_menu(cls, element: UIElement) -> bool:
-        text = _element_text(element)
+        allowed = ("menu", "navigation menu", "open navigation", "more")
         return any(
-            label == text or label in text
-            for label in ("menu", "navigation menu", "open navigation")
+            value.strip().casefold() in allowed
+            for value in (
+                element.text,
+                element.accessibility_text,
+                element.hint_text,
+                element.label,
+            )
+            if value
         )
 
     @classmethod
     def _is_drawer_account(
         cls, element: UIElement, observation: UIObservation
     ) -> bool:
+        if any(
+            value.strip().casefold() in ("account", "profile", "settings")
+            for value in (
+                element.text,
+                element.accessibility_text,
+                element.hint_text,
+                element.label,
+            )
+            if value
+        ):
+            return True
         bounded = [
             item
             for item in observation.elements
@@ -145,8 +162,7 @@ class AccountSafetyValidator:
         ]
         if bounded and element.bounds is not None:
             return element.bounds[3] == max(item.bounds[3] for item in bounded)
-        text = _element_text(element)
-        return "account" in text or "profile" in text
+        return False
 
     @classmethod
     def _is_settings_account(cls, element: UIElement) -> bool:
@@ -156,7 +172,15 @@ class AccountSafetyValidator:
     @classmethod
     def _is_add_account(cls, element: UIElement) -> bool:
         text = _element_text(element)
-        return "add an account" in text or "add account" in text
+        return any(
+            phrase in text
+            for phrase in (
+                "add an account",
+                "add account",
+                "sign in with another account",
+                "use another account",
+            )
+        )
 
     @classmethod
     def _is_overlay_enable(

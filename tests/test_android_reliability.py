@@ -1,25 +1,57 @@
 from __future__ import annotations
 
+import io
+import json
 import shlex
 import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.error
+from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from apppilot.android import AndroidOperationalError, MaestroExecutor
-from apppilot.models import Action, ActionKind, UIElement, UIObservation
+from apppilot.android import (
+    AndroidOperationalError,
+    MaestroExecutor,
+    MaestroHierarchyObserver,
+)
+from apppilot.agent import AppPilotAgent
+from apppilot.brain import DecisionRequest, ModelDecision
+from apppilot.models import (
+    Action,
+    ActionKind,
+    CredentialInputMethod,
+    CredentialKind,
+    CredentialVerification,
+    CredentialVerificationStatus,
+    ExecutionContext,
+    RuntimeContext,
+    UIElement,
+    UIObservation,
+)
+from apppilot.safety import SafetyValidator
 from shared.login.flow import SharedLoginFlow
-from shared.login.goal import AuthoritativeLoginGoalEvaluator
+from shared.account.session import AndroidAccountSession
+from shared.account.safety import AccountActionPurpose
+from shared.login.goal import (
+    AuthoritativeLoginGoalEvaluator,
+    LLMLoginGoalEvaluator,
+    SignedInCopilotGoalEvaluator,
+)
+from shared.login.login_decision_cache import LoginDecisionCache
 from shared.model_client import ChatModelClient, ModelTransportError
 from usecases.deeplink.deeplink_testcase_loader import DeeplinkTestCase
 from usecases.deeplink.grouping import LicenseCaseGroup
 from usecases.deeplink.orchestrator import DeeplinkSuiteOrchestrator
 from usecases.deeplink.results import SuiteReport
 from usecases.deeplink.runner import DeeplinkTestRunner
+from usecases.deeplink.supported_links import SUPPORTED_LINK_DOMAINS
+from usecases.deeplink.verification import LLMExpectationJudge
 
 
 class MaestroExecutorReliabilityTests(unittest.TestCase):
@@ -61,6 +93,305 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
             bounds=(0, 0, 100, 100),
         )
         return target, UIObservation((target, blocker))
+
+    @staticmethod
+    def _credential_observation() -> tuple[UIElement, UIObservation]:
+        target = UIElement(
+            element_id="credential",
+            parent_id=None,
+            text="",
+            accessibility_text="password",
+            hint_text="Enter password",
+            resource_id="i0118",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="password | Enter password",
+            bounds=(100, 200, 900, 300),
+        )
+        return target, UIObservation((target,))
+
+    @staticmethod
+    def _username_observation() -> tuple[UIElement, UIObservation]:
+        target = UIElement(
+            element_id="credential",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username | Email",
+            bounds=(100, 200, 900, 300),
+        )
+        return target, UIObservation((target,))
+
+    @patch.object(MaestroExecutor, "_run_flow")
+    @patch("apppilot.android.subprocess.run")
+    def test_printable_username_uses_single_adb_shell_without_maestro(
+        self,
+        run,
+        run_flow,
+    ) -> None:
+        run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        target, observation = self._username_observation()
+        secret = "person@example.com"
+
+        result = self.executor.execute_fast(
+            Action(
+                ActionKind.INPUT_TEXT,
+                target_id=target.element_id,
+                credential_kind=CredentialKind.USERNAME,
+            ),
+            observation,
+            secret=secret,
+        )
+
+        self.assertEqual(result, CredentialInputMethod.ADB)
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["adb", "-s", "emulator-5554", "shell", "sh"],
+        )
+        self.assertIn("input keycombination 113 29", run.call_args.kwargs["input"])
+        self.assertIn("input text p", run.call_args.kwargs["input"])
+        run_flow.assert_not_called()
+
+    @patch.object(MaestroExecutor, "_run_flow")
+    @patch.object(MaestroExecutor, "_clear_credential_field")
+    def test_password_uses_single_exact_clipboard_flow(
+        self,
+        clear_field,
+        run_flow,
+    ) -> None:
+        target, observation = self._credential_observation()
+        secret = "P@ssw0rd!"
+
+        result = self.executor.execute_fast(
+            Action(
+                ActionKind.INPUT_TEXT,
+                target_id=target.element_id,
+                credential_kind=CredentialKind.PASSWORD,
+            ),
+            observation,
+            secret=secret,
+        )
+
+        self.assertEqual(result, CredentialInputMethod.CLIPBOARD)
+        clear_field.assert_called_once_with(500, 250)
+        run_flow.assert_called_once()
+        flow = run_flow.call_args.args[0]
+        self.assertTrue(flow.startswith("- tapOn:\n"))
+        self.assertIn("${MAESTRO_APPPILOT_INPUT_SECRET}", flow)
+        self.assertNotIn(secret, flow)
+        self.assertEqual(run_flow.call_args.kwargs["secret"], secret)
+
+    @patch.object(MaestroExecutor, "_run_flow")
+    @patch.object(MaestroExecutor, "_clear_credential_field")
+    def test_non_printable_username_falls_back_to_one_maestro_flow(
+        self,
+        clear_field,
+        run_flow,
+    ) -> None:
+        target, observation = self._username_observation()
+
+        result = self.executor.execute_fast(
+            Action(
+                ActionKind.INPUT_TEXT,
+                target_id=target.element_id,
+                credential_kind=CredentialKind.USERNAME,
+            ),
+            observation,
+            secret="line one\nline two",
+        )
+
+        self.assertEqual(result, CredentialInputMethod.CLIPBOARD)
+        clear_field.assert_called_once_with(500, 250)
+        run_flow.assert_called_once()
+
+    @patch.object(MaestroExecutor, "_clear_focused_credential_field")
+    @patch.object(MaestroExecutor, "_run_flow")
+    def test_selector_only_password_uses_bounded_two_flow_fallback(
+        self,
+        run_flow,
+        clear_field,
+    ) -> None:
+        target = UIElement(
+            element_id="credential",
+            parent_id=None,
+            text="",
+            accessibility_text="password",
+            hint_text="Enter password",
+            resource_id="i0118",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="password | Enter password",
+            bounds=None,
+        )
+        secret = "P@ssw0rd!"
+
+        result = self.executor.execute_fast(
+            Action(
+                ActionKind.INPUT_TEXT,
+                target_id=target.element_id,
+                credential_kind=CredentialKind.PASSWORD,
+            ),
+            UIObservation((target,)),
+            secret=secret,
+        )
+
+        self.assertEqual(result, CredentialInputMethod.CLIPBOARD)
+        self.assertEqual(run_flow.call_count, 2)
+        clear_field.assert_called_once_with()
+        paste_flow = run_flow.call_args_list[1].args[0]
+        self.assertIn("${MAESTRO_APPPILOT_INPUT_SECRET}", paste_flow)
+        self.assertNotIn(secret, paste_flow)
+
+    @staticmethod
+    def _hierarchy(value: str) -> str:
+        return json.dumps(
+            {
+                "attributes": {
+                    "resource-id": "emailTextInput",
+                    "text": value,
+                    "accessibilityText": "Email",
+                    "hintText": "Email",
+                    "class": "android.widget.EditText",
+                    "clickable": "true",
+                    "enabled": "true",
+                },
+                "children": [],
+            }
+        )
+
+    @staticmethod
+    def _password_hierarchy(value: str) -> str:
+        return json.dumps(
+            {
+                "attributes": {
+                    "resource-id": "i0118",
+                    "text": value,
+                    "accessibilityText": "Password",
+                    "hintText": "Password",
+                    "class": "android.widget.EditText",
+                    "clickable": "true",
+                    "enabled": "true",
+                    "password": "true",
+                },
+                "children": [],
+            }
+        )
+
+    @patch("apppilot.android.subprocess.run")
+    def test_next_observation_verifies_username_without_exposing_it(
+        self,
+        run,
+    ) -> None:
+        secret = "person@example.com"
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            self._hierarchy(secret),
+            "",
+        )
+        observer = MaestroHierarchyObserver("emulator-5554")
+        observer.expect_credential(
+            CredentialKind.USERNAME,
+            "emailTextInput",
+            secret,
+        )
+
+        observation = observer._capture_maestro()
+
+        self.assertEqual(
+            observation.credential_verification.status,
+            CredentialVerificationStatus.MATCHED,
+        )
+        self.assertNotIn(secret, observation.describe())
+        self.assertEqual(observation.elements[0].text, "")
+
+    @patch("apppilot.android.subprocess.run")
+    def test_next_observation_reports_username_mismatch(
+        self,
+        run,
+    ) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            self._hierarchy("mistyped@example.com"),
+            "",
+        )
+        observer = MaestroHierarchyObserver("emulator-5554")
+        observer.expect_credential(
+            CredentialKind.USERNAME,
+            "emailTextInput",
+            "person@example.com",
+        )
+
+        observation = observer._capture_maestro()
+
+        self.assertEqual(
+            observation.credential_verification.status,
+            CredentialVerificationStatus.MISMATCHED,
+        )
+
+    @patch("apppilot.android.subprocess.run")
+    def test_next_observation_accepts_populated_masked_password(
+        self,
+        run,
+    ) -> None:
+        secret = "P@ssw0rd!"
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            self._password_hierarchy("•••••••••"),
+            "",
+        )
+        observer = MaestroHierarchyObserver("emulator-5554")
+        observer.expect_credential(
+            CredentialKind.PASSWORD,
+            "i0118",
+            secret,
+        )
+
+        observation = observer._capture_maestro()
+
+        self.assertEqual(
+            observation.credential_verification.status,
+            CredentialVerificationStatus.MATCHED,
+        )
+        self.assertNotIn(secret, observation.describe())
+
+    @patch("apppilot.android.subprocess.run")
+    def test_next_observation_rejects_wrong_masked_password_length(
+        self,
+        run,
+    ) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            self._password_hierarchy("••••"),
+            "",
+        )
+        observer = MaestroHierarchyObserver("emulator-5554")
+        observer.expect_credential(
+            CredentialKind.PASSWORD,
+            "i0118",
+            "P@ssw0rd!",
+        )
+
+        observation = observer._capture_maestro()
+
+        self.assertEqual(
+            observation.credential_verification.status,
+            CredentialVerificationStatus.MISMATCHED,
+        )
 
     @patch("apppilot.android.subprocess.run")
     def test_lifecycle_operations_use_adb_without_maestro(self, run) -> None:
@@ -451,7 +782,292 @@ class LoginRecoveryTests(unittest.TestCase):
         recover.assert_not_called()
 
 
+class AccountSessionNavigationTests(unittest.TestCase):
+    @staticmethod
+    def _element(
+        element_id: str,
+        label: str,
+        *,
+        parent_id: str | None = None,
+        clickable: bool = True,
+        bounds: tuple[int, int, int, int] | None = None,
+    ) -> UIElement:
+        return UIElement(
+            element_id=element_id,
+            parent_id=parent_id,
+            text=label,
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.view.View",
+            clickable=clickable,
+            enabled=True,
+            is_input=False,
+            label=label,
+            bounds=bounds,
+        )
+
+    def test_new_home_more_navigation_opens_explicit_profile_entry(self) -> None:
+        more = self._element("more", "More", bounds=(0, 900, 200, 1000))
+        new_chat = self._element(
+            "new-chat",
+            "New chat",
+            bounds=(800, 900, 1000, 1000),
+        )
+        profile = self._element(
+            "profile",
+            "Profile",
+            bounds=(0, 100, 1000, 200),
+        )
+        other = self._element(
+            "other",
+            "Help",
+            bounds=(0, 800, 1000, 900),
+        )
+        settings = UIObservation(
+            (self._element("account", "person@example.com"),)
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            UIObservation((more, new_chat)),
+            UIObservation((profile, other)),
+            settings,
+        ]
+        executor = Mock()
+        sleep = Mock()
+        session = AndroidAccountSession(
+            observer,
+            executor,
+            Mock(),
+            sleep=sleep,
+        )
+
+        self.assertIs(session._open_settings(), settings)
+
+        self.assertEqual(executor.execute_fast.call_count, 2)
+        self.assertEqual(
+            executor.execute_fast.call_args_list[0].args[0].target_id,
+            more.element_id,
+        )
+        self.assertEqual(
+            executor.execute_fast.call_args_list[1].args[0].target_id,
+            profile.element_id,
+        )
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_account_menu_matching_does_not_confuse_add_menu(self) -> None:
+        add_menu = self._element("add-menu", "Add menu")
+        observation = UIObservation((add_menu,))
+        session = AndroidAccountSession(Mock(), Mock(), Mock())
+
+        self.assertIsNone(
+            session._find_exact_text_control(
+                observation,
+                ("menu", "navigation menu", "open navigation"),
+            )
+        )
+
+    def test_more_drawer_ignores_background_profiles_and_selects_settings(
+        self,
+    ) -> None:
+        background_profiles = self._element(
+            "background-profiles",
+            "Work and Web profiles",
+            bounds=(0, 100, 1000, 200),
+        )
+        settings = self._element(
+            "settings",
+            "Settings",
+            bounds=(0, 700, 1000, 800),
+        )
+        observation = UIObservation((background_profiles, settings))
+        session = AndroidAccountSession(Mock(), Mock(), Mock())
+
+        self.assertIs(
+            session._find_drawer_account_row(observation),
+            settings,
+        )
+
+    def test_account_sheet_accepts_sign_in_with_another_account(self) -> None:
+        control = self._element(
+            "another-account",
+            "Sign in with another account",
+        )
+        observation = UIObservation((control,))
+        executor = Mock()
+        session = AndroidAccountSession(Mock(), executor, Mock())
+
+        session._tap(
+            observation,
+            control,
+            AccountActionPurpose.ADD_ACCOUNT,
+        )
+
+        executor.execute_fast.assert_called_once()
+
+
 class LoginCompletionTests(unittest.TestCase):
+    @staticmethod
+    def _goal_observation() -> UIObservation:
+        return UIObservation(
+            (
+                UIElement(
+                    element_id="continue",
+                    parent_id=None,
+                    text="Continue",
+                    accessibility_text="",
+                    hint_text="",
+                    resource_id="continue_button",
+                    class_name="android.widget.Button",
+                    clickable=True,
+                    enabled=True,
+                    is_input=False,
+                    label="Continue",
+                ),
+            )
+        )
+
+    def test_successful_login_persists_matching_goal_verdict(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"reached": false, "actionable_step": true}'
+                        )
+                    }
+                }
+            ]
+        }
+        first_transport = Mock(return_value=response)
+        second_transport = Mock(return_value=response)
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "goal-verdicts.json"
+            first = LLMLoginGoalEvaluator(
+                "model",
+                "secret",
+                transport=first_transport,
+                cache_path=cache_path,
+            )
+            observation = self._goal_observation()
+            self.assertFalse(first.is_reached("login", observation))
+            first.finish_run(True)
+            persisted = cache_path.read_text(encoding="utf-8")
+            self.assertNotIn("Continue", persisted)
+            self.assertNotIn("continue_button", persisted)
+
+            second = LLMLoginGoalEvaluator(
+                "model",
+                "secret",
+                transport=second_transport,
+                cache_path=cache_path,
+            )
+            self.assertFalse(second.is_reached("login", observation))
+            self.assertTrue(second.has_actionable_step(observation))
+
+        first_transport.assert_called_once()
+        second_transport.assert_called_once()
+
+    def test_persistent_goal_cache_distinguishes_enabled_state(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"reached": false, "actionable_step": true}'
+                        )
+                    }
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "goal-verdicts.json"
+            first = LLMLoginGoalEvaluator(
+                "model",
+                "secret",
+                transport=Mock(return_value=response),
+                cache_path=cache_path,
+            )
+            enabled = self._goal_observation()
+            first.is_reached("login", enabled)
+            first.finish_run(True)
+
+            button = enabled.elements[0]
+            disabled = UIObservation((replace(button, enabled=False),))
+            second_transport = Mock(return_value=response)
+            second = LLMLoginGoalEvaluator(
+                "model",
+                "secret",
+                transport=second_transport,
+                cache_path=cache_path,
+            )
+            second.is_reached("login", disabled)
+
+        second_transport.assert_called_once()
+
+    def test_in_memory_goal_cache_distinguishes_goal_text(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"reached": false, "actionable_step": true}'
+                        )
+                    }
+                }
+            ]
+        }
+        transport = Mock(return_value=response)
+        with tempfile.TemporaryDirectory() as directory:
+            evaluator = LLMLoginGoalEvaluator(
+                "model",
+                "secret",
+                transport=transport,
+                cache_path=Path(directory) / "goal-verdicts.json",
+            )
+            observation = self._goal_observation()
+
+            evaluator.is_reached("first goal", observation)
+            evaluator.is_reached("second goal", observation)
+
+        self.assertEqual(transport.call_count, 2)
+
+    def test_failed_login_does_not_persist_goal_verdict(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"reached": false, "actionable_step": true}'
+                        )
+                    }
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "goal-verdicts.json"
+            first = LLMLoginGoalEvaluator(
+                "model",
+                "secret",
+                transport=Mock(return_value=response),
+                cache_path=cache_path,
+            )
+            first.is_reached("login", self._goal_observation())
+            first.finish_run(False)
+
+            second_transport = Mock(return_value=response)
+            second = LLMLoginGoalEvaluator(
+                "model",
+                "secret",
+                transport=second_transport,
+                cache_path=cache_path,
+            )
+            second.is_reached("login", self._goal_observation())
+
+        second_transport.assert_called_once()
+
     def test_completion_requires_three_consecutive_positive_observations(
         self,
     ) -> None:
@@ -473,6 +1089,892 @@ class LoginCompletionTests(unittest.TestCase):
         self.assertFalse(evaluator.is_reached("", observation))
         self.assertFalse(evaluator.is_reached("", observation))
         self.assertTrue(evaluator.is_reached("", observation))
+
+    def test_mismatched_fast_username_is_replaced_once_without_logging_value(
+        self,
+    ) -> None:
+        username = UIElement(
+            element_id="username",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+            bounds=(100, 100, 900, 200),
+        )
+        next_button = UIElement(
+            element_id="next",
+            parent_id=None,
+            text="Next",
+            accessibility_text="",
+            hint_text="",
+            resource_id="nextButton",
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Next",
+            bounds=(100, 300, 900, 400),
+        )
+        initial = UIObservation((username, next_button))
+        mismatch = UIObservation(
+            (username, next_button),
+            credential_verification=CredentialVerification(
+                kind=CredentialKind.USERNAME,
+                field_id="emailTextInput",
+                element_id="username",
+                status=CredentialVerificationStatus.MISMATCHED,
+            ),
+        )
+        matched = UIObservation(
+            (username, next_button),
+            credential_verification=CredentialVerification(
+                kind=CredentialKind.USERNAME,
+                field_id="emailTextInput",
+                element_id="username",
+                status=CredentialVerificationStatus.MATCHED,
+            ),
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            initial,
+            mismatch,
+            matched,
+            UIObservation(()),
+        ]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.side_effect = [False, False, True]
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.side_effect = [
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=username.element_id,
+                    credential_kind=CredentialKind.USERNAME,
+                ),
+                "username",
+                reobserve_required=False,
+            ),
+            ModelDecision(
+                Action(ActionKind.TAP, target_id=next_button.element_id),
+                "next",
+                reobserve_required=False,
+            ),
+        ]
+        executor = Mock()
+        executor.execute_fast.side_effect = [
+            CredentialInputMethod.ADB,
+            None,
+        ]
+        secret = "person@example.com"
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=5,
+            runtime_context=RuntimeContext(
+                {CredentialKind.USERNAME: secret}
+            ),
+        )
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertTrue(agent.run("login"))
+
+        self.assertEqual(observer.expect_credential.call_count, 2)
+        observer.expect_credential.assert_called_with(
+            CredentialKind.USERNAME,
+            "emailTextInput",
+            secret,
+        )
+        executor.execute_credential_fallback.assert_called_once()
+        self.assertEqual(
+            executor.execute_credential_fallback.call_args.args[2],
+            secret,
+        )
+        self.assertNotIn(secret, output.getvalue())
+        self.assertEqual(decision_provider.decide.call_count, 2)
+
+    def test_unavailable_username_check_does_not_fail_on_password_screen(
+        self,
+    ) -> None:
+        username = UIElement(
+            element_id="username",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+        )
+        password = UIElement(
+            element_id="password",
+            parent_id=None,
+            text="",
+            accessibility_text="password",
+            hint_text="Password",
+            resource_id="i0118",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="password",
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            UIObservation((username,)),
+            UIObservation(
+                (password,),
+                credential_verification=CredentialVerification(
+                    kind=CredentialKind.USERNAME,
+                    field_id="emailTextInput",
+                    element_id=None,
+                    status=CredentialVerificationStatus.UNAVAILABLE,
+                ),
+            ),
+            UIObservation(
+                (),
+                credential_verification=CredentialVerification(
+                    kind=CredentialKind.PASSWORD,
+                    field_id="i0118",
+                    element_id=None,
+                    status=CredentialVerificationStatus.UNAVAILABLE,
+                ),
+            ),
+        ]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.side_effect = [False, False, True]
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.side_effect = [
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=username.element_id,
+                    credential_kind=CredentialKind.USERNAME,
+                ),
+                "username",
+                reobserve_required=False,
+            ),
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=password.element_id,
+                    credential_kind=CredentialKind.PASSWORD,
+                ),
+                "password",
+                reobserve_required=False,
+            ),
+        ]
+        executor = Mock()
+        executor.execute_fast.side_effect = [
+            CredentialInputMethod.ADB,
+            CredentialInputMethod.CLIPBOARD,
+        ]
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=4,
+            runtime_context=RuntimeContext(
+                {
+                    CredentialKind.USERNAME: "person@example.com",
+                    CredentialKind.PASSWORD: "P@ssw0rd!",
+                }
+            ),
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(agent.run("login"))
+
+        executor.execute_credential_fallback.assert_not_called()
+
+    def test_clipboard_recovery_fails_after_one_unverified_retry(self) -> None:
+        username = UIElement(
+            element_id="username",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+        )
+        initial = UIObservation((username,))
+        mismatch = UIObservation(
+            (username,),
+            credential_verification=CredentialVerification(
+                kind=CredentialKind.USERNAME,
+                field_id="emailTextInput",
+                element_id="username",
+                status=CredentialVerificationStatus.MISMATCHED,
+            ),
+        )
+        observer = Mock()
+        observer.observe.side_effect = [initial, mismatch, mismatch]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.return_value = False
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.return_value = ModelDecision(
+            Action(
+                ActionKind.INPUT_TEXT,
+                target_id=username.element_id,
+                credential_kind=CredentialKind.USERNAME,
+            ),
+            "username",
+            reobserve_required=False,
+        )
+        executor = Mock()
+        executor.execute_fast.return_value = CredentialInputMethod.ADB
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=4,
+            runtime_context=RuntimeContext(
+                {CredentialKind.USERNAME: "person@example.com"}
+            ),
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(agent.run("login"))
+
+        self.assertIn(
+            "verification failed after exact recovery",
+            agent.last_failure_reason,
+        )
+        executor.execute_credential_fallback.assert_called_once()
+
+    def test_unavailable_username_check_recovers_unique_relocated_field(
+        self,
+    ) -> None:
+        username = UIElement(
+            element_id="e:shifted",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+        )
+        observation = UIObservation(
+            (username,),
+            credential_verification=CredentialVerification(
+                kind=CredentialKind.USERNAME,
+                field_id="e:original",
+                element_id=None,
+                status=CredentialVerificationStatus.UNAVAILABLE,
+            ),
+        )
+
+        action = AppPilotAgent._credential_recovery_action(observation)
+
+        self.assertEqual(action.target_id, "e:shifted")
+        self.assertEqual(action.credential_kind, CredentialKind.USERNAME)
+
+    def test_credential_recovery_respects_action_limit(self) -> None:
+        username = UIElement(
+            element_id="username",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+        )
+        initial = UIObservation((username,))
+        mismatch = UIObservation(
+            (username,),
+            credential_verification=CredentialVerification(
+                kind=CredentialKind.USERNAME,
+                field_id="emailTextInput",
+                element_id="username",
+                status=CredentialVerificationStatus.MISMATCHED,
+            ),
+        )
+        observer = Mock()
+        observer.observe.side_effect = [initial, mismatch]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.return_value = False
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.return_value = ModelDecision(
+            Action(
+                ActionKind.INPUT_TEXT,
+                target_id=username.element_id,
+                credential_kind=CredentialKind.USERNAME,
+            ),
+            "username",
+            reobserve_required=False,
+        )
+        executor = Mock()
+        executor.execute_fast.return_value = CredentialInputMethod.ADB
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=1,
+            runtime_context=RuntimeContext(
+                {CredentialKind.USERNAME: "person@example.com"}
+            ),
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(agent.run("login"))
+
+        self.assertEqual(
+            agent.last_failure_reason,
+            "action/step limit reached (1)",
+        )
+        executor.execute_credential_fallback.assert_not_called()
+
+    def test_fast_submit_does_not_wait_after_credential_screen_changes(
+        self,
+    ) -> None:
+        username = UIElement(
+            element_id="username",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+            bounds=(100, 100, 900, 200),
+        )
+        next_button = UIElement(
+            element_id="next",
+            parent_id=None,
+            text="Next",
+            accessibility_text="",
+            hint_text="",
+            resource_id="nextButton",
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Next",
+            bounds=(100, 300, 900, 400),
+        )
+        password = UIElement(
+            element_id="password",
+            parent_id=None,
+            text="",
+            accessibility_text="password",
+            hint_text="Enter password",
+            resource_id="i0118",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="password | Enter password",
+            bounds=(100, 100, 900, 200),
+        )
+        sign_in = UIElement(
+            element_id="sign-in",
+            parent_id=None,
+            text="Sign in",
+            accessibility_text="",
+            hint_text="",
+            resource_id="idSIButton9",
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Sign in",
+            bounds=(100, 300, 900, 400),
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            UIObservation((username, next_button)),
+            UIObservation((password, sign_in)),
+            UIObservation(()),
+        ]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.side_effect = [False, False, True]
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.side_effect = [
+            ModelDecision(
+                Action(ActionKind.TAP, target_id=next_button.element_id),
+                "next",
+                reobserve_required=False,
+            ),
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=password.element_id,
+                    credential_kind=CredentialKind.PASSWORD,
+                ),
+                "password",
+                reobserve_required=False,
+            ),
+        ]
+        executor = Mock()
+        sleep = Mock()
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=5,
+            runtime_context=RuntimeContext(
+                {CredentialKind.PASSWORD: "P@ssw0rd!"}
+            ),
+            sleep=sleep,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(agent.run("login"))
+
+        sleep.assert_not_called()
+        self.assertEqual(executor.execute_fast.call_count, 2)
+
+    def test_fast_submit_waits_when_same_submit_control_becomes_disabled(
+        self,
+    ) -> None:
+        password = UIElement(
+            element_id="password",
+            parent_id=None,
+            text="",
+            accessibility_text="password",
+            hint_text="Enter password",
+            resource_id="passwordEntry",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="password",
+            bounds=(100, 100, 900, 200),
+        )
+        next_button = UIElement(
+            element_id="next",
+            parent_id=None,
+            text="Next",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Next",
+            bounds=(100, 300, 900, 400),
+        )
+        disabled_next = UIElement(
+            element_id="next",
+            parent_id=None,
+            text="",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=False,
+            is_input=False,
+            label="",
+            bounds=(100, 300, 900, 400),
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            UIObservation((password, next_button)),
+            UIObservation((password, next_button)),
+            UIObservation((password, disabled_next)),
+            UIObservation(()),
+        ]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.side_effect = [False, False, False, True]
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.side_effect = [
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=password.element_id,
+                    credential_kind=CredentialKind.PASSWORD,
+                ),
+                "password",
+                reobserve_required=False,
+            ),
+            ModelDecision(
+                Action(ActionKind.TAP, target_id=next_button.element_id),
+                "next",
+                reobserve_required=False,
+            ),
+        ]
+        executor = Mock()
+        sleep = Mock()
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=5,
+            runtime_context=RuntimeContext(
+                {CredentialKind.PASSWORD: "P@ssw0rd!"}
+            ),
+            sleep=sleep,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(agent.run("login"))
+
+        sleep.assert_called_once_with(0.5)
+        self.assertEqual(executor.execute_fast.call_count, 2)
+        self.assertEqual(decision_provider.decide.call_count, 2)
+
+    def test_post_submit_blank_screen_uses_shorter_recovery_budget(self) -> None:
+        password = UIElement(
+            element_id="password",
+            parent_id=None,
+            text="",
+            accessibility_text="password",
+            hint_text="Enter password",
+            resource_id="passwordEntry",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="password",
+        )
+        next_button = UIElement(
+            element_id="next",
+            parent_id=None,
+            text="Next",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Next",
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            UIObservation((password, next_button)),
+            UIObservation((password, next_button)),
+            UIObservation(()),
+            UIObservation(()),
+            UIObservation(()),
+            UIObservation(()),
+            UIObservation(()),
+        ]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.return_value = False
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.side_effect = [
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=password.element_id,
+                    credential_kind=CredentialKind.PASSWORD,
+                ),
+                "password",
+                reobserve_required=False,
+            ),
+            ModelDecision(
+                Action(ActionKind.TAP, target_id=next_button.element_id),
+                "next",
+                reobserve_required=False,
+            ),
+        ]
+        executor = Mock()
+        sleep = Mock()
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=5,
+            runtime_context=RuntimeContext(
+                {CredentialKind.PASSWORD: "P@ssw0rd!"}
+            ),
+            sleep=sleep,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(agent.run("login"))
+
+        self.assertIn("after 5 wait(s)", agent.last_failure_reason)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertEqual(decision_provider.decide.call_count, 2)
+
+    def test_notification_permission_modal_is_actionable_and_denied(
+        self,
+    ) -> None:
+        message = UIElement(
+            element_id="message",
+            parent_id="dialog",
+            text="Allow Copilot to send you notifications?",
+            accessibility_text="",
+            hint_text="",
+            resource_id="com.android.permissioncontroller:id/permission_message",
+            class_name="android.widget.TextView",
+            clickable=False,
+            enabled=True,
+            is_input=False,
+            label="Allow Copilot to send you notifications?",
+        )
+        allow = UIElement(
+            element_id="allow",
+            parent_id="dialog",
+            text="Allow",
+            accessibility_text="",
+            hint_text="",
+            resource_id=(
+                "com.android.permissioncontroller:id/permission_allow_button"
+            ),
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Allow",
+        )
+        deny = UIElement(
+            element_id="deny",
+            parent_id="dialog",
+            text="Don’t allow",
+            accessibility_text="",
+            hint_text="",
+            resource_id=(
+                "com.android.permissioncontroller:id/permission_deny_button"
+            ),
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Don’t allow",
+        )
+        dialog = UIElement(
+            element_id="dialog",
+            parent_id=None,
+            text="",
+            accessibility_text="",
+            hint_text="",
+            resource_id="com.android.permissioncontroller:id/grant_dialog",
+            class_name="android.widget.FrameLayout",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Allow Copilot to send you notifications? | Allow | Don’t allow",
+        )
+        singleton = UIElement(
+            element_id="singleton",
+            parent_id=None,
+            text="",
+            accessibility_text="",
+            hint_text="",
+            resource_id="com.android.permissioncontroller:id/grant_singleton",
+            class_name="android.widget.FrameLayout",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="Allow Copilot to send you notifications? | Allow | Don’t allow",
+        )
+        observation = UIObservation((message, allow, deny, dialog, singleton))
+        evaluator = SignedInCopilotGoalEvaluator(
+            foreground_check=lambda: False
+        )
+
+        self.assertFalse(evaluator.deterministic_verdict(observation))
+        self.assertTrue(
+            evaluator.deterministic_actionable_verdict(observation)
+        )
+        self.assertTrue(evaluator.has_actionable_step(observation))
+
+        validator = SafetyValidator()
+        actions = validator.available_actions(observation)
+        self.assertNotIn(
+            Action(ActionKind.TAP, target_id=allow.element_id),
+            actions,
+        )
+        deny_action = Action(ActionKind.TAP, target_id=deny.element_id)
+        self.assertIn(deny_action, actions)
+
+        fallback = Mock()
+        cache = LoginDecisionCache(fallback)
+        decision = cache.decide(
+            DecisionRequest(
+                goal="login",
+                guidance=None,
+                observation=observation,
+                available_actions=actions,
+                context=ExecutionContext(step=0, max_steps=5),
+            )
+        )
+
+        self.assertEqual(decision.action, deny_action)
+        self.assertFalse(decision.reobserve_required)
+        fallback.decide.assert_not_called()
+
+    def test_privacy_diagnostic_sheet_is_deterministic_and_cached(
+        self,
+    ) -> None:
+        title = UIElement(
+            element_id="title",
+            parent_id=None,
+            text="Your privacy matters",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.TextView",
+            clickable=False,
+            enabled=True,
+            is_input=False,
+            label="Your privacy matters",
+        )
+        detail = UIElement(
+            element_id="detail",
+            parent_id=None,
+            text="Diagnostic data for Microsoft 365",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.TextView",
+            clickable=False,
+            enabled=True,
+            is_input=False,
+            label="Diagnostic data for Microsoft 365",
+        )
+        ok = UIElement(
+            element_id="ok",
+            parent_id=None,
+            text="OK",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.Button",
+            clickable=True,
+            enabled=True,
+            is_input=False,
+            label="OK",
+        )
+        observation = UIObservation((title, detail, ok))
+        evaluator = SignedInCopilotGoalEvaluator()
+
+        self.assertFalse(evaluator.deterministic_verdict(observation))
+        self.assertTrue(
+            evaluator.deterministic_actionable_verdict(observation)
+        )
+
+        validator = SafetyValidator()
+        actions = validator.available_actions(observation)
+        fallback = Mock()
+        decision = LoginDecisionCache(fallback).decide(
+            DecisionRequest(
+                goal="login",
+                guidance=None,
+                observation=observation,
+                available_actions=actions,
+                context=ExecutionContext(step=0, max_steps=5),
+            )
+        )
+
+        self.assertEqual(
+            decision.action,
+            Action(ActionKind.TAP, target_id=ok.element_id),
+        )
+        self.assertFalse(decision.reobserve_required)
+        fallback.decide.assert_not_called()
+
+    def test_known_onboarding_dialogs_are_deterministic_and_seeded(
+        self,
+    ) -> None:
+        for title, control in (
+            ("Privacy Settings Applied", "OK"),
+            ("Meet the latest Copilot", "Continue"),
+        ):
+            with self.subTest(title=title):
+                title_element = UIElement(
+                    element_id="title",
+                    parent_id=None,
+                    text=title,
+                    accessibility_text="",
+                    hint_text="",
+                    resource_id="title",
+                    class_name="android.widget.TextView",
+                    clickable=False,
+                    enabled=True,
+                    is_input=False,
+                    label=title,
+                )
+                button = UIElement(
+                    element_id="button",
+                    parent_id=None,
+                    text=control,
+                    accessibility_text="",
+                    hint_text="",
+                    resource_id="android:id/button1",
+                    class_name="android.widget.Button",
+                    clickable=True,
+                    enabled=True,
+                    is_input=False,
+                    label=control,
+                )
+                observation = UIObservation((title_element, button))
+                deterministic = SignedInCopilotGoalEvaluator(
+                    foreground_check=lambda: True
+                )
+                evaluator = AuthoritativeLoginGoalEvaluator(
+                    deterministic,
+                    None,
+                )
+                fallback = Mock()
+                cache = LoginDecisionCache(fallback)
+                actions = SafetyValidator().available_actions(observation)
+
+                self.assertFalse(evaluator.is_reached("login", observation))
+                self.assertTrue(evaluator.has_actionable_step(observation))
+                decision = cache.decide(
+                    DecisionRequest(
+                        goal="login",
+                        guidance=None,
+                        observation=observation,
+                        available_actions=actions,
+                        context=ExecutionContext(step=0, max_steps=5),
+                    )
+                )
+
+                self.assertEqual(decision.action.target_id, "button")
+                fallback.decide.assert_not_called()
 
 
 class InstalledGroupOrderingTests(unittest.TestCase):
@@ -589,10 +2091,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
     def test_supported_link_is_approved_and_replayed_after_login(self) -> None:
         case = DeeplinkTestCase(
             test_id="TC009",
-            deep_link=(
-                "https://unifiedlink.svc.cloud.microsoft/"
-                "app/copilot/chat/payload"
-            ),
+            deep_link="https://m365.cloud.microsoft/chat/payload",
             user_type="Consumer",
             expected_result="Chat",
             installed=False,
@@ -626,7 +2125,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
         login_flow.ensure_ready_without_relaunch.assert_not_called()
         self.assertEqual(executor.open_link.call_count, 2)
         executor.enable_supported_links.assert_called_once_with(
-            ("unifiedlink.svc.cloud.microsoft",)
+            SUPPORTED_LINK_DOMAINS
         )
         self.assertEqual(
             lifecycle.method_calls,
@@ -638,7 +2137,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
                 ),
                 unittest.mock.call.login.ensure_ready(),
                 unittest.mock.call.executor.enable_supported_links(
-                    ("unifiedlink.svc.cloud.microsoft",)
+                    SUPPORTED_LINK_DOMAINS
                 ),
                 unittest.mock.call.executor.open_link(case.deep_link),
             ],
@@ -690,7 +2189,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
         login_flow.ensure_ready_without_relaunch.assert_called_once_with()
         self.assertEqual(executor.open_link.call_count, 3)
         executor.enable_supported_links.assert_called_once_with(
-            ("unifiedlink.svc.cloud.microsoft",)
+            SUPPORTED_LINK_DOMAINS
         )
 
     def test_login_failure_recreates_fresh_install_on_retry(self) -> None:
@@ -819,7 +2318,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
     def test_unsupported_link_retry_recreates_fresh_install(self) -> None:
         case = DeeplinkTestCase(
             test_id="TC008",
-            deep_link="https://m365.cloud.microsoft/apps",
+            deep_link="https://unsupported.example.test/apps",
             user_type="Consumer",
             expected_result="Store",
             installed=False,
@@ -879,7 +2378,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
     def test_unsupported_link_operational_failure_retries_fresh(self) -> None:
         case = DeeplinkTestCase(
             test_id="TC008",
-            deep_link="https://m365.cloud.microsoft/apps",
+            deep_link="https://unsupported.example.test/apps",
             user_type="Consumer",
             expected_result="Store",
             installed=False,
@@ -1047,6 +2546,36 @@ class DeeplinkAttemptRecoveryTests(unittest.TestCase):
             )
         )
 
+    def test_expectation_judge_caches_unchanged_observation(self) -> None:
+        transport = Mock(
+            return_value={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"match": False, "reason": "wrong destination"}
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+        judge = LLMExpectationJudge(
+            model="test-model",
+            api_key="test-key",
+            transport=transport,
+        )
+        observation = self._input_observation()
+
+        with redirect_stdout(io.StringIO()):
+            first = judge.evaluate("Researcher with prompt", observation)
+            second = judge.evaluate("Researcher with prompt", observation)
+            judge.evaluate("Chat with prompt", observation)
+            judge.evaluate("Chat with prompt", UIObservation(()))
+
+        self.assertEqual(first, second)
+        self.assertEqual(transport.call_count, 3)
+
     def test_operational_failure_restarts_and_replays_within_attempt(self) -> None:
         case = self._case()
         observer = Mock()
@@ -1071,7 +2600,7 @@ class DeeplinkAttemptRecoveryTests(unittest.TestCase):
         self.assertTrue(result.passed)
         executor.stop_app.assert_called_once_with()
         executor.enable_supported_links.assert_called_once_with(
-            ("unifiedlink.svc.cloud.microsoft",)
+            SUPPORTED_LINK_DOMAINS
         )
         executor.open_link.assert_called_once_with(case.deep_link)
         self.assertEqual(observer.reset_recovery_budget.call_count, 2)
@@ -1503,7 +3032,7 @@ class DeeplinkAttemptRecoveryTests(unittest.TestCase):
         login_flow.ensure_ready.assert_not_called()
         self.assertEqual(executor.open_link.call_count, 2)
         executor.enable_supported_links.assert_called_once_with(
-            ("unifiedlink.svc.cloud.microsoft",)
+            SUPPORTED_LINK_DOMAINS
         )
 
     def test_usable_wrong_destination_is_not_restarted(self) -> None:
@@ -1580,7 +3109,6 @@ class ModelClientReliabilityTests(unittest.TestCase):
 
         urlopen.assert_called_once()
         sleep.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,9 @@ from . import logtags
 from .models import (
     Action,
     ActionKind,
+    CredentialInputMethod,
+    CredentialKind,
+    CredentialVerificationStatus,
     ExecutionContext,
     GoalEvaluator,
     RuntimeContext,
@@ -38,6 +41,10 @@ DEFAULT_MAX_STUCK_ACTIONS = 5
 # forever. These are deliberately generic (no string/coordinate detection).
 DEFAULT_NONACTIONABLE_WAIT_SECONDS = 2.0
 DEFAULT_MAX_NONACTIONABLE_WAITS = 10
+# A completely empty hierarchy after credential submission is a narrower
+# failure mode than general app loading. Recover sooner instead of spending the
+# full generic wait budget on a stalled authentication WebView.
+DEFAULT_MAX_POST_SUBMIT_EMPTY_OBSERVATIONS = 5
 _T = TypeVar("_T")
 
 
@@ -123,6 +130,9 @@ class AppPilotAgent:
             finish = getattr(self._decision_provider, "finish_run", None)
             if callable(finish):
                 finish(succeeded)
+            finish_goal = getattr(self._goal_evaluator, "finish_run", None)
+            if callable(finish_goal):
+                finish_goal(succeeded)
 
     def _run(self, goal: str, guidance: str | None = None) -> bool:
         reset_recovery = getattr(self._observer, "reset_recovery_budget", None)
@@ -148,10 +158,140 @@ class AppPilotAgent:
         # Track consecutive actions that leave the meaningful UI unchanged.
         last_acted_fingerprint: tuple | None = None
         consecutive_stuck = 0
+        pending_fast_submit_fingerprint: tuple | None = None
+        pending_fast_submit_identity: tuple[str, str, str] | None = None
         pending_fast_submit_waits = 0
+        post_submit_transition_active = False
+        post_submit_empty_observations = 0
+        pending_credential_verification: CredentialKind | None = None
+        recovered_credential_kinds: set[CredentialKind] = set()
         for step in range(self._max_actions + 1):
             observation = self._timed_call("observe", self._observer.observe)
             self._emit(f"OBSERVE:\n{observation.describe()}\n")
+
+            verification = observation.credential_verification
+            if pending_credential_verification is not None:
+                if (
+                    verification is None
+                    or verification.kind != pending_credential_verification
+                ):
+                    self._log_fail(
+                        "credential entry did not produce a local verification "
+                        "result"
+                    )
+                    return False
+                pending_credential_verification = None
+            recovery_action = self._credential_recovery_action(observation)
+            if (
+                verification is not None
+                and verification.status != CredentialVerificationStatus.MATCHED
+                and recovery_action is None
+                and (
+                    verification.status
+                    == CredentialVerificationStatus.MISMATCHED
+                    or self._has_credential_field_of_kind(
+                        observation,
+                        verification.kind,
+                    )
+                )
+            ):
+                self._log_fail(
+                    "credential verification failed and the input field could "
+                    "not be uniquely recovered"
+                )
+                return False
+            if recovery_action is not None:
+                if step == self._max_actions:
+                    self._log_fail(
+                        f"action/step limit reached ({self._max_actions})"
+                    )
+                    return False
+                if (
+                    recovery_action.credential_kind
+                    in recovered_credential_kinds
+                ):
+                    self._log_fail(
+                        f"{recovery_action.credential_kind.value} input "
+                        "verification failed after exact recovery"
+                    )
+                    return False
+                if not self._runtime_context.has(recovery_action.credential_kind):
+                    self._log_fail(
+                        "credential verification failed and the configured "
+                        "credential is unavailable"
+                    )
+                    return False
+                try:
+                    self._safety_validator.validate(
+                        recovery_action,
+                        observation,
+                    )
+                except ValueError as error:
+                    self._emit(
+                        "CREDENTIAL VERIFICATION:\n"
+                        f"recovery rejected - {error}\n"
+                    )
+                    self._log_fail(
+                        "credential verification failed and recovery was unsafe"
+                    )
+                    return False
+                fallback = getattr(
+                    self._executor,
+                    "execute_credential_fallback",
+                    None,
+                )
+                if not callable(fallback):
+                    self._log_fail(
+                        "credential verification failed and no exact recovery "
+                        "path is available"
+                    )
+                    return False
+                secret = self._runtime_context.resolve(
+                    recovery_action.credential_kind
+                )
+                self._emit(
+                    "CREDENTIAL VERIFICATION:\n"
+                    f"{recovery_action.credential_kind.value} mismatch; "
+                    "replacing the configured value through the exact local "
+                    "clipboard path\n"
+                )
+                self._timed_call(
+                    "credential recovery",
+                    lambda: fallback(
+                        recovery_action,
+                        observation,
+                        secret,
+                    ),
+                )
+                if not self._arm_credential_verification(
+                    recovery_action,
+                    observation,
+                    secret,
+                ):
+                    self._log_fail(
+                        "exact credential recovery cannot be verified by the "
+                        "configured observer"
+                    )
+                    return False
+                pending_credential_verification = (
+                    recovery_action.credential_kind
+                )
+                recovered_credential_kinds.add(
+                    recovery_action.credential_kind
+                )
+                credential_key = self._credential_field_key(
+                    recovery_action,
+                    observation,
+                )
+                filled_credential_keys.add(credential_key)
+                filled_fingerprint = self._meaningful_fingerprint(observation)
+                last_credential_key = credential_key
+                last_credential_fingerprint = self._observation_fingerprint(
+                    observation
+                )
+                last_acted_fingerprint = filled_fingerprint
+                history.append(recovery_action.describe(observation))
+                continue
 
             reached = self._timed_call(
                 "goal evaluation",
@@ -173,8 +313,34 @@ class AppPilotAgent:
             available_actions, filled_fingerprint = self._offer_actions(
                 observation, filled_credential_keys, filled_fingerprint
             )
+            if (
+                post_submit_transition_active
+                and self._has_relevant_ui(observation)
+                and not self._has_credential_field(observation)
+            ):
+                post_submit_transition_active = False
+                post_submit_empty_observations = 0
             waits = 0
             while not self._has_actionable_step(observation, available_actions):
+                if (
+                    post_submit_transition_active
+                    and not self._has_relevant_ui(observation)
+                ):
+                    post_submit_empty_observations += 1
+                    if (
+                        post_submit_empty_observations
+                        >= DEFAULT_MAX_POST_SUBMIT_EMPTY_OBSERVATIONS
+                    ):
+                        self._log_fail(
+                            "no actionable step appeared after "
+                            f"{post_submit_empty_observations} wait(s); app stayed "
+                            "in a loading/transition state with no "
+                            "login/onboarding action to take after credential "
+                            "submission"
+                        )
+                        return False
+                elif self._has_relevant_ui(observation):
+                    post_submit_empty_observations = 0
                 if waits >= self._max_nonactionable_waits:
                     self._log_fail(
                         f"no actionable step appeared after {waits} wait(s); app "
@@ -208,18 +374,35 @@ class AppPilotAgent:
                 available_actions, filled_fingerprint = self._offer_actions(
                     observation, filled_credential_keys, filled_fingerprint
                 )
+                if (
+                    post_submit_transition_active
+                    and self._has_relevant_ui(observation)
+                    and not self._has_credential_field(observation)
+                ):
+                    post_submit_transition_active = False
+                    post_submit_empty_observations = 0
 
-            if (
-                pending_fast_submit_waits > 0
-                and self._has_credential_field(observation)
-            ):
-                pending_fast_submit_waits -= 1
-                self._emit(
-                    "WAIT:\nsubmitted credentials; waiting for authentication "
-                    "transition\n"
-                )
-                self._sleep(0.5)
-                continue
+            if pending_fast_submit_waits > 0:
+                current_fingerprint = self._meaningful_fingerprint(observation)
+                if (
+                    (
+                        current_fingerprint == pending_fast_submit_fingerprint
+                        or self._submitted_control_is_disabled(
+                            observation,
+                            pending_fast_submit_identity,
+                        )
+                    )
+                    and self._has_credential_field(observation)
+                ):
+                    pending_fast_submit_waits -= 1
+                    self._emit(
+                        "WAIT:\nsubmitted credentials; waiting for authentication "
+                        "transition\n"
+                    )
+                    self._sleep(0.5)
+                    continue
+                pending_fast_submit_fingerprint = None
+                pending_fast_submit_identity = None
             pending_fast_submit_waits = 0
 
             # Advance the stuck counter when the last action left the meaningful
@@ -303,7 +486,7 @@ class AppPilotAgent:
 
             # Resolve any requested credential locally, after safety validation.
             # The secret value is never printed and never leaves this scope
-            # except to be handed directly to Maestro.
+            # except to be handed directly to the local Android executor.
             secret: str | None = None
             action = current_action
             if action.credential_kind is not None:
@@ -347,10 +530,30 @@ class AppPilotAgent:
                 fast_execute = getattr(self._executor, "execute_fast", None)
                 if callable(fast_execute):
                     execute = fast_execute
-            self._timed_call(
+            execution_result = self._timed_call(
                 "action",
                 lambda: execute(action, observation, secret=secret),
             )
+            if (
+                action.credential_kind is not None
+                and secret is not None
+                and execution_result
+                in (
+                    CredentialInputMethod.ADB,
+                    CredentialInputMethod.CLIPBOARD,
+                )
+            ):
+                if not self._arm_credential_verification(
+                    action,
+                    observation,
+                    secret,
+                ):
+                    self._log_fail(
+                        "credential entry cannot be verified by the "
+                        "configured observer"
+                    )
+                    return False
+                pending_credential_verification = action.credential_kind
             record_executed = getattr(
                 self._decision_provider, "record_executed", None
             )
@@ -374,7 +577,14 @@ class AppPilotAgent:
                 not decision.reobserve_required
                 and self._is_submit_action(action, observation)
             ):
+                pending_fast_submit_fingerprint = meaningful_fingerprint
+                pending_fast_submit_identity = self._submit_identity(
+                    action,
+                    observation,
+                )
                 pending_fast_submit_waits = 2
+                post_submit_transition_active = True
+                post_submit_empty_observations = 0
 
         raise AssertionError("Agent loop exited unexpectedly")
 
@@ -382,6 +592,85 @@ class AppPilotAgent:
     def _has_credential_field(observation: UIObservation) -> bool:
         return any(
             SafetyValidator.credential_kind(element) is not None
+            for element in observation.elements
+        )
+
+    @staticmethod
+    def _has_credential_field_of_kind(
+        observation: UIObservation,
+        kind: CredentialKind,
+    ) -> bool:
+        return any(
+            SafetyValidator.credential_kind(element) == kind
+            for element in observation.elements
+        )
+
+    @staticmethod
+    def _credential_recovery_action(
+        observation: UIObservation,
+    ) -> Action | None:
+        verification = observation.credential_verification
+        if (
+            verification is None
+            or verification.status == CredentialVerificationStatus.MATCHED
+        ):
+            return None
+        same_kind = [
+            element
+            for element in observation.elements
+            if SafetyValidator.credential_kind(element) == verification.kind
+        ]
+        candidates = [
+            element
+            for element in same_kind
+            if (
+                element.element_id == verification.element_id
+                or element.resource_id == verification.field_id
+            )
+        ]
+        if (
+            not candidates
+            and verification.status == CredentialVerificationStatus.UNAVAILABLE
+            and len(same_kind) == 1
+        ):
+            candidates = same_kind
+        if len(candidates) != 1:
+            return None
+        return Action(
+            ActionKind.INPUT_TEXT,
+            target_id=candidates[0].element_id,
+            credential_kind=verification.kind,
+        )
+
+    def _arm_credential_verification(
+        self,
+        action: Action,
+        observation: UIObservation,
+        secret: str,
+    ) -> bool:
+        if action.credential_kind is None:
+            return False
+        expect_credential = getattr(
+            self._observer,
+            "expect_credential",
+            None,
+        )
+        if not callable(expect_credential):
+            return False
+        expect_credential(
+            action.credential_kind,
+            self._credential_field_key(action, observation)[1],
+            secret,
+        )
+        return True
+
+    @staticmethod
+    def _has_relevant_ui(observation: UIObservation) -> bool:
+        return any(
+            element.label
+            or element.resource_id
+            or element.clickable
+            or element.is_input
             for element in observation.elements
         )
 
@@ -401,6 +690,44 @@ class AppPilotAgent:
             "nextbutton",
             "idsibutton9",
         )
+
+    @staticmethod
+    def _submit_identity(
+        action: Action,
+        observation: UIObservation,
+    ) -> tuple[str, str, str] | None:
+        target = observation.find(action.target_id)
+        if target is None:
+            return None
+        label = (target.own_text or target.label).strip().casefold()
+        return (
+            target.resource_id.strip().casefold(),
+            label,
+            target.element_id,
+        )
+
+    @staticmethod
+    def _submitted_control_is_disabled(
+        observation: UIObservation,
+        identity: tuple[str, str, str] | None,
+    ) -> bool:
+        if identity is None:
+            return False
+        resource_id, label, element_id = identity
+        for element in observation.elements:
+            if element.enabled:
+                continue
+            current_resource = element.resource_id.strip().casefold()
+            current_label = (
+                element.own_text or element.label
+            ).strip().casefold()
+            if resource_id and current_resource == resource_id:
+                return True
+            if element.element_id == element_id:
+                return True
+            if not resource_id and label and current_label == label:
+                return True
+        return False
 
     def _has_actionable_step(self, observation, available_actions) -> bool:
         """Whether the agent should act now, or wait/re-observe instead.

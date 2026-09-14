@@ -169,3 +169,8 @@ class _SignInTracer:
             return None
         reason = get_reason(observation)
         return str(reason) if reason else None
+
+    def finish_run(self, succeeded: bool) -> None:
+        finish = getattr(self._inner, "finish_run", None)
+        if callable(finish):
+            finish(succeeded)
