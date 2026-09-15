@@ -15,6 +15,9 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from .supported_links import SUPPORTED_LINK_DOMAINS
 
 
 # --------------------------------------------------------------------------- #
@@ -72,9 +75,23 @@ _FIELD_SYNONYMS: dict[str, tuple[str, ...]] = {
     "expected_result": ("expected screen", "expected result", "expected", "result", "screen"),
     "installed": ("installed", "install state", "app installed", "fresh", "uninstalled"),
 }
-# Only explicit negatives mean a fresh/uninstalled first-open scenario; anything
-# else (including blank/unknown, "yes", "true") means the app is installed.
+_SPECIFIC_DEEP_LINK_SYNONYMS = {
+    "launch url",
+    "deep link",
+    "deeplink",
+    "launch link",
+}
+_INSTALLED_TRUE = {"true", "t", "yes", "y", "1", "installed"}
 _INSTALLED_FALSE = {"false", "f", "no", "n", "0", "uninstalled", "not installed", "fresh"}
+_REQUIRED_FIELDS = ("test_id", "deep_link", "user_type", "expected_result")
+_FIELD_DISPLAY = {
+    "test_id": "Test ID",
+    "deep_link": "Deep Link",
+    "user_type": "License",
+    "expected_result": "Expected Result",
+    "installed": "Installed",
+}
+_ALLOWED_SCHEMES = {"https"}
 # Deterministic signal (not model-driven) that a deeplink targets the genuine
 # first-open-after-install experience: the URL asks the app store to open on
 # load, which only makes sense when the app is not yet installed.
@@ -82,7 +99,15 @@ _APP_STORE_ON_LOAD = "openappstoreonload=true"
 
 
 def _parse_installed(raw: str) -> bool:
-    return (raw or "").strip().casefold() not in _INSTALLED_FALSE
+    value = (raw or "").strip().casefold()
+    if value in _INSTALLED_TRUE:
+        return True
+    if value in _INSTALLED_FALSE:
+        return False
+    raise ValueError(
+        "Installed must be one of: "
+        + ", ".join(sorted(_INSTALLED_TRUE | _INSTALLED_FALSE))
+    )
 
 
 def _derive_installed(deep_link: str) -> bool:
@@ -96,7 +121,7 @@ def _normalize_label(text: str) -> str:
     return " ".join((text or "").split()).casefold()
 
 
-def _match_field(label: str) -> str | None:
+def _field_match(label: str) -> tuple[str, int] | None:
     """Map a header cell label to a logical field, preferring the most specific
     (longest) synonym match so e.g. 'Expected Screen' maps to expected_result
     rather than the shorter 'screen'."""
@@ -104,13 +129,28 @@ def _match_field(label: str) -> str | None:
     if not norm:
         return None
     best_field: str | None = None
+    best_synonym: str | None = None
     best_len = 0
     for logical_field, synonyms in _FIELD_SYNONYMS.items():
         for synonym in synonyms:
             if synonym == norm or synonym in norm:
                 if len(synonym) > best_len:
-                    best_field, best_len = logical_field, len(synonym)
-    return best_field
+                    best_field = logical_field
+                    best_synonym = synonym
+                    best_len = len(synonym)
+    if best_field is None:
+        return None
+    if best_field == "deep_link":
+        return (
+            best_field,
+            2 if best_synonym in _SPECIFIC_DEEP_LINK_SYNONYMS else 1,
+        )
+    return best_field, best_len
+
+
+def _match_field(label: str) -> str | None:
+    match = _field_match(label)
+    return match[0] if match is not None else None
 
 
 def _column_letter(cell_ref: str) -> str:
@@ -197,25 +237,50 @@ def _looks_like_data(cells: dict[str, str]) -> bool:
     return any("://" in value for value in cells.values())
 
 
-def _map_header(cells: dict[str, str]) -> dict[str, str]:
+def _map_header(
+    cells: dict[str, str],
+    *,
+    row_number: int | None = None,
+) -> dict[str, str]:
     """Map header cells to logical fields: {column_letter: field}. Each field is
-    assigned at most once (first, most-specific match wins)."""
+    assigned at most once, preferring the strongest semantic match."""
     mapping: dict[str, str] = {}
     assigned: set[str] = set()
-    # Resolve per-cell best field, then assign in column order avoiding clashes.
-    scored = [
-        (letter, _match_field(label)) for letter, label in cells.items()
-    ]
-    for letter, logical_field in sorted(scored, key=lambda item: item[0]):
-        if logical_field and logical_field not in assigned:
+    deep_link_candidates: list[tuple[int, str]] = []
+    for letter, label in sorted(cells.items()):
+        match = _field_match(label)
+        if match is None:
+            continue
+        logical_field, score = match
+        if logical_field == "deep_link":
+            deep_link_candidates.append((score, letter))
+        elif logical_field not in assigned:
             mapping[letter] = logical_field
             assigned.add(logical_field)
+
+    ambiguous_letters: list[str] = []
+    if deep_link_candidates:
+        best_score = max(score for score, _letter in deep_link_candidates)
+        best_letters = sorted(
+            letter
+            for score, letter in deep_link_candidates
+            if score == best_score
+        )
+        mapping[best_letters[0]] = "deep_link"
+        if len(best_letters) > 1:
+            ambiguous_letters = best_letters
+
+    recognized_required = set(mapping.values()) & set(_REQUIRED_FIELDS)
+    if ambiguous_letters and len(recognized_required) >= 2:
+        location = (
+            f" row {row_number}" if row_number is not None else ""
+        )
+        raise ValueError(
+            f"Workbook header{location} has ambiguous columns: "
+            f"{_FIELD_DISPLAY['deep_link']} "
+            f"({', '.join(ambiguous_letters)})"
+        )
     return mapping
-
-
-def _is_usable_header(mapping: dict[str, str]) -> bool:
-    fields = set(mapping.values())
-    return "deep_link" in fields and "expected_result" in fields
 
 
 def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
@@ -249,29 +314,51 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
             ) from error
         sheet = ET.fromstring(sheet_bytes)
 
-    rows = [
-        cells
-        for cells in (_row_cells(row, shared) for row in sheet.iter(f"{_SHEET_NS}row"))
-        if any(cells.values())
-    ]
+    rows = []
+    for fallback_number, row in enumerate(
+        sheet.iter(f"{_SHEET_NS}row"), start=1
+    ):
+        cells = _row_cells(row, shared)
+        if any(cells.values()):
+            raw_number = row.get("r", "")
+            row_number = int(raw_number) if raw_number.isdigit() else fallback_number
+            rows.append((row_number, cells))
 
     # Recognise a header among the leading non-data rows (title rows are simply
     # ignored: they map too few fields to be a usable header).
     column_map = _COLUMNS
     data_start = 0
-    for index, cells in enumerate(rows):
+    header_row: int | None = None
+    for index, (row_number, cells) in enumerate(rows):
         if _looks_like_data(cells):
             data_start = index
             break
-        candidate = _map_header(cells)
-        if _is_usable_header(candidate):
+        candidate = _map_header(cells, row_number=row_number)
+        if len(set(candidate.values()) & set(_REQUIRED_FIELDS)) >= 2:
             column_map = candidate
+            header_row = row_number
     else:
         # No data row found (only title/header rows, or empty sheet).
         data_start = len(rows)
 
+    if header_row is not None:
+        missing_headers = [
+            _FIELD_DISPLAY[field]
+            for field in _REQUIRED_FIELDS
+            if field not in column_map.values()
+        ]
+        if missing_headers:
+            raise ValueError(
+                f"Workbook header row {header_row} is missing required column(s): "
+                + ", ".join(missing_headers)
+            )
+
     cases: list[DeeplinkTestCase] = []
-    for cells in rows[data_start:]:
+    seen_ids: dict[str, int] = {}
+    field_columns = {
+        logical_field: letter for letter, logical_field in column_map.items()
+    }
+    for row_number, cells in rows[data_start:]:
         values = {
             logical_field: cells.get(letter, "")
             for letter, logical_field in column_map.items()
@@ -291,15 +378,57 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
             if not present
         ]
         if missing:
+            contextual = [
+                f"{name} (column {field_columns.get(field, '?')})"
+                for field, name, present in (
+                    ("test_id", "Test ID", test_id),
+                    ("deep_link", "Deep Link", deep_link),
+                    ("user_type", "License", license_name),
+                    ("expected_result", "Expected Result", expected),
+                )
+                if not present
+            ]
             raise ValueError(
-                f"Deeplink test row is missing required column(s): {', '.join(missing)}"
+                f"Workbook row {row_number} is missing required value(s): "
+                + ", ".join(contextual)
+            )
+        normalized_id = test_id.casefold()
+        if normalized_id in seen_ids:
+            raise ValueError(
+                f"Workbook row {row_number}, column "
+                f"{field_columns.get('test_id', '?')} has duplicate Test ID "
+                f"{test_id!r}; first defined on row {seen_ids[normalized_id]}"
+            )
+        seen_ids[normalized_id] = row_number
+
+        parsed_link = urlsplit(deep_link)
+        deep_link_column = field_columns.get("deep_link", "?")
+        if parsed_link.scheme.casefold() not in _ALLOWED_SCHEMES:
+            raise ValueError(
+                f"Workbook row {row_number}, column {deep_link_column} has "
+                f"unsupported deeplink scheme {parsed_link.scheme!r}; "
+                "only https is allowed"
+            )
+        hostname = (parsed_link.hostname or "").casefold()
+        if hostname not in {
+            domain.casefold() for domain in SUPPORTED_LINK_DOMAINS
+        }:
+            raise ValueError(
+                f"Workbook row {row_number}, column {deep_link_column} has "
+                f"unsupported deeplink host {hostname!r}; allowed hosts: "
+                + ", ".join(SUPPORTED_LINK_DOMAINS)
             )
         installed_raw = values.get("installed", "")
-        installed = (
-            _parse_installed(installed_raw)
-            if installed_raw
-            else _derive_installed(deep_link)
-        )
+        if installed_raw:
+            try:
+                installed = _parse_installed(installed_raw)
+            except ValueError as error:
+                raise ValueError(
+                    f"Workbook row {row_number}, column "
+                    f"{field_columns.get('installed', '?')} is invalid: {error}"
+                ) from error
+        else:
+            installed = _derive_installed(deep_link)
         cases.append(
             DeeplinkTestCase(
                 test_id=test_id,

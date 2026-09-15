@@ -22,10 +22,27 @@ class AttemptResult:
 class TestCaseResult:
     case: DeeplinkTestCase
     attempts: list[AttemptResult] = field(default_factory=list)
+    cleanup_errors: list[str] = field(default_factory=list)
+    artifact_paths: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
+        return (
+            any(attempt.matched for attempt in self.attempts)
+            and not self.cleanup_errors
+        )
+
+    @property
+    def deeplink_matched(self) -> bool:
         return any(attempt.matched for attempt in self.attempts)
+
+    @property
+    def cleanup_status(self) -> str:
+        return "failed" if self.cleanup_errors else "completed"
+
+    def record_cleanup_failure(self, reason: str) -> None:
+        if reason not in self.cleanup_errors:
+            self.cleanup_errors.append(reason)
 
     @property
     def passing_attempt(self) -> int | None:
@@ -43,6 +60,7 @@ class SuiteReport:
     # Left generic here because ``SuiteReport`` is a plain data carrier and
     # does not own the suite's identity - the orchestrator does.
     suite_name: str = "Test"
+    cleanup_errors: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -66,11 +84,12 @@ class SuiteReport:
         ]
         for result in self.results:
             status = "PASS" if result.passed else "FAIL"
+            deeplink_status = "PASS" if result.deeplink_matched else "FAIL"
             attempt_no = result.passing_attempt or len(result.attempts)
             lines.append(
                 f"{result.case.test_id}  {status}  Attempt {attempt_no}"
             )
-            lines.append(f"    {self.suite_name} test: {status}")
+            lines.append(f"    {self.suite_name} test: {deeplink_status}")
             lines.append(f"    Overall test case: {status}")
             lines.append(f"    Expected: {result.case.expected_result}")
             for attempt in result.attempts:
@@ -78,6 +97,14 @@ class SuiteReport:
                 lines.append(
                     f"    Attempt {attempt.attempt}: {mark} - {attempt.reason}"
                 )
+            lines.append(f"    Cleanup: {result.cleanup_status}")
+            for error in result.cleanup_errors:
+                lines.append(f"      Cleanup failure: {error}")
+            lines.append("")
+        if self.cleanup_errors:
+            lines.append("Suite cleanup failures:")
+            for error in self.cleanup_errors:
+                lines.append(f"  - {error}")
             lines.append("")
         lines.append(f"Total test cases: {self.total}")
         lines.append(f"{self.suite_name} test cases passed: {self.passed}")

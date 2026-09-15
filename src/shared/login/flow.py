@@ -9,7 +9,6 @@ can be overridden by the caller.
 """
 
 from __future__ import annotations
-
 from collections.abc import Callable
 from typing import Protocol
 
@@ -162,6 +161,9 @@ class _SignInTracer:
             logtags.trace("Login goal reached: true", logtags.LOGIN)
             logtags.trace("Returning control to use case", logtags.LOGIN)
         return reached
+
+    def has_actionable_step(self, observation: UIObservation) -> bool:
+        return bool(self._inner.has_actionable_step(observation))
 
     def failure_reason(self, observation: UIObservation) -> "str | None":
         get_reason = getattr(self._inner, "failure_reason", None)

@@ -10,20 +10,31 @@ Deeplink use case's own contract.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
+import uuid
 import zipfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 
 try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
-    from ...apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
-    from ...apppilot.agent import _load_dotenv
+    from ...apppilot.android import (
+        MaestroExecutor,
+        MaestroHierarchyObserver,
+    )
+    from ...apppilot.agent import (
+        _default_max_actions,
+        _default_max_stuck_actions,
+        _load_dotenv,
+    )
     from ...apppilot import (
         apk_config,
+        apk_trust,
         device_config,
+        device_lock,
         email_delivery,
         logtags,
     )
@@ -41,10 +52,25 @@ try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
         build_login_agent,
         resolve_decision_provider,
     )
+    from ...shared.model_client import ModelConfigurationError
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
-    from apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
-    from apppilot.agent import _load_dotenv
-    from apppilot import apk_config, device_config, email_delivery, logtags
+    from apppilot.android import (
+        MaestroExecutor,
+        MaestroHierarchyObserver,
+    )
+    from apppilot.agent import (
+        _default_max_actions,
+        _default_max_stuck_actions,
+        _load_dotenv,
+    )
+    from apppilot import (
+        apk_config,
+        apk_trust,
+        device_config,
+        device_lock,
+        email_delivery,
+        logtags,
+    )
     from apppilot import telemetry
     from shared.installer import LocalApkInstaller
     from shared.account.session import AndroidAccountSession
@@ -59,7 +85,9 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
         build_login_agent,
         resolve_decision_provider,
     )
+    from shared.model_client import ModelConfigurationError
 
+from .artifacts import FailureArtifactWriter
 from .deeplink_testcase_loader import DeeplinkTestCase, load_deeplink_cases
 from .verification import LLMExpectationJudge
 from .runner import (
@@ -160,6 +188,17 @@ def _resolve_credential_profiles(
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    if argv is not None:
+        argv = list(argv)
+        for index, value in enumerate(argv[:-1]):
+            if (
+                value == "--verify-timeout"
+                and argv[index + 1].casefold() in {"nan", "inf", "+inf", "-inf"}
+            ):
+                argv[index : index + 2] = [
+                    f"--verify-timeout={argv[index + 1]}"
+                ]
+                break
     parser = argparse.ArgumentParser(
         description="Run the data-driven AppPilot deeplink test suite."
     )
@@ -211,8 +250,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_attempts < 1:
         print("ERROR: --max-attempts must be at least 1", file=sys.stderr)
         return 2
-    if args.verify_timeout < 0:
-        print("ERROR: --verify-timeout must not be negative", file=sys.stderr)
+    if not math.isfinite(args.verify_timeout) or args.verify_timeout < 0:
+        print(
+            "ERROR: --verify-timeout must be a finite non-negative number",
+            file=sys.stderr,
+        )
         return 2
 
     interactive = getattr(sys.stdin, "isatty", lambda: False)()
@@ -238,6 +280,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CredentialConfigurationError as error:
         print(f"ERROR: invalid credential configuration: {error}", file=sys.stderr)
         return 2
+    try:
+        trust_config = apk_trust.ApkTrustConfig.from_env()
+    except apk_trust.ApkTrustConfigurationError as error:
+        print(f"ERROR: invalid APK trust configuration: {error}", file=sys.stderr)
+        return 2
+    try:
+        login_max_actions = _default_max_actions()
+        login_max_stuck_actions = _default_max_stuck_actions()
+    except ValueError as error:
+        print(f"ERROR: invalid runtime configuration: {error}", file=sys.stderr)
+        return 2
 
     # AppPilot installs ONLY a user-provided local APK (no build/acquisition).
     # Resolve it up front from --apk, a saved path, or an interactive prompt, and
@@ -247,8 +300,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if apk_path is None:
         print("ERROR: no valid APK path provided", file=sys.stderr)
         return 2
+    trust_guard = apk_trust.ApkTrustGuard(trust_config)
+    try:
+        trust_guard.validate_apk(apk_path)
+    except apk_trust.ApkTrustError as error:
+        print(f"ERROR: APK trust validation failed: {error}", file=sys.stderr)
+        return 2
 
-    judge = LLMExpectationJudge.from_env()
+    try:
+        judge = LLMExpectationJudge.from_env()
+    except ModelConfigurationError as error:
+        print(f"ERROR: invalid model configuration: {error}", file=sys.stderr)
+        return 2
     if judge is None:
         print(
             "ERROR: no evaluation model configured. Set APPPILOT_MODEL and "
@@ -265,8 +328,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if device_id is None:
         return 2
-    executor = MaestroExecutor(APP_ID, device_id)
-    observer = MaestroHierarchyObserver(device_id)
+    try:
+        observer = MaestroHierarchyObserver(device_id)
+        executor = MaestroExecutor(
+            trust_config.package_id,
+            device_id,
+            credential_release_check=lambda timeout: (
+                trust_guard.assert_credential_release(
+                    device_id, timeout=timeout
+                )
+            ),
+            credential_observer=observer,
+        )
+    except ValueError as error:
+        print(f"ERROR: invalid runtime configuration: {error}", file=sys.stderr)
+        return 2
     warm_up = (
         None
         if args.no_warm_up
@@ -292,6 +368,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             observer=observer,
             foreground_check=executor.is_foreground,
             runtime_context=runtime_context,
+            max_actions=login_max_actions,
+            max_stuck_actions=login_max_stuck_actions,
         ),
         flow_builder=lambda agent: SharedLoginFlow(
             agent,
@@ -305,7 +383,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     logtags.trace(f"using APK: {apk_path}", logtags.INSTALL)
-    installer = LocalApkInstaller(executor, str(apk_path))
+    installer = LocalApkInstaller(
+        executor,
+        str(apk_path),
+        pre_install_check=trust_guard.before_install,
+        post_install_check=lambda: trust_guard.verify_installed(device_id),
+    )
+    run_id = uuid.uuid4().hex
+    artifact_writer = FailureArtifactWriter(
+        run_id,
+        device_id,
+        {
+            "path": str(apk_path),
+            "package_id": trust_config.package_id,
+            "certificate_sha256": trust_config.certificate_sha256,
+        },
+    )
     runner = DeeplinkTestRunner(
         observer=observer,
         executor=executor,
@@ -317,27 +410,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         account_session=account_session,
         profile_for_license=login_flows.profile_for_license,
         installer=installer,
+        deterministic_probe=executor,
+        expected_package_id=trust_config.package_id,
+        artifact_writer=artifact_writer,
     )
-    # Ask UP FRONT whether to email the report and to whom, so the operator can
-    # start the (long) suite and walk away; delivery happens automatically once
-    # the run finishes. Prompting is isolated and must never affect the suite
-    # result, so any failure here is swallowed.
+    lock = device_lock.DeviceProcessLock(device_id, run_id=run_id)
     try:
-        email_recipient = email_delivery.prompt_email_recipient(
-            env=os.environ, interactive=interactive
-        )
-    except Exception as error:  # pragma: no cover - defensive; prompt never raises
-        print(
-            logtags.prefix(
-                logtags.EMAIL,
-                f"email prompt failed - continuing without email: {error}",
-            )
-        )
-        email_recipient = None
+        with lock:
+            # Ask UP FRONT whether to email the report and to whom, so the operator
+            # can start the long suite and walk away. Holding the device lock here
+            # ensures a competing process fails before either process mutates it.
+            try:
+                email_recipient = email_delivery.prompt_email_recipient(
+                    env=os.environ, interactive=interactive
+                )
+            except Exception as error:  # pragma: no cover - defensive
+                print(
+                    logtags.prefix(
+                        logtags.EMAIL,
+                        f"email prompt failed - continuing without email: {error}",
+                    )
+                )
+                email_recipient = None
 
-    # The orchestrator owns the explicit top-level lifecycle and composes the
-    # runner for per-case execution, judging, retry and reporting.
-    report = DeeplinkSuiteOrchestrator(runner).run(cases)
+            # The orchestrator owns the explicit top-level lifecycle and composes
+            # the runner for per-case execution, judging, retry and reporting.
+            report = DeeplinkSuiteOrchestrator(runner).run(cases)
+    except device_lock.DeviceLockError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
     # Best-effort telemetry (roadmap #8/#9): one minimal record per real suite
     # run, submitted from the CLI seam only (never in the orchestrator, so direct
     # orchestrator/test calls emit nothing). Never raises; never affects results.

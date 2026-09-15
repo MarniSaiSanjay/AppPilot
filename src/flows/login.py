@@ -9,7 +9,7 @@ imports (``flows.login`` and the ``apppilot_agent`` facade) and
 from __future__ import annotations
 
 try:  # package-relative (python -m src.flows.login) vs top-level (src on path)
-    from ..shared.login import (  # noqa: F401
+    from ..shared.login import (
         AuthoritativeLoginGoalEvaluator,
         CompositeTerminalEvaluator,
         DEFAULT_GUIDANCE,
@@ -28,7 +28,7 @@ try:  # package-relative (python -m src.flows.login) vs top-level (src on path)
         _parse_args,
     )
 except ImportError:  # top-level (src on sys.path)
-    from shared.login import (  # noqa: F401
+    from shared.login import (
         AuthoritativeLoginGoalEvaluator,
         CompositeTerminalEvaluator,
         DEFAULT_GUIDANCE,
@@ -46,6 +46,25 @@ except ImportError:  # top-level (src on sys.path)
         resolve_decision_provider,
         _parse_args,
     )
+
+__all__ = [
+    "AuthoritativeLoginGoalEvaluator",
+    "CompositeTerminalEvaluator",
+    "DEFAULT_GUIDANCE",
+    "DeterministicTerminalState",
+    "LLMLoginGoalEvaluator",
+    "LoginCapability",
+    "LoginPolicy",
+    "PROTOTYPE_GOAL",
+    "SemanticStateEvaluator",
+    "SemanticTerminalState",
+    "SharedLoginFlow",
+    "SignedInCopilotGoalEvaluator",
+    "_parse_args",
+    "build_login_agent",
+    "main",
+    "resolve_decision_provider",
+]
 
 
 if __name__ == "__main__":

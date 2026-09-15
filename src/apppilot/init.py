@@ -17,24 +17,39 @@ from __future__ import annotations
 import argparse
 import enum
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlparse
 
-from . import apk_config, device, device_config, email_delivery, environment
+from . import (
+    apk_config,
+    apk_trust,
+    device,
+    device_config,
+    email_delivery,
+    environment,
+)
 
 # `.agent` resolves within the top package in both import styles
 # (`apppilot.agent` and `src.apppilot.agent`).
 from .agent import _load_dotenv
 
 try:  # `python -m src.apppilot_init` -> package is `src.apppilot`
-    from ..shared.model_client import ChatModelClient
+    from ..shared.model_client import (
+        ChatModelClient,
+        ModelConfigurationError,
+        validate_base_url,
+    )
 except ImportError:  # `python3 src/apppilot_init.py` -> `src` is on sys.path
-    from shared.model_client import ChatModelClient  # type: ignore[no-redef]
+    from shared.model_client import (  # type: ignore[no-redef]
+        ChatModelClient,
+        ModelConfigurationError,
+        validate_base_url,
+    )
 
 
 # =============================================================================
@@ -169,21 +184,81 @@ def check_maestro(*, which=None, runner=None) -> CheckResult:
 
 
 def check_java(*, which=None, runner=None) -> CheckResult:
-    """Report Java availability (INFORMATIONAL - never blocks readiness)."""
-    probe = environment.probe_executable(
-        "java", ["-version"],
-        which=which or shutil.which,
+    """Verify Java 17+ availability because Maestro requires it."""
+    which = which or shutil.which
+    if not which("java"):
+        return CheckResult(
+            "java", _ENVIRONMENT, Importance.REQUIRED, Status.FAIL,
+            "Java not found",
+            "Install Java 17+ and add java to PATH; Maestro requires it.",
+        )
+    ok, output = environment.run(
+        ["java", "-version"],
         runner=runner or subprocess.run,
     )
-    if not probe.found:
+    match = re.search(r'\bversion\s+"([^"]+)"', output, re.IGNORECASE)
+    version = match.group(1) if ok and match else None
+    if not version or not re.fullmatch(
+        r"\d+(?:\.\d+)*(?:_\d+)?(?:[-+][0-9A-Za-z.-]+)?",
+        version,
+    ):
         return CheckResult(
-            "java", _ENVIRONMENT, Importance.INFORMATIONAL, Status.FAIL,
-            "Java not found (informational)",
+            "java", _ENVIRONMENT, Importance.REQUIRED, Status.FAIL,
+            "Java version could not be determined",
+            "Install Java 17+ and ensure `java -version` reports its version.",
         )
-    version = f" {probe.version}" if probe.version else ""
+    parts = version.split(".")
+    try:
+        major = int(parts[1] if parts[0] == "1" and len(parts) > 1 else parts[0])
+    except ValueError:
+        major = 0
+    if major < 17:
+        return CheckResult(
+            "java", _ENVIRONMENT, Importance.REQUIRED, Status.FAIL,
+            f"Java {version} is unsupported",
+            "Install Java 17 or newer and make it the active java on PATH.",
+        )
     return CheckResult(
-        "java", _ENVIRONMENT, Importance.INFORMATIONAL, Status.PASS,
-        f"Java{version} (informational)",
+        "java", _ENVIRONMENT, Importance.REQUIRED, Status.PASS,
+        f"Java {version}",
+    )
+
+
+def check_apk_tools(
+    *,
+    which=None,
+    env: Mapping[str, str] | None = None,
+    home=None,
+) -> CheckResult:
+    """Verify the external tools required for APK trust inspection."""
+    which = which or shutil.which
+    missing = []
+    if not apk_trust.resolve_android_tool(
+        "apksigner", which=which, env=env, home=home
+    ):
+        missing.append("apksigner")
+    if not apk_trust.resolve_android_tool(
+        "apkanalyzer", which=which, env=env, home=home
+    ) and not apk_trust.resolve_android_tool(
+        "aapt", which=which, env=env, home=home
+    ):
+        missing.append("apkanalyzer or aapt")
+    if missing:
+        return CheckResult(
+            "apk-tools",
+            _ENVIRONMENT,
+            Importance.REQUIRED,
+            Status.FAIL,
+            "APK inspection tools missing: " + ", ".join(missing),
+            "Install Android SDK build-tools and command-line tools, and set "
+            "ANDROID_SDK_ROOT or ANDROID_HOME if the SDK is in a custom location.",
+        )
+    return CheckResult(
+        "apk-tools",
+        _ENVIRONMENT,
+        Importance.REQUIRED,
+        Status.PASS,
+        "APK inspection tools available",
     )
 
 
@@ -205,12 +280,10 @@ def _model_config_problem(config: Mapping[str, str]) -> Optional[str]:
         return "APPPILOT_MODEL is blank"
     if not config["api_key"].strip():
         return "APPPILOT_MODEL_API_KEY is blank"
-    base_url = config["base_url"]
-    parsed = urlparse(base_url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return (
-            f"APPPILOT_MODEL_BASE_URL is not a valid http(s) URL: {base_url!r}"
-        )
+    try:
+        validate_base_url(config["base_url"])
+    except ModelConfigurationError as error:
+        return str(error)
     return None
 
 
@@ -224,7 +297,15 @@ def check_model(env: Optional[Mapping[str, str]] = None) -> CheckResult:
     endpoint or consume tokens, so ``PASS`` means "configured", not "reachable".
     """
     source = os.environ if env is None else env
-    config = ChatModelClient.config_from_env(source)
+    try:
+        config = ChatModelClient.config_from_env(source)
+    except ModelConfigurationError as error:
+        return CheckResult(
+            "model", _MODEL, Importance.REQUIRED, Status.FAIL,
+            f"Model misconfigured ({error})",
+            "Use HTTPS for remote model endpoints. HTTP is allowed only for "
+            "explicit loopback development endpoints.",
+        )
     if not config:
         return CheckResult(
             "model", _MODEL, Importance.REQUIRED, Status.NOT_CONFIGURED,
@@ -600,6 +681,8 @@ def check_apk(
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
     resolve: Callable = apk_config.resolve_apk_path,
+    env: Optional[Mapping[str, str]] = None,
+    guard_factory: Callable = apk_trust.ApkTrustGuard,
 ) -> CheckResult:
     """Resolve/validate the local APK and map it to a REQUIRED readiness check.
 
@@ -624,6 +707,19 @@ def check_apk(
             "No valid APK configured",
             "Configure a valid APK (run /init and enter the path, or pass "
             "--apk to the run command).",
+        )
+    try:
+        config = apk_trust.ApkTrustConfig.from_env(env)
+        guard_factory(config).validate_apk(path)
+    except apk_trust.ApkTrustError as error:
+        return CheckResult(
+            "apk",
+            _APK,
+            Importance.REQUIRED,
+            Status.FAIL,
+            f"APK trust validation failed ({error})",
+            "Configure APPPILOT_EXPECTED_PACKAGE_ID and "
+            "APPPILOT_TRUSTED_CERT_SHA256, and provide a matching signed APK.",
         )
     return CheckResult(
         "apk", _APK, Importance.REQUIRED, Status.PASS,
@@ -843,6 +939,7 @@ def run_all_checks(
         check_adb(which=which, runner=runner),
         check_maestro(which=which, runner=runner),
         check_java(which=which, runner=runner),
+        check_apk_tools(which=which),
         check_model(env),
     ]
 
@@ -895,7 +992,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             adb_available=_adb_available(core),
             interactive=_is_interactive(),
         )
-        apk_result = check_apk(interactive=_is_interactive())
+        apk_result = check_apk(interactive=_is_interactive(), env=os.environ)
         email_result = check_email(interactive=_is_interactive())
         results = _compose_results(core, device_results, apk_result, email_result)
         text, exit_code = render(results)

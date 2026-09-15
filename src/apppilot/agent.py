@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from collections import Counter
@@ -65,6 +66,19 @@ class AppPilotAgent:
         actionable_step_check: "Callable[[object], bool] | None" = None,
         log_tag: str = "",
     ) -> None:
+        if max_actions < 1:
+            raise ValueError("max_actions must be at least 1")
+        if max_stuck_actions < 1:
+            raise ValueError("max_stuck_actions must be at least 1")
+        if (
+            not math.isfinite(nonactionable_wait_seconds)
+            or nonactionable_wait_seconds < 0
+        ):
+            raise ValueError(
+                "nonactionable_wait_seconds must be a finite non-negative number"
+            )
+        if max_nonactionable_waits < 0:
+            raise ValueError("max_nonactionable_waits must not be negative")
         self._observer = observer
         self._goal_evaluator = goal_evaluator
         self._decision_provider = decision_provider
@@ -257,11 +271,7 @@ class AppPilotAgent:
                 )
                 self._timed_call(
                     "credential recovery",
-                    lambda: fallback(
-                        recovery_action,
-                        observation,
-                        secret,
-                    ),
+                    lambda: fallback(recovery_action, observation, secret),
                 )
                 if not self._arm_credential_verification(
                     recovery_action,
@@ -321,7 +331,9 @@ class AppPilotAgent:
                 post_submit_transition_active = False
                 post_submit_empty_observations = 0
             waits = 0
-            while not self._has_actionable_step(observation, available_actions):
+            while not self._has_actionable_step(
+                observation, available_actions
+            ):
                 if (
                     post_submit_transition_active
                     and not self._has_relevant_ui(observation)
@@ -729,7 +741,11 @@ class AppPilotAgent:
                 return True
         return False
 
-    def _has_actionable_step(self, observation, available_actions) -> bool:
+    def _has_actionable_step(
+        self,
+        observation,
+        available_actions,
+    ) -> bool:
         """Whether the agent should act now, or wait/re-observe instead.
 
         Two conditions must hold:

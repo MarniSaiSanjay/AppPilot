@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from xml.etree import ElementTree
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from . import logtags
+from .apk_trust import (
+    ForegroundComponent,
+    parse_activity_component,
+    parse_foreground_component,
+)
 from .models import (
     Action,
     ActionKind,
@@ -48,6 +56,23 @@ _DRIVER_STARTUP_RETRY_DELAY = 3.0
 # is often too short on a loaded emulator right after install/uninstall/build.
 _DRIVER_STARTUP_TIMEOUT_ENV = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
 _DRIVER_STARTUP_TIMEOUT_MS = "120000"
+_MAESTRO_RUNTIME_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "JAVA_HOME",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "USER",
+    "USERNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+)
 _ADB_SAFE_USERNAME = re.compile(r"[\x21-\x7e]+\Z")
 _ADB_USERNAME_CHARACTER_DELAY_SECONDS = 0.10
 _PASSWORD_MASK_CHARACTERS = frozenset("*•●·∙▪◦")
@@ -71,8 +96,57 @@ _APP_LINK_APPROVED_STATES = {
 }
 
 
+def _nonnegative_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a non-negative integer") from error
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _nonnegative_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError as error:
+        raise ValueError(
+            f"{name} must be a finite non-negative number"
+        ) from error
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return value
+
+
+def _maestro_environment(
+    secret: str | None = None,
+    source: dict[str, str] | None = None,
+) -> dict[str, str]:
+    source = os.environ if source is None else source
+    environment = {
+        name: source[name]
+        for name in _MAESTRO_RUNTIME_ENV_KEYS
+        if source.get(name)
+    }
+    environment[_DRIVER_STARTUP_TIMEOUT_ENV] = _DRIVER_STARTUP_TIMEOUT_MS
+    if secret is not None:
+        environment[MAESTRO_SECRET_ENV] = secret
+    return environment
+
+
 class AndroidOperationalError(RuntimeError):
     """Expected device/Maestro infrastructure failure."""
+
+
+@dataclass(frozen=True)
+class SupportedLinkState:
+    user_id: str
+    domains: tuple[str, ...]
+    handling_allowed: bool
+    enabled_domains: tuple[str, ...]
+    verification_states: tuple[tuple[str, str], ...]
 
 
 class MaestroHierarchyObserver:
@@ -101,15 +175,14 @@ class MaestroHierarchyObserver:
         self._ime_provider = ime_package_provider
         self._excluded_prefixes = self._BASE_EXCLUDED_PREFIXES
         self._ime_resolved = False
-        self._popup_unblock_budget_limit = max(
-            0,
-            int(
-                os.environ.get("APPPILOT_POPUP_UNBLOCK_BUDGET", "3")
-            ),
+        self._popup_unblock_budget_limit = _nonnegative_env_int(
+            "APPPILOT_POPUP_UNBLOCK_BUDGET",
+            3,
         )
         self._popup_unblock_budget = self._popup_unblock_budget_limit
-        self._popup_unblock_settle_seconds = float(
-            os.environ.get("APPPILOT_POPUP_UNBLOCK_SETTLE", "1.0")
+        self._popup_unblock_settle_seconds = _nonnegative_env_float(
+            "APPPILOT_POPUP_UNBLOCK_SETTLE",
+            1.0,
         )
         self._pending_credential_check: (
             tuple[CredentialKind, str, bytes, int] | None
@@ -186,7 +259,7 @@ class MaestroHierarchyObserver:
             except AndroidOperationalError as recovery_error:
                 raise maestro_error from recovery_error
 
-    def _capture_uiautomator(self) -> UIObservation:
+    def _capture_uiautomator(self, timeout: float = 15) -> UIObservation:
         command = [
             "adb",
             "-s",
@@ -202,7 +275,7 @@ class MaestroHierarchyObserver:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=timeout,
             )
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             raise AndroidOperationalError(
@@ -252,7 +325,7 @@ class MaestroHierarchyObserver:
             ],
         }
 
-    def _capture_maestro(self) -> UIObservation:
+    def _capture_maestro(self, timeout: float = 30) -> UIObservation:
         command = [
             "maestro",
             "--no-ansi",
@@ -266,7 +339,8 @@ class MaestroHierarchyObserver:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=timeout,
+                env=_maestro_environment(),
             )
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             # ValueError covers UnicodeDecodeError from text=True decoding of
@@ -364,13 +438,13 @@ class MaestroHierarchyObserver:
         time.sleep(self._popup_unblock_settle_seconds)
         return self._capture()
 
-    def _focused_window_is_popup(self) -> bool:
+    def _focused_window_is_popup(self, timeout: float = 15) -> bool:
         """True when the focused window is a separate pop-up window not covered
         by the hierarchy dump (read from ``dumpsys window`` mCurrentFocus)."""
         try:
             result = subprocess.run(
                 ["adb", "-s", self._device_id, "shell", "dumpsys", "window"],
-                check=False, capture_output=True, text=True, timeout=15,
+                check=False, capture_output=True, text=True, timeout=timeout,
             )
         except Exception:
             return False
@@ -379,7 +453,7 @@ class MaestroHierarchyObserver:
                 return True
         return False
 
-    def _press_back(self) -> bool:
+    def _press_back(self, timeout: float = 15) -> bool:
         try:
             result = subprocess.run(
                 [
@@ -394,7 +468,7 @@ class MaestroHierarchyObserver:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=timeout,
             )
         except (OSError, subprocess.SubprocessError):
             return False
@@ -416,7 +490,7 @@ class MaestroHierarchyObserver:
         if package:
             self._excluded_prefixes = self._excluded_prefixes + (f"{package}:",)
 
-    def _query_ime_package(self) -> "str | None":
+    def _query_ime_package(self, timeout: float = 10) -> "str | None":
         result = subprocess.run(
             [
                 "adb",
@@ -431,7 +505,7 @@ class MaestroHierarchyObserver:
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
         )
         value = (result.stdout or "").strip()
         if not value or value == "null":
@@ -455,6 +529,7 @@ class MaestroHierarchyObserver:
         accessibility_text = self._clean(attributes.get("accessibilityText"))
         hint_text = self._clean(attributes.get("hintText"))
         class_name = self._clean(attributes.get("class"), limit=120)
+        package_name = self._clean(attributes.get("package"), limit=200)
         clickable = self._as_bool(attributes.get("clickable", node.get("clickable")))
         enabled = self._as_bool(attributes.get("enabled", node.get("enabled")), True)
         is_input = class_name.endswith("EditText") or "TextInput" in class_name
@@ -467,11 +542,20 @@ class MaestroHierarchyObserver:
         # detected KIND (never the field content). This keeps the credential
         # classification intact for downstream consumers (available actions and
         # validation) while guaranteeing no secret can leak.
-        field_credential_kind = (
-            infer_credential_kind(resource_id, hint_text, class_name, accessibility_text)
-            if is_input
-            else None
-        )
+        field_credential_kind = None
+        if is_input:
+            field_credential_kind = (
+                CredentialKind.PASSWORD
+                if self._as_bool(
+                    attributes.get("password", node.get("password"))
+                )
+                else infer_credential_kind(
+                    resource_id,
+                    hint_text,
+                    class_name,
+                    accessibility_text,
+                )
+            )
         if (
             self._pending_credential_check is not None
             and field_credential_kind is not None
@@ -543,6 +627,7 @@ class MaestroHierarchyObserver:
                     label=label,
                     bounds=self._parse_bounds(attributes.get("bounds")),
                     checked=self._optional_bool(attributes.get("checked")),
+                    package_name=package_name,
                 )
             )
 
@@ -610,9 +695,24 @@ class MaestroHierarchyObserver:
 
 
 class MaestroExecutor:
-    def __init__(self, app_id: str, device_id: str) -> None:
+    def __init__(
+        self,
+        app_id: str,
+        device_id: str,
+        *,
+        credential_release_check: Callable[[float], None] | None = None,
+        credential_observer: MaestroHierarchyObserver | None = None,
+    ) -> None:
         self._app_id = app_id
         self._device_id = device_id
+        self._credential_release_check = credential_release_check
+        self._credential_observer = credential_observer
+        self._last_deeplink_component: ForegroundComponent | None = None
+
+    def bind_credential_observer(
+        self, observer: MaestroHierarchyObserver
+    ) -> None:
+        self._credential_observer = observer
 
     def execute(
         self,
@@ -688,10 +788,17 @@ class MaestroExecutor:
         target = observation.find(action.target_id)
         if target is None:
             raise ValueError("Cannot replace a credential without an observed target")
-        self._input_credential_via_clipboard(target, secret)
+        target = self._revalidate_credential_target(
+            action.credential_kind, target
+        )
+        self._input_credential_via_clipboard(
+            target,
+            secret,
+            action.credential_kind,
+        )
         return CredentialInputMethod.CLIPBOARD
 
-    def open_link(self, deep_link: str) -> None:
+    def open_link(self, deep_link: str, timeout: float = 180) -> None:
         """Launch an exact deep link through Android's VIEW intent.
 
         The link is executed verbatim as supplied by the test case; nothing about
@@ -709,6 +816,7 @@ class MaestroExecutor:
                 "-d",
                 shlex.quote(deep_link),
             ],
+            timeout=timeout,
             operation="open deeplink",
         )
         combined = f"{result.stdout or ''}{result.stderr or ''}"
@@ -716,10 +824,44 @@ class MaestroExecutor:
             raise AndroidOperationalError(
                 f"adb open deeplink failed: {combined.strip()}"
             )
+        status = next(
+            (
+                line.split(":", 1)[1].strip().casefold()
+                for line in combined.splitlines()
+                if line.strip().casefold().startswith("status:")
+            ),
+            "",
+        )
+        if status and status != "ok":
+            raise AndroidOperationalError(
+                f"adb open deeplink returned status {status}"
+            )
+        self._last_deeplink_component = next(
+            (
+                component
+                for line in combined.splitlines()
+                if line.strip().casefold().startswith("activity:")
+                and (
+                    component := parse_activity_component(
+                        line.split(":", 1)[1].strip()
+                    )
+                )
+                is not None
+            ),
+            None,
+        )
 
-    def launch_app(self) -> None:
+    @property
+    def last_deeplink_component(self) -> ForegroundComponent | None:
+        return self._last_deeplink_component
+
+    @property
+    def app_id(self) -> str:
+        return self._app_id
+
+    def launch_app(self, timeout: float = 30) -> None:
         """Launch the app (used e.g. by first-install warm-up)."""
-        self.launch_app_via_adb()
+        self.launch_app_via_adb(timeout=timeout)
 
     def launch_app_via_open_btn_click(self, timeout: float = 60) -> None:
         """Launch the app by tapping the store's "Open" button via Maestro.
@@ -759,17 +901,19 @@ class MaestroExecutor:
                 f"adb launch failed for {self._app_id}: {combined.strip()}"
             )
 
-    def stop_app(self) -> None:
+    def stop_app(self, timeout: float = 180) -> None:
         """Force-stop (kill) the app."""
         self._run_adb_checked(
             ["shell", "am", "force-stop", self._app_id],
+            timeout=timeout,
             operation="stop app",
         )
 
-    def is_installed(self) -> bool:
+    def is_installed(self, timeout: float = 60) -> bool:
         """Return whether the app package is currently installed (via adb)."""
         result = self._run_adb_checked(
             ["shell", "pm", "list", "packages", self._app_id],
+            timeout=timeout,
             operation="query installed packages",
         )
         expected = f"package:{self._app_id}"
@@ -787,24 +931,28 @@ class MaestroExecutor:
         while the store window (e.g. Google Play) is still foreground; only the
         resumed-activity package proves the app is really open.
         """
+        component = self.foreground_component(timeout=timeout)
+        return component is not None and component.package_id == self._app_id
+
+    def foreground_component(
+        self, timeout: float = 15
+    ) -> ForegroundComponent | None:
+        """Return the currently resumed Android package/activity, if observable."""
         result = self._run_adb_checked(
             ["shell", "dumpsys", "activity", "activities"],
             timeout=timeout,
             operation="query foreground activity",
         )
-        for line in (result.stdout or "").splitlines():
-            stripped = line.strip()
-            # `mResumedActivity` / `topResumedActivity` name the currently
-            # foreground activity; the app is foreground only if its package owns
-            # that resumed activity.
-            if "ResumedActivity" in stripped and self._app_id in stripped:
-                return True
-        return False
+        return parse_foreground_component(
+            f"{result.stdout or ''}\n{result.stderr or ''}"
+        )
 
-    def uninstall_app(self) -> None:
+    def uninstall_app(self, timeout: float = 180) -> None:
         """Uninstall the app package and fail if adb does not confirm success."""
         result = self._run_adb_checked(
-            ["uninstall", self._app_id], operation="uninstall app"
+            ["uninstall", self._app_id],
+            timeout=timeout,
+            operation="uninstall app",
         )
         combined = f"{result.stdout or ''}{result.stderr or ''}"
         if "Success" not in combined:
@@ -812,16 +960,27 @@ class MaestroExecutor:
                 f"adb uninstall did not confirm success: {combined.strip()}"
             )
 
-    def ensure_uninstalled(self) -> bool:
+    def ensure_uninstalled(self, timeout: float = 180) -> bool:
         """Guarantee a genuinely fresh (uninstalled) app before a first-open test.
 
         Clearing app data is not enough for a true first-install, so this removes
         the APK entirely when present. Returns True iff an app was actually
         uninstalled (False if already absent).
         """
-        if self.is_installed():
-            self.uninstall_app()
-            if self.is_installed():
+        deadline = time.monotonic() + timeout
+        if self.is_installed(
+            timeout=self._remaining_deadline(
+                deadline, "query installed package"
+            )
+        ):
+            self.uninstall_app(
+                timeout=self._remaining_deadline(deadline, "uninstall app")
+            )
+            if self.is_installed(
+                timeout=self._remaining_deadline(
+                    deadline, "confirm package uninstall"
+                )
+            ):
                 raise AndroidOperationalError(
                     f"package {self._app_id} is still installed after uninstall"
                 )
@@ -845,7 +1004,9 @@ class MaestroExecutor:
                 f"adb install failed for {apk_path}: {combined.strip()}"
             )
 
-    def enable_supported_links(self, domains: Sequence[str]) -> None:
+    def enable_supported_links(
+        self, domains: Sequence[str], timeout: float = 180
+    ) -> None:
         """Approve declared App Link domains for the current Android user."""
         normalized = tuple(
             dict.fromkeys(domain.strip().casefold() for domain in domains)
@@ -861,19 +1022,18 @@ class MaestroExecutor:
                 "Invalid supported-link domain(s): " + ", ".join(invalid)
             )
 
-        user_result = self._run_adb_checked(
-            ["shell", "am", "get-current-user"],
-            operation="query current Android user",
-        )
-        user_id = (user_result.stdout or "").strip()
-        if not user_id.isdigit():
-            raise AndroidOperationalError(
-                "adb query current Android user returned an invalid user id"
+        deadline = time.monotonic() + timeout
+        user_id = self._current_user_id(
+            timeout=self._remaining_deadline(
+                deadline, "query current Android user"
             )
+        )
 
         def run_pm(operation: str, *args: str) -> subprocess.CompletedProcess:
             return self._run_adb_checked(
-                ["shell", "pm", *args], operation=operation
+                ["shell", "pm", *args],
+                timeout=self._remaining_deadline(deadline, operation),
+                operation=operation,
             )
 
         run_pm(
@@ -912,8 +1072,232 @@ class MaestroExecutor:
         )
         self._verify_supported_links(status.stdout or "", normalized)
 
+    def capture_supported_link_state(
+        self, domains: Sequence[str], timeout: float = 180
+    ) -> SupportedLinkState:
+        normalized = tuple(
+            dict.fromkeys(domain.strip().casefold() for domain in domains)
+        )
+        deadline = time.monotonic() + timeout
+        user_id = self._current_user_id(
+            timeout=self._remaining_deadline(
+                deadline, "query current Android user"
+            )
+        )
+        status = self._run_adb_checked(
+            [
+                "shell",
+                "pm",
+                "get-app-links",
+                "--user",
+                user_id,
+                self._app_id,
+            ],
+            timeout=self._remaining_deadline(
+                deadline, "capture supported-link configuration"
+            ),
+            operation="capture supported-link configuration",
+        )
+        handling_allowed, enabled = self._supported_link_selection(
+            status.stdout or ""
+        )
+        verification_states = self._supported_link_verification_states(
+            status.stdout or ""
+        )
+        verification_states = {
+            domain: verification_states.get(domain, "none")
+            for domain in normalized
+        }
+        return SupportedLinkState(
+            user_id=user_id,
+            domains=normalized,
+            handling_allowed=handling_allowed,
+            enabled_domains=tuple(
+                domain for domain in normalized if domain in enabled
+            ),
+            verification_states=tuple(sorted(verification_states.items())),
+        )
+
+    def restore_supported_link_state(
+        self, state: SupportedLinkState, timeout: float = 180
+    ) -> None:
+        deadline = time.monotonic() + timeout
+
+        def run_pm(operation: str, *args: str) -> subprocess.CompletedProcess:
+            return self._run_adb_checked(
+                ["shell", "pm", *args],
+                timeout=self._remaining_deadline(deadline, operation),
+                operation=operation,
+            )
+
+        run_pm(
+            "restore supported-link handling",
+            "set-app-links-allowed",
+            "--user",
+            state.user_id,
+            "--package",
+            self._app_id,
+            str(state.handling_allowed).lower(),
+        )
+        if state.domains:
+            run_pm(
+                "clear temporary supported-link selection",
+                "set-app-links-user-selection",
+                "--user",
+                state.user_id,
+                "--package",
+                self._app_id,
+                "false",
+                *state.domains,
+            )
+        if state.enabled_domains:
+            run_pm(
+                "restore supported-link selection",
+                "set-app-links-user-selection",
+                "--user",
+                state.user_id,
+                "--package",
+                self._app_id,
+                "true",
+                *state.enabled_domains,
+            )
+        status = run_pm(
+            "query restored supported-link state",
+            "get-app-links",
+            "--user",
+            state.user_id,
+            self._app_id,
+        )
+        restored_states = self._supported_link_verification_states(
+            status.stdout or ""
+        )
+        expected_states = {
+            domain: verification_state
+            for domain, verification_state in dict(state.verification_states).items()
+            if verification_state
+            in {"none", "0", "approved", "2", "denied", "3"}
+        }
+        verification_domains = tuple(expected_states)
+        reset_domains = [
+            domain
+            for domain in verification_domains
+            if expected_states.get(domain, "none") in {"none", "0"}
+            and restored_states.get(domain, "none") not in {"none", "0"}
+        ]
+        approved_domains = [
+            domain
+            for domain in verification_domains
+            if expected_states.get(domain) in {"approved", "2"}
+            and restored_states.get(domain) not in {"approved", "2"}
+        ]
+        denied_domains = [
+            domain
+            for domain in verification_domains
+            if expected_states.get(domain) in {"denied", "3"}
+            and restored_states.get(domain) not in {"denied", "3"}
+        ]
+        for code, domains in (
+            ("0", reset_domains),
+            ("2", approved_domains),
+            ("3", denied_domains),
+        ):
+            if domains:
+                run_pm(
+                    "restore supported-link verification state",
+                    "set-app-links",
+                    "--package",
+                    self._app_id,
+                    code,
+                    *domains,
+                )
+        expected_enabled = set(state.enabled_domains)
+        status = run_pm(
+            "verify restored supported-link state",
+            "get-app-links",
+            "--user",
+            state.user_id,
+            self._app_id,
+        )
+        restored_states = self._supported_link_verification_states(
+            status.stdout or ""
+        )
+        handling_allowed, enabled = self._supported_link_selection(
+            status.stdout or ""
+        )
+        changed = [
+            domain
+            for domain in verification_domains
+            if restored_states.get(domain, "none")
+            != expected_states.get(domain, "none")
+        ]
+        selection_changed = {
+            domain for domain in state.domains if domain in enabled
+        } != expected_enabled
+        handling_changed = handling_allowed != state.handling_allowed
+        if changed or selection_changed or handling_changed:
+            problems = changed
+            if selection_changed:
+                problems.append("user selection")
+            if handling_changed:
+                problems.append("link handling")
+            raise AndroidOperationalError(
+                "supported-link state changed unexpectedly: "
+                + ", ".join(problems)
+            )
+
+    def _current_user_id(self, timeout: float = 180) -> str:
+        user_result = self._run_adb_checked(
+            ["shell", "am", "get-current-user"],
+            timeout=timeout,
+            operation="query current Android user",
+        )
+        user_id = (user_result.stdout or "").strip()
+        if not user_id.isdigit():
+            raise AndroidOperationalError(
+                "adb query current Android user returned an invalid user id"
+            )
+        return user_id
+
     @staticmethod
-    def _verify_supported_links(status: str, domains: Sequence[str]) -> None:
+    def _supported_link_selection(status: str) -> tuple[bool, set[str]]:
+        enabled: set[str] = set()
+        section = ""
+        handling_allowed = False
+        for raw_line in status.splitlines():
+            line = raw_line.strip().casefold()
+            if line == "selection state:":
+                section = "selection"
+            elif line == "enabled:" and section == "selection":
+                section = "enabled"
+            elif line == "disabled:":
+                section = "disabled"
+            elif line == "verification link handling allowed: true":
+                handling_allowed = True
+            elif section == "enabled" and line:
+                enabled.add(line)
+        return handling_allowed, enabled
+
+    @staticmethod
+    def _supported_link_verification_states(status: str) -> dict[str, str]:
+        states: dict[str, str] = {}
+        section = ""
+        for raw_line in status.splitlines():
+            line = raw_line.strip().casefold()
+            if line == "domain verification state:":
+                section = "verification"
+            elif line == "selection state:":
+                section = "selection"
+            elif line.startswith("verification link handling allowed:"):
+                section = ""
+            elif section == "verification" and ":" in line:
+                domain, state = (part.strip() for part in line.rsplit(":", 1))
+                states[domain] = state
+        return states
+
+    @classmethod
+    def _verify_supported_links(
+        cls, status: str, domains: Sequence[str]
+    ) -> None:
         approved: set[str] = set()
         enabled: set[str] = set()
         section = ""
@@ -991,7 +1375,14 @@ class MaestroExecutor:
             )
         return result
 
-    def _reset_adb_connection(self, timeout: float = 60) -> None:
+    @staticmethod
+    def _remaining_deadline(deadline: float, operation: str) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AndroidOperationalError(f"{operation} timeout budget exhausted")
+        return remaining
+
+    def _reset_adb_connection(self, deadline: float) -> None:
         """Restart the adb server and wait for the device to reattach.
 
         The reliable recovery for a stuck Maestro driver: a fresh adb server
@@ -1002,13 +1393,22 @@ class MaestroExecutor:
             try:
                 subprocess.run(
                     ["adb", *args], check=False,
-                    capture_output=True, text=True, timeout=timeout,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._remaining_deadline(
+                        deadline, "ADB connection reset"
+                    ),
                 )
-            except (subprocess.SubprocessError, OSError):
+            except (subprocess.SubprocessError, OSError, AndroidOperationalError):
                 pass
         try:
-            self._run_adb(["wait-for-device"], timeout=timeout)
-        except (subprocess.SubprocessError, OSError):
+            self._run_adb(
+                ["wait-for-device"],
+                timeout=self._remaining_deadline(
+                    deadline, "ADB device reconnect"
+                ),
+            )
+        except (subprocess.SubprocessError, OSError, AndroidOperationalError):
             pass
 
     def _run_flow(
@@ -1017,17 +1417,17 @@ class MaestroExecutor:
         secret: str | None = None,
         timeout: float = 60,
     ) -> None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise AndroidOperationalError(
+                "Maestro action execution timeout budget exhausted"
+            )
+        deadline = time.monotonic() + timeout
         flow = f"appId: {self._app_id}\n---\n{commands}"
         # Give the Maestro driver a longer startup budget on loaded emulators.
         # For credential inputs the secret is never written to the flow file; it
         # is passed via a MAESTRO_-prefixed env var and interpolated as ${...},
         # keeping it out of the YAML, argv and logs.
-        run_env: dict[str, str] = {
-            **os.environ,
-            _DRIVER_STARTUP_TIMEOUT_ENV: _DRIVER_STARTUP_TIMEOUT_MS,
-        }
-        if secret is not None:
-            run_env[MAESTRO_SECRET_ENV] = secret
+        run_env = _maestro_environment(secret)
         flow_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -1053,7 +1453,9 @@ class MaestroExecutor:
                         check=False,
                         capture_output=True,
                         text=True,
-                        timeout=timeout,
+                        timeout=self._remaining_deadline(
+                            deadline, "Maestro action execution"
+                        ),
                         env=run_env,
                     )
                 except (OSError, subprocess.SubprocessError, ValueError) as error:
@@ -1085,16 +1487,34 @@ class MaestroExecutor:
                                 "resetting adb and retrying",
                             )
                         )
-                        self._reset_adb_connection()
-                        time.sleep(_DRIVER_STARTUP_RETRY_DELAY)
+                        self._reset_adb_connection(deadline)
+                        remaining = self._remaining_deadline(
+                            deadline, "Maestro retry delay"
+                        )
+                        time.sleep(
+                            min(_DRIVER_STARTUP_RETRY_DELAY, remaining)
+                        )
                         continue
                     raise AndroidOperationalError(
                         f"Maestro action execution failed: {error}"
                     )
                 return
         finally:
+            primary_error = sys.exception()
             if flow_path:
-                flow_path.unlink(missing_ok=True)
+                try:
+                    flow_path.unlink(missing_ok=True)
+                except OSError as error:
+                    cleanup_error = AndroidOperationalError(
+                        f"Maestro temporary flow cleanup failed: {error}"
+                    )
+                    if primary_error is None:
+                        raise cleanup_error from error
+                    primary_error.args = (
+                        f"{primary_error}; {cleanup_error}",
+                        *primary_error.args[1:],
+                    )
+                    primary_error.add_note(str(cleanup_error))
 
     def _tap(
         self,
@@ -1103,9 +1523,8 @@ class MaestroExecutor:
     ) -> None:
         kind, payload = self._tap_command(target)
         if kind == "point":
-            self._tap_point(
-                *self._safe_tap_point(target, observation)
-            )
+            point = self._safe_tap_point(target, observation)
+            self._tap_point(*point)
             return
         try:
             self._run_flow(payload)
@@ -1231,7 +1650,10 @@ class MaestroExecutor:
         )
 
     def _input_text(
-        self, action: Action, target: UIElement, secret: str | None
+        self,
+        action: Action,
+        target: UIElement,
+        secret: str | None,
     ) -> CredentialInputMethod | None:
         use_secret = secret is not None
         replace_existing = action.credential_kind is not None or use_secret
@@ -1245,53 +1667,160 @@ class MaestroExecutor:
             self._run_flow(f"- inputText: {json.dumps(action.input_text)}\n")
             return
 
+        if action.credential_kind is not None:
+            target = self._revalidate_credential_target(
+                action.credential_kind, target
+            )
+
         if (
             action.credential_kind == CredentialKind.USERNAME
             and secret is not None
-            and self._input_username_via_adb(target, secret)
+            and self._input_username_via_adb(
+                target,
+                secret,
+                action.credential_kind,
+            )
         ):
             return CredentialInputMethod.ADB
 
-        self._input_credential_via_clipboard(target, secret)
+        self._input_credential_via_clipboard(
+            target,
+            secret,
+            action.credential_kind,
+        )
         return CredentialInputMethod.CLIPBOARD
+
+    def _assert_credential_release(self, timeout: float) -> None:
+        if self._credential_release_check is None:
+            raise AndroidOperationalError(
+                "credential entry blocked because no APK trust guard is configured"
+            )
+        self._credential_release_check(timeout)
+
+    def _revalidate_credential_target(
+        self,
+        kind: CredentialKind,
+        target: UIElement,
+    ) -> UIElement:
+        self._assert_credential_release(15)
+        if self._credential_observer is None:
+            raise AndroidOperationalError(
+                "credential entry blocked because no fresh UI observer is configured"
+            )
+        observation = self._credential_observer.reobserve()
+        matches = [
+            element
+            for element in observation.elements
+            if element.package_name == self._app_id
+            and self._same_credential_target(target, element)
+            and infer_credential_kind(
+                element.resource_id,
+                element.hint_text,
+                element.class_name,
+                element.accessibility_text,
+            )
+            == kind
+        ]
+        if len(matches) != 1:
+            raise AndroidOperationalError(
+                "credential entry blocked because the trusted target field changed"
+            )
+        return matches[0]
+
+    @staticmethod
+    def _same_credential_target(
+        original: UIElement, current: UIElement
+    ) -> bool:
+        if original.resource_id:
+            return original.resource_id == current.resource_id
+        return (
+            original.class_name == current.class_name
+            and original.hint_text == current.hint_text
+            and original.accessibility_text == current.accessibility_text
+            and original.bounds == current.bounds
+        )
+
+    def _focus_credential_target(self, target: UIElement) -> None:
+        kind, payload = self._tap_command(target)
+        if kind == "point":
+            self._tap_point(*payload, timeout=15)
+        else:
+            self._run_flow(payload, timeout=30)
 
     def _input_credential_via_clipboard(
         self,
         target: UIElement,
         secret: str | None,
+        credential_kind: CredentialKind | None = None,
     ) -> None:
         """Replace a credential exactly without putting its value in the flow."""
-        kind, payload = self._tap_command(target)
-        center = target.center
-        if center is None:
-            if kind != "flow":
-                raise AndroidOperationalError(
-                    "Exact credential replacement requires bounds or a selector"
+        paste_started = False
+        paste_completed = False
+        try:
+            self._focus_credential_target(target)
+            if credential_kind is not None:
+                target = self._revalidate_credential_target(
+                    credential_kind,
+                    target,
                 )
-            self._run_flow(payload)
-            self._clear_focused_credential_field()
+            self._clear_focused_credential_field(timeout=15)
+            if credential_kind is not None:
+                target = self._revalidate_credential_target(
+                    credential_kind,
+                    target,
+                )
+            paste_started = True
             self._run_flow(
-                f"{payload}"
                 f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
-                "- pasteText\n",
+                "- pasteText\n"
+                '- setClipboard: ""\n',
                 secret=secret,
+                timeout=60,
             )
-            return
-        self._clear_credential_field(*center)
-        if kind == "point":
-            x, y = center
-            payload = f'- tapOn:\n    point: "{x}, {y}"\n'
-        self._run_flow(
-            f"{payload}"
-            f"- setClipboard: ${{{MAESTRO_SECRET_ENV}}}\n"
-            "- pasteText\n",
-            secret=secret,
-        )
+            paste_completed = True
+        finally:
+            primary_error = sys.exception()
+            if (
+                paste_started
+                and not paste_completed
+                and not self.clear_clipboard()
+            ):
+                cleanup_error = AndroidOperationalError(
+                    "credential paste failed and clipboard cleanup "
+                    "could not be confirmed"
+                )
+                if primary_error is None:
+                    raise cleanup_error
+                primary_error.args = (
+                    f"{primary_error}; {cleanup_error}",
+                    *primary_error.args[1:],
+                )
+                primary_error.add_note(str(cleanup_error))
+
+    def clear_clipboard(self) -> bool:
+        """Best-effort removal of clipboard contents without exposing them."""
+        try:
+            self._run_flow('- setClipboard: ""\n', timeout=15)
+            return True
+        except (AndroidOperationalError, OSError):
+            return self._clear_clipboard_via_adb()
+
+    def _clear_clipboard_via_adb(self) -> bool:
+        try:
+            result = self._run_adb_checked(
+                ["shell", "cmd", "clipboard", "set", "text", ""],
+                timeout=15,
+                operation="clear clipboard via adb",
+            )
+        except (AndroidOperationalError, OSError):
+            return False
+        return result.returncode == 0
 
     def _input_username_via_adb(
         self,
         target: UIElement,
         username: str,
+        credential_kind: CredentialKind | None = None,
     ) -> bool:
         """Replace a printable ASCII username through one adb process.
 
@@ -1304,8 +1833,13 @@ class MaestroExecutor:
         if center is None or not _ADB_SAFE_USERNAME.fullmatch(username):
             return False
         x, y = center
+        self._tap_point(x, y, timeout=15)
+        if credential_kind is not None:
+            self._revalidate_credential_target(
+                credential_kind,
+                target,
+            )
         commands = [
-            f"input tap {x} {y}",
             "input keycombination 113 29",
             "input keyevent 67",
         ]
@@ -1317,6 +1851,11 @@ class MaestroExecutor:
                 )
             )
         script = "\n".join(commands) + "\n"
+        if credential_kind is not None:
+            self._revalidate_credential_target(
+                credential_kind,
+                target,
+            )
         try:
             result = subprocess.run(
                 ["adb", "-s", self._device_id, "shell", "sh"],
@@ -1341,20 +1880,9 @@ class MaestroExecutor:
             )
         return True
 
-    def _clear_credential_field(self, x: int, y: int) -> None:
-        """Focus a bounded field and clear its current value through adb."""
-        self._run_adb_checked(
-            [
-                "shell",
-                "sh",
-                "-c",
-                f"input tap {x} {y} && "
-                "input keycombination 113 29 && input keyevent 67",
-            ],
-            operation="clear credential field",
-        )
-
-    def _clear_focused_credential_field(self) -> None:
+    def _clear_focused_credential_field(
+        self, timeout: float = 180
+    ) -> None:
         """Clear the field already focused through a selector-only flow."""
         self._run_adb_checked(
             [
@@ -1363,10 +1891,13 @@ class MaestroExecutor:
                 "-c",
                 "input keycombination 113 29 && input keyevent 67",
             ],
+            timeout=timeout,
             operation="clear focused credential field",
         )
 
-    def _tap_point(self, x: int, y: int) -> None:
+    def _tap_point(
+        self, x: int, y: int, timeout: float = 180
+    ) -> None:
         """Deliver a coordinate tap through adb's input pipeline.
 
         Maestro's ``tapOn: point`` can silently no-op on Compose surfaces: it
@@ -1378,6 +1909,7 @@ class MaestroExecutor:
         """
         self._run_adb_checked(
             ["shell", "input", "tap", str(x), str(y)],
+            timeout=timeout,
             operation="coordinate tap",
         )
 

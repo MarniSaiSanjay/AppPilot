@@ -9,7 +9,7 @@ re-exports that surface so existing imports (``flows.deeplink``) and
 from __future__ import annotations
 
 try:  # package-relative (python -m src.flows.deeplink) vs top-level
-    from ..usecases.deeplink import (  # noqa: F401
+    from ..usecases.deeplink import (
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RETRY_WAIT_SECONDS,
         DEFAULT_SETTLE_SECONDS,
@@ -33,7 +33,7 @@ try:  # package-relative (python -m src.flows.deeplink) vs top-level
         main,
     )
 except ImportError:  # top-level (src on sys.path)
-    from usecases.deeplink import (  # noqa: F401
+    from usecases.deeplink import (
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RETRY_WAIT_SECONDS,
         DEFAULT_SETTLE_SECONDS,
@@ -56,6 +56,30 @@ except ImportError:  # top-level (src on sys.path)
         load_deeplink_cases,
         main,
     )
+
+__all__ = [
+    "DEFAULT_MAX_ATTEMPTS",
+    "DEFAULT_RETRY_WAIT_SECONDS",
+    "DEFAULT_SETTLE_SECONDS",
+    "AttemptResult",
+    "AppInstaller",
+    "DeeplinkSuiteOrchestrator",
+    "DeeplinkTestCase",
+    "DeeplinkTestRunner",
+    "ExpectationJudge",
+    "ExpectationJudgeOperationalError",
+    "ExpectationVerdict",
+    "LLMExpectationJudge",
+    "LocalApkInstaller",
+    "LoginCapability",
+    "MaestroWarmUp",
+    "SharedLoginFlow",
+    "SuiteReport",
+    "TestCaseResult",
+    "WarmUp",
+    "load_deeplink_cases",
+    "main",
+]
 
 
 if __name__ == "__main__":

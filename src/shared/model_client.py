@@ -11,13 +11,16 @@ parsed response.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from ipaddress import ip_address
 from typing import Mapping
+from urllib.parse import urlparse
 
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -26,12 +29,61 @@ _BASE_RETRY_WAIT_SECONDS = 2.0
 _MAX_RETRY_WAIT_SECONDS = 30.0
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_RejectRedirects())
+
+
 class ModelTransportError(RuntimeError):
     """Raised when the model HTTP transport fails (network / decode error).
 
     Subclasses RuntimeError so existing callers that catch RuntimeError keep
     working; a consumer may re-map it to its own operational error type while
     preserving the original message (``str(error)``)."""
+
+
+class ModelConfigurationError(ValueError):
+    """Model endpoint configuration is unsafe or malformed."""
+
+
+def validate_base_url(base_url: str) -> str:
+    value = (base_url or "").strip().rstrip("/")
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        parsed.port
+        username = parsed.username
+        password = parsed.password
+    except ValueError as error:
+        raise ModelConfigurationError(
+            "APPPILOT_MODEL_BASE_URL must be a valid http(s) URL"
+        ) from error
+    if parsed.scheme not in ("http", "https") or not hostname:
+        raise ModelConfigurationError(
+            "APPPILOT_MODEL_BASE_URL must be a valid http(s) URL"
+        )
+    if username or password:
+        raise ModelConfigurationError(
+            "APPPILOT_MODEL_BASE_URL must not contain credentials"
+        )
+    if parsed.scheme == "https":
+        return value
+    hostname = hostname.casefold()
+    local = hostname == "localhost" or hostname.endswith(".localhost")
+    if not local:
+        try:
+            local = ip_address(hostname).is_loopback
+        except ValueError:
+            local = False
+    if not local:
+        raise ModelConfigurationError(
+            "remote APPPILOT_MODEL_BASE_URL endpoints must use https"
+        )
+    return value
 
 
 class ChatModelClient:
@@ -47,9 +99,13 @@ class ChatModelClient:
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 60.0,
     ) -> None:
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ModelConfigurationError(
+                "model timeout must be a finite positive number"
+            )
         self._model = model
         self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
+        self._base_url = validate_base_url(base_url)
         self._timeout = timeout
 
     @property
@@ -69,7 +125,9 @@ class ChatModelClient:
         model = env.get("APPPILOT_MODEL")
         if not api_key or not model:
             return None
-        base_url = env.get("APPPILOT_MODEL_BASE_URL") or DEFAULT_BASE_URL
+        base_url = validate_base_url(
+            env.get("APPPILOT_MODEL_BASE_URL") or DEFAULT_BASE_URL
+        )
         return {"model": model, "api_key": api_key, "base_url": base_url}
 
     def send(self, payload: dict) -> dict:
@@ -92,7 +150,7 @@ class ChatModelClient:
         )
         for attempt in range(1, _MAX_SEND_ATTEMPTS + 1):
             try:
-                with urllib.request.urlopen(
+                with _NO_REDIRECT_OPENER.open(
                     http_request, timeout=self._timeout
                 ) as resp:
                     return json.loads(resp.read().decode("utf-8"))
@@ -100,7 +158,12 @@ class ChatModelClient:
                 raise ModelTransportError(str(error)) from error
             except OSError as error:
                 if attempt == _MAX_SEND_ATTEMPTS or not self._is_retryable(error):
-                    raise ModelTransportError(str(error)) from error
+                    detail = (
+                        f"model timeout: {error}"
+                        if isinstance(error, TimeoutError)
+                        else str(error)
+                    )
+                    raise ModelTransportError(detail) from error
                 wait_seconds = self._retry_wait_seconds(error, attempt)
                 time.sleep(wait_seconds)
 

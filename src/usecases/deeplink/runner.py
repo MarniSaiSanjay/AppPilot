@@ -11,7 +11,10 @@ retry. Composes the shared login/installer/warm-up nodes.
 
 from __future__ import annotations
 
+import math
+
 import time
+from dataclasses import dataclass
 from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
@@ -23,6 +26,7 @@ try:  # package-relative (python -m src.usecases.deeplink.runner) vs top-level
     )
     from ...apppilot import logtags
     from ...apppilot.models import Action, ActionKind, UIElement, UIObservation
+    from ...apppilot.apk_trust import ForegroundComponent
     from ...shared.account import (
         AccountPreparationKind,
         AccountPreparationResult,
@@ -41,6 +45,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     )
     from apppilot import logtags
     from apppilot.models import Action, ActionKind, UIElement, UIObservation
+    from apppilot.apk_trust import ForegroundComponent
     from shared.account import (
         AccountPreparationKind,
         AccountPreparationResult,
@@ -54,6 +59,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
 
 from .deeplink_testcase_loader import DeeplinkTestCase
 from .verification import ExpectationJudge, ExpectationJudgeOperationalError
+from .artifacts import FailureArtifactWriter
 from .results import AttemptResult, SuiteReport, TestCaseResult
 from .supported_links import SUPPORTED_LINK_DOMAINS
 
@@ -73,10 +79,18 @@ DEFAULT_SETTLE_SECONDS = 3.0
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 30.0
 DEFAULT_VERIFY_POLL_INTERVAL_SECONDS = 2.0
 _RESEARCHER_ADD_VERBS = {"add", "get", "install"}
+_TRUSTED_STORE_PACKAGES = {"com.android.vending"}
 
 
 class _ReplayRecoveryError(RuntimeError):
     """A restart-and-replay recovery failed before verification could resume."""
+
+
+@dataclass(frozen=True)
+class _DeterministicVerdict:
+    allowed: bool
+    reason: str
+    contradiction: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -101,24 +115,47 @@ class DeeplinkTestRunner:
         account_session: AccountSessionCapability | None = None,
         profile_for_license: "Callable[[str], CredentialProfile] | None" = None,
         installer: AppInstaller | None = None,
+        deterministic_probe: object | None = None,
+        expected_package_id: str | None = None,
+        artifact_writer: FailureArtifactWriter | None = None,
     ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        for name, value in (
+            ("retry_wait_seconds", retry_wait_seconds),
+            ("settle_seconds", settle_seconds),
+            ("verify_timeout_seconds", verify_timeout_seconds),
+            ("verify_poll_interval_seconds", verify_poll_interval_seconds),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite non-negative number")
         self._observer = observer
         self._executor = executor
         self._judge = judge
         self._warm_up = warm_up
         self._sleep = sleep
-        self._max_attempts = max(1, max_attempts)
+        self._max_attempts = max_attempts
         self._retry_wait_seconds = retry_wait_seconds
         self._settle_seconds = settle_seconds
-        self._verify_timeout_seconds = max(0.0, verify_timeout_seconds)
-        self._verify_poll_interval_seconds = max(0.0, verify_poll_interval_seconds)
+        self._verify_timeout_seconds = verify_timeout_seconds
+        self._verify_poll_interval_seconds = verify_poll_interval_seconds
         self._monotonic = monotonic
         self._login_flow = login_flow
         self._login_flow_for_license = login_flow_for_license
         self._account_session = account_session
         self._profile_for_license = profile_for_license
         self._installer = installer
+        if deterministic_probe is None and isinstance(executor, MaestroExecutor):
+            deterministic_probe = executor
+        if expected_package_id is None and isinstance(executor, MaestroExecutor):
+            expected_package_id = executor.app_id
+        self._deterministic_probe = deterministic_probe
+        self._expected_package_id = expected_package_id
+        self._artifact_writer = artifact_writer
+        self._verification_evidence: dict[tuple[str, int], dict] = {}
+        self._active_evidence: dict | None = None
         self._supported_links_prepared = False
+        self._supported_link_state = None
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
         # Delegate the top-level lifecycle to the explicit orchestrator, which
@@ -163,6 +200,15 @@ class DeeplinkTestRunner:
             f"Enabling {len(SUPPORTED_LINK_DOMAINS)} supported-link domain(s)",
             logtags.INSTALLED_BATCH,
         )
+        self._enable_supported_links()
+
+    def _enable_supported_links(self) -> None:
+        if self._supported_link_state is None:
+            capture = getattr(
+                self._executor, "capture_supported_link_state", None
+            )
+            if callable(capture):
+                self._supported_link_state = capture(SUPPORTED_LINK_DOMAINS)
         self._executor.enable_supported_links(SUPPORTED_LINK_DOMAINS)
         self._supported_links_prepared = True
 
@@ -193,6 +239,19 @@ class DeeplinkTestRunner:
         # no installer is configured.
         if self._installer is None:
             return
+        is_installed = getattr(self._executor, "is_installed", None)
+        if (
+            self._supported_link_state is None
+            and callable(is_installed)
+            and is_installed() is True
+        ):
+            capture = getattr(
+                self._executor, "capture_supported_link_state", None
+            )
+            if callable(capture):
+                self._supported_link_state = capture(
+                    SUPPORTED_LINK_DOMAINS
+                )
         if self._installer.ensure_absent():
             logtags.trace("Removed existing app install", logtags.SUITE)
         else:
@@ -207,38 +266,95 @@ class DeeplinkTestRunner:
 
     def run_installed_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         """Run an INSTALLED case with ready-state restoration on retry."""
+        result: TestCaseResult | None = None
         try:
-            return self._run_attempts(
+            result = self._run_attempts(
                 case, logtags.INSTALLED, self._installed_prepare(case)
             )
         finally:
-            logtags.trace(
-                f"{case.test_id} stopping app (case cleanup)", logtags.INSTALLED
-            )
-            # Cleanup must never abort the suite nor mask the case result.
-            try:
-                self._executor.stop_app()
-            except AndroidOperationalError as exc:
-                logtags.trace(
-                    f"{case.test_id} cleanup stop_app failed (ignored): {exc}",
-                    logtags.INSTALLED,
-                )
+            self._cleanup_case(case, result, logtags.INSTALLED)
+        return result
 
     def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
         """Run an UNINSTALLED first-open case with phase-aware retries."""
         prepare, invalidate_recovery = self._uninstalled_prepare(case)
-        return self._run_attempts(
-            case,
-            logtags.UNINSTALLED,
-            prepare,
-            on_start=lambda: logtags.trace(
-                f"{case.test_id} first-open flow - warm-up not applicable",
+        result: TestCaseResult | None = None
+        try:
+            result = self._run_attempts(
+                case,
                 logtags.UNINSTALLED,
-            ),
-            on_replay_recovery_failure=invalidate_recovery,
-        )
+                prepare,
+                on_start=lambda: logtags.trace(
+                    f"{case.test_id} first-open flow - warm-up not applicable",
+                    logtags.UNINSTALLED,
+                ),
+                on_replay_recovery_failure=invalidate_recovery,
+            )
+        finally:
+            self._cleanup_case(case, result, logtags.UNINSTALLED)
+        return result
 
-    def _verify(self, case: DeeplinkTestCase, attempt: int):
+    def _cleanup_case(
+        self,
+        case: DeeplinkTestCase,
+        result: TestCaseResult | None,
+        label: str,
+    ) -> None:
+        errors = []
+        logtags.trace(f"{case.test_id} stopping app (case cleanup)", label)
+        try:
+            self._executor.stop_app()
+        except (RuntimeError, OSError) as error:
+            errors.append(f"stop app failed: {error}")
+        clear_clipboard = getattr(self._executor, "clear_clipboard", None)
+        if callable(clear_clipboard):
+            try:
+                if clear_clipboard() is False:
+                    errors.append("clipboard cleanup failed")
+            except (RuntimeError, OSError) as error:
+                errors.append(f"clipboard cleanup failed: {error}")
+        for error in errors:
+            logtags.trace(f"{case.test_id} cleanup failed: {error}", label)
+            if result is not None:
+                result.record_cleanup_failure(error)
+
+    def finalize_suite(self, report: SuiteReport) -> None:
+        """Best-effort target-app restoration that never hides test failures."""
+        errors = []
+        try:
+            self._executor.stop_app()
+        except (RuntimeError, OSError) as error:
+            errors.append(f"suite stop app failed: {error}")
+        clear_clipboard = getattr(self._executor, "clear_clipboard", None)
+        if callable(clear_clipboard):
+            try:
+                if clear_clipboard() is False:
+                    errors.append("suite clipboard cleanup failed")
+            except (RuntimeError, OSError) as error:
+                errors.append(f"suite clipboard cleanup failed: {error}")
+        if self._supported_link_state is not None:
+            restore = getattr(
+                self._executor, "restore_supported_link_state", None
+            )
+            if callable(restore):
+                try:
+                    restore(self._supported_link_state)
+                except (RuntimeError, OSError) as error:
+                    errors.append(
+                        f"suite supported-link restoration failed: {error}"
+                    )
+        for error in errors:
+            logtags.trace(error, logtags.SUITE)
+            report.cleanup_errors.append(error)
+            for result in report.results:
+                result.record_cleanup_failure(error)
+        self._write_failure_artifacts(report)
+
+    def _verify(
+        self,
+        case: DeeplinkTestCase,
+        attempt: int,
+    ):
         """Shared, bounded verification polling for a single attempt.
 
         Used IDENTICALLY by installed and uninstalled cases. After the deeplink
@@ -250,6 +366,14 @@ class DeeplinkTestRunner:
         judge. Uses a monotonic clock so the window can never be skewed by
         wall-clock jumps, and always makes at least one observe/judge call.
         """
+        evidence = {
+            "deeplink": case.deep_link,
+            "expected_destination": case.expected_result,
+        }
+        self._verification_evidence[
+            (case.test_id.casefold(), attempt)
+        ] = evidence
+        self._active_evidence = evidence
         deadline = self._monotonic() + self._verify_timeout_seconds
         researcher_add_attempted = False
         transient_recovery_used = False
@@ -261,6 +385,7 @@ class DeeplinkTestRunner:
             )
             try:
                 observation = self._observer.observe()
+                evidence["ui_observation"] = observation.describe(limit=50)
                 if not researcher_add_attempted and (
                     add_researcher := self._find_researcher_add_control(observation)
                 ) is not None:
@@ -269,7 +394,10 @@ class DeeplinkTestRunner:
                         logtags.VERIFY,
                     )
                     self._executor.execute(
-                        Action(ActionKind.TAP, target_id=add_researcher.element_id),
+                        Action(
+                            ActionKind.TAP,
+                            target_id=add_researcher.element_id,
+                        ),
                         observation,
                     )
                     researcher_add_attempted = True
@@ -287,26 +415,51 @@ class DeeplinkTestRunner:
                 researcher_add_attempted = False
                 deadline = self._monotonic() + self._verify_timeout_seconds
                 continue
-            verdict = self._judge.evaluate(case.expected_result, observation)
+            deterministic = self._deterministic_verdict(
+                case,
+                observation,
+            )
+            evidence["deterministic_result"] = {
+                "allowed": deterministic.allowed,
+                "contradiction": deterministic.contradiction,
+                "reason": deterministic.reason,
+            }
+            if not deterministic.allowed:
+                verdict = self._mismatch(deterministic.reason)
+                if deterministic.contradiction:
+                    return verdict
+            else:
+                model_started = self._monotonic()
+                verdict = self._judge.evaluate(
+                    case.expected_result,
+                    observation,
+                )
+                evidence["model_latency_seconds"] = (
+                    self._monotonic() - model_started
+                )
+                evidence["model_decision"] = {
+                    "matched": verdict.matched,
+                    "reason": verdict.reason,
+                }
             if verdict.matched:
                 logtags.trace(
                     f"{case.test_id}: expected result matched", logtags.VERIFY
                 )
                 return verdict
+            if (
+                not transient_recovery_used
+                and self._can_restart_and_replay(case)
+                and self._is_incomplete_destination(observation)
+            ):
+                self._recover_transient_attempt(
+                    case,
+                    "expected destination shell remained incomplete",
+                )
+                transient_recovery_used = True
+                researcher_add_attempted = False
+                deadline = self._monotonic() + self._verify_timeout_seconds
+                continue
             if self._monotonic() >= deadline:
-                if (
-                    not transient_recovery_used
-                    and self._can_restart_and_replay(case)
-                    and self._is_incomplete_destination(observation)
-                ):
-                    self._recover_transient_attempt(
-                        case,
-                        "expected destination shell remained incomplete",
-                    )
-                    transient_recovery_used = True
-                    researcher_add_attempted = False
-                    deadline = self._monotonic() + self._verify_timeout_seconds
-                    continue
                 logtags.trace(
                     f"{case.test_id}: verification timeout reached", logtags.VERIFY
                 )
@@ -317,6 +470,122 @@ class DeeplinkTestRunner:
                 logtags.VERIFY,
             )
             self._sleep(self._verify_poll_interval_seconds)
+
+    @staticmethod
+    def _mismatch(reason: str):
+        from .verification import ExpectationVerdict
+
+        return ExpectationVerdict(matched=False, reason=reason)
+
+    def _deterministic_verdict(
+        self,
+        case: DeeplinkTestCase,
+        observation: UIObservation,
+    ) -> _DeterministicVerdict:
+        if self._deterministic_probe is None:
+            return _DeterministicVerdict(True, "deterministic probe not configured")
+        if not self._expected_package_id:
+            raise AndroidOperationalError(
+                "deterministic verification requires an expected package ID"
+            )
+
+        launch_component = getattr(
+            self._deterministic_probe, "last_deeplink_component", None
+        )
+        if self._active_evidence is not None and isinstance(
+            launch_component, ForegroundComponent
+        ):
+            self._active_evidence["delivery_component"] = {
+                "package": launch_component.package_id,
+                "activity": launch_component.activity,
+            }
+        if (
+            isinstance(launch_component, ForegroundComponent)
+            and launch_component.package_id != self._expected_package_id
+            and (
+                case.installed
+                or self._can_restart_and_replay(case)
+                or launch_component.package_id not in _TRUSTED_STORE_PACKAGES
+            )
+        ):
+            return _DeterministicVerdict(
+                False,
+                "deeplink was delivered to an unexpected package",
+                contradiction=True,
+            )
+
+        component_getter = getattr(
+            self._deterministic_probe, "foreground_component", None
+        )
+        if not callable(component_getter):
+            raise AndroidOperationalError(
+                "deterministic foreground verification is unavailable"
+            )
+        component = component_getter()
+        if not isinstance(component, ForegroundComponent):
+            raise AndroidOperationalError(
+                "foreground package/activity could not be determined"
+            )
+        if self._active_evidence is not None:
+            self._active_evidence["foreground_component"] = {
+                "package": component.package_id,
+                "activity": component.activity,
+            }
+        if component.package_id != self._expected_package_id:
+            return _DeterministicVerdict(
+                False,
+                "expected package is not foreground",
+                contradiction=True,
+            )
+        activity_package = component.activity.split("/", 1)[0]
+        if activity_package != self._expected_package_id:
+            return _DeterministicVerdict(
+                False,
+                "foreground activity belongs to an unexpected package",
+                contradiction=True,
+            )
+        if not observation.elements:
+            return _DeterministicVerdict(False, "observed UI is empty")
+
+        return _DeterministicVerdict(True, "deterministic checks passed")
+
+    def _write_failure_artifacts(self, report: SuiteReport) -> None:
+        if self._artifact_writer is None:
+            return
+        for result in report.results:
+            if result.passed or result.artifact_paths:
+                continue
+            attempts = [
+                attempt
+                for attempt in result.attempts
+                if not attempt.matched
+            ]
+            if not attempts and result.attempts:
+                attempts = [result.attempts[-1]]
+            for attempt in attempts:
+                evidence = self._verification_evidence.get(
+                    (result.case.test_id.casefold(), attempt.attempt),
+                    {},
+                )
+                try:
+                    path = self._artifact_writer.write(
+                        case_id=result.case.test_id,
+                        attempt=attempt.attempt,
+                        expected_destination=result.case.expected_result,
+                        observed_destination=attempt.reason,
+                        matched=attempt.matched,
+                        cleanup_status=result.cleanup_status,
+                        cleanup_errors=result.cleanup_errors,
+                        evidence=evidence,
+                    )
+                except OSError as error:
+                    logtags.trace(
+                        f"{result.case.test_id} failure artifact could not be "
+                        f"written: {error}",
+                        logtags.REPORT,
+                    )
+                    continue
+                result.artifact_paths.append(str(path))
 
     def _recover_transient_attempt(
         self,
@@ -344,7 +613,10 @@ class DeeplinkTestRunner:
             logtags.VERIFY,
         )
 
-    def _restart_ready_and_replay(self, case: DeeplinkTestCase) -> None:
+    def _restart_ready_and_replay(
+        self,
+        case: DeeplinkTestCase,
+    ) -> None:
         """Restart the installed app, restore prerequisites, and replay its link."""
         self._executor.stop_app()
         if self._retry_wait_seconds:
@@ -357,7 +629,10 @@ class DeeplinkTestRunner:
         self._prepare_supported_link_if_needed(case.deep_link)
         self._executor.open_link(case.deep_link)
 
-    def _ensure_login_after_restart(self, case: DeeplinkTestCase) -> None:
+    def _ensure_login_after_restart(
+        self,
+        case: DeeplinkTestCase,
+    ) -> None:
         """Confirm readiness after restart and act only when login is required."""
         login_flow = self._login_flow_for_case(case)
         if login_flow is None:
@@ -381,13 +656,15 @@ class DeeplinkTestRunner:
                 f"login preparation failed after restart{detail}"
             )
 
-    def _prepare_supported_link_if_needed(self, deep_link: str) -> None:
+    def _prepare_supported_link_if_needed(
+        self,
+        deep_link: str,
+    ) -> None:
         if (
             self._needs_supported_link_replay(deep_link)
             and not self._supported_links_prepared
         ):
-            self._executor.enable_supported_links(SUPPORTED_LINK_DOMAINS)
-            self._supported_links_prepared = True
+            self._enable_supported_links()
 
     def _can_restart_and_replay(self, case: DeeplinkTestCase) -> bool:
         return case.installed or self._needs_supported_link_replay(case.deep_link)
@@ -562,7 +839,9 @@ class DeeplinkTestRunner:
         )
         return result
 
-    def _installed_prepare(self, case: DeeplinkTestCase) -> Callable[[int], None]:
+    def _installed_prepare(
+        self, case: DeeplinkTestCase
+    ) -> Callable[[int], None]:
         def prepare(attempt: int) -> None:
             if attempt > 1:
                 logtags.trace(

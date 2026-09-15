@@ -1,0 +1,2 @@
+-e .[dev]
+-r email_service/requirements.txt

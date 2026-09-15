@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
 .env
@@ -23,3 +24,6 @@ testcases/regressions/*.xlsx
 
 # Locally remembered device serial selected during /init (never commit)
 .apppilot_device
+
+# Run-scoped sanitized failure evidence
+.apppilot_artifacts/

@@ -96,6 +96,43 @@ except ImportError:  # top-level (src on sys.path)
         main,
     )
 
+__all__ = [
+    "APP_ID",
+    "Action",
+    "ActionKind",
+    "AndroidOperationalError",
+    "AppPilotAgent",
+    "AuthoritativeLoginGoalEvaluator",
+    "CredentialKind",
+    "DEFAULT_GUIDANCE",
+    "DEFAULT_MAX_ACTIONS",
+    "DEFAULT_MAX_STUCK_ACTIONS",
+    "DecisionRequest",
+    "ExecutionContext",
+    "GoalEvaluator",
+    "LLMLoginGoalEvaluator",
+    "LLMModelDecisionProvider",
+    "MAESTRO_SECRET_ENV",
+    "MaestroExecutor",
+    "MaestroHierarchyObserver",
+    "ModelDecision",
+    "ModelDecisionProvider",
+    "PROTOTYPE_GOAL",
+    "REPO_ROOT",
+    "RuntimeContext",
+    "SafetyValidator",
+    "SignedInCopilotGoalEvaluator",
+    "UIElement",
+    "UIObservation",
+    "UnconfiguredModelDecisionProvider",
+    "_default_max_actions",
+    "_default_max_stuck_actions",
+    "_load_dotenv",
+    "_parse_args",
+    "infer_credential_kind",
+    "main",
+]
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

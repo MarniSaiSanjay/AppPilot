@@ -9,6 +9,7 @@ Deeplink, FRI, or any use case. The caller decides which open mode to use.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable, Protocol
 
@@ -57,15 +58,33 @@ class LocalApkInstaller:
         executor: MaestroExecutor,
         apk_path: str,
         *,
+        pre_install_check: Callable[[str], None] | None = None,
+        post_install_check: Callable[[], None] | None = None,
         foreground_timeout_seconds: float = DEFAULT_FOREGROUND_TIMEOUT_SECONDS,
         foreground_poll_seconds: float = DEFAULT_FOREGROUND_POLL_SECONDS,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
+        if (
+            not math.isfinite(foreground_timeout_seconds)
+            or foreground_timeout_seconds < 0
+        ):
+            raise ValueError(
+                "foreground_timeout_seconds must be a finite non-negative number"
+            )
+        if (
+            not math.isfinite(foreground_poll_seconds)
+            or foreground_poll_seconds < 0
+        ):
+            raise ValueError(
+                "foreground_poll_seconds must be a finite non-negative number"
+            )
         self._executor = executor
         self._apk_path = apk_path
-        self._foreground_timeout_seconds = max(0.0, foreground_timeout_seconds)
-        self._foreground_poll_seconds = max(0.0, foreground_poll_seconds)
+        self._pre_install_check = pre_install_check
+        self._post_install_check = post_install_check
+        self._foreground_timeout_seconds = foreground_timeout_seconds
+        self._foreground_poll_seconds = foreground_poll_seconds
         self._sleep = sleep
         self._monotonic = monotonic
 
@@ -76,7 +95,11 @@ class LocalApkInstaller:
         logtags.trace(
             f"installing local build: {self._apk_path}", logtags.INSTALL
         )
+        if self._pre_install_check is not None:
+            self._pre_install_check(self._apk_path)
         self._executor.install_apk(self._apk_path)
+        if self._post_install_check is not None:
+            self._post_install_check()
 
     def install_and_open(self, via_store_button: bool = False) -> None:
         self.install_fresh()
@@ -99,15 +122,21 @@ class LocalApkInstaller:
             launch = self._executor.launch_app_via_adb
         try:
             launch()
-        except AndroidOperationalError:
+        except AndroidOperationalError as error:
             # APK installation can complete the pending deeplink and foreground
             # the app while Maestro is waiting for the store button.
-            if via_store_button and self._executor.is_foreground():
-                return
-            raise
+            if via_store_button:
+                try:
+                    if self._executor.is_foreground():
+                        return
+                except RuntimeError:
+                    pass
+            raise error
         self._wait_until_foreground(launch)
 
-    def _wait_until_foreground(self, relaunch: Callable[[], None]) -> None:
+    def _wait_until_foreground(
+        self, relaunch: Callable[[], None]
+    ) -> None:
         logtags.trace(
             "waiting for target app to become foreground", logtags.INSTALL
         )

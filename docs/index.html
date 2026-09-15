@@ -180,16 +180,16 @@
       <p>Make sure you have all of these before you start:</p>
       <ul class="checklist">
         <li><strong>macOS or Linux</strong> with a terminal (commands below assume macOS/zsh).</li>
-        <li><strong>Python 3.11+</strong> — AppPilot uses only the standard library, so there are <em>no</em> pip packages to install.</li>
+        <li><strong>Python 3.11-3.13</strong> with the development requirements installed.</li>
         <li><strong>Java 17+ (JDK)</strong> — required by Maestro.</li>
         <li><strong>Maestro CLI</strong> — the tool that actually taps/types on the device.</li>
-        <li><strong>Android SDK platform-tools</strong> (gives you <code>adb</code>) and an <strong>Android emulator</strong> (or a physical device).</li>
+        <li><strong>Android SDK platform-tools and build tools</strong> — <code>adb</code>, <code>apksigner</code>, and either <code>apkanalyzer</code> or <code>aapt</code> — plus an Android emulator or physical device.</li>
         <li>For the standalone login CLI, the target app installed on the device. The deeplink suite manages its local APK installation.</li>
         <li>An <strong>OpenAI-compatible LLM endpoint</strong> — a model name/deployment and an API key.</li>
       </ul>
       <div class="note">
         <strong>Quick version checks</strong>
-        <pre><code>python3 --version   <span class="cmt"># 3.11 or newer</span>
+        <pre><code>        python3 --version   <span class="cmt"># 3.11, 3.12, or 3.13</span>
 java -version       <span class="cmt"># 17 or newer</span>
 adb --version       <span class="cmt"># from Android SDK platform-tools</span></code></pre>
       </div>
@@ -222,15 +222,16 @@ maestro --version</code></pre>
 export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"</code></pre>
         </li>
         <li>
+          <h3>Install Python development requirements</h3>
+          <pre><code>python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt</code></pre>
+        </li>
+        <li>
           <h3>Create your <code>.env</code> file</h3>
           <p>See <a class="inline" href="#config">Configuration</a> below — this holds your model settings and (optionally) sign-in credentials. It is git-ignored, so nothing secret is ever committed.</p>
         </li>
       </ol>
-      <div class="note">
-        <strong>No dependency install step</strong>
-        AppPilot's Python code is standard-library only — there is nothing to <code>pip install</code>. If you
-        want an isolated interpreter you can still create a virtualenv (<code>python3 -m venv .venv &amp;&amp; source .venv/bin/activate</code>), but it is optional.
-      </div>
     </section>
 
     <section id="config">
@@ -250,6 +251,8 @@ export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"</code></
           <tr><td><code>APPPILOT_MODEL_BASE_URL</code></td><td class="req-no">No</td><td>OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint).</td></tr>
           <tr><td><code>APPPILOT_USERNAME</code></td><td class="req-cond">For login</td><td><strong>Sign-in username/email for the app under test</strong> (e.g. the Microsoft account used to log into the Office hub app) — resolved locally and injected straight into Maestro, never sent to the model. <em>Not</em> the model API key.</td></tr>
           <tr><td><code>APPPILOT_PASSWORD</code></td><td class="req-cond">For login</td><td><strong>Sign-in password for the app under test</strong> — handled the same secure way.</td></tr>
+          <tr><td><code>APPPILOT_EXPECTED_PACKAGE_ID</code></td><td class="req-yes">APK runs</td><td>Expected Android package ID for both the local and installed APK.</td></tr>
+          <tr><td><code>APPPILOT_TRUSTED_CERT_SHA256</code></td><td class="req-yes">APK runs</td><td>Trusted APK signing-certificate SHA-256 fingerprint (64 hexadecimal characters; colons optional).</td></tr>
           <tr><td><code>APPPILOT_MAX_ACTIONS</code></td><td class="req-no">No</td><td>Upper bound on actions per run (default <code>30</code>).</td></tr>
           <tr><td><code>APPPILOT_MAX_STUCK_ACTIONS</code></td><td class="req-no">No</td><td>Consecutive no-change actions before a controlled early FAIL (default <code>5</code>).</td></tr>
         </tbody>
@@ -264,7 +267,9 @@ APPPILOT_PASSWORD=your-password</code></pre>
         <strong>Credentials stay secret</strong>
         Credentials are never placed in prompts, observations, logs, exceptions, Maestro arguments, or source.
         The model can only <em>request</em> a credential by kind (<code>username</code>/<code>password</code>);
-        AppPilot resolves the real value locally and hands it to Maestro securely.
+        AppPilot resolves the real value locally and revalidates APK trust, the foreground package/window,
+        and the expected field immediately before handing it to Android automation. Because ADB and Maestro
+        do not expose an atomic focus-and-inject primitive, a residual platform race remains after validation.
       </div>
       <div class="note">
         <strong>These are the app's login credentials</strong>
@@ -282,18 +287,20 @@ APPPILOT_PASSWORD=your-password</code></pre>
 <span class="cmt"># expected output, e.g.:</span>
 <span class="cmt"># List of devices attached</span>
 <span class="cmt"># emulator-5554   device</span></code></pre>
-      <p>Note the device id (e.g. <code>emulator-5554</code>) — you pass it with <code>--device</code> below.</p>
+      <p>Note the device id (e.g. <code>emulator-5554</code>) if you want to select it explicitly. Otherwise AppPilot reuses a valid device saved by <code>/init</code> only when its identity still matches, or uniquely auto-detects an authorized, fully booted device.</p>
     </section>
 
     <section id="run-agent">
       <h2><span class="num">5</span>Run the agent</h2>
       <p>With the emulator running and <code>.env</code> in place:</p>
-      <pre><code>python3 src/apppilot_agent.py --device emulator-5554</code></pre>
+      <pre><code>python3 src/apppilot_agent.py
+<span class="cmt"># Optional explicit selection:</span>
+python3 src/apppilot_agent.py --device emulator-5554</code></pre>
       <h3>Options</h3>
       <table>
         <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td><code>--device</code></td><td>ADB device id (default <code>emulator-5554</code>).</td></tr>
+          <tr><td><code>--device</code></td><td>Optional authorized, fully booted ADB device id. When omitted, reuse the valid <code>/init</code> selection only after identity verification or uniquely auto-detect one; never guess when identity is unverified or zero or multiple devices are usable.</td></tr>
           <tr><td><code>--max-actions</code></td><td>Override the absolute per-run action bound.</td></tr>
           <tr><td><code>--max-stuck-actions</code></td><td>Override the early-termination "stuck" bound.</td></tr>
           <tr><td><code>--guidance</code></td><td>Override the default high-level guidance given to the model.</td></tr>

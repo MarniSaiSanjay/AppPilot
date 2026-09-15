@@ -21,13 +21,15 @@ judges expected-vs-observed. Retry and reporting are fully deterministic.
 
 ## Excel-driven testcases
 
-The workbook is the source of truth (`deeplink_testcase_loader.py`). The loader is tolerant of
-layout: it recognises a header row by name (e.g. *Launch URL*, *Expected
-Screen*, *License*, *Installed*) and maps columns accordingly, falling back to a
-fixed positional layout when no header is present. Each data row must provide a
-Test ID, a Deep Link, a License and an Expected Result. The License selects
-profile-specific credentials from local environment variables; credentials are
-never stored in the workbook.
+The workbook is the source of truth (`deeplink_testcase_loader.py`). Explicit
+header rows must contain Test ID, Deep Link, License, and Expected Result;
+Installed is optional. Headerless positional A-D compatibility remains.
+Duplicate Test IDs, missing required values, non-HTTPS links, and links outside
+the supported App Link domains are rejected with row/column context.
+`Installed` accepts only the documented true/false tokens listed in the root
+README; unknown values are errors rather than truthy fallbacks. The License
+selects profile-specific credentials from local environment variables;
+credentials are never stored in the workbook.
 
 ## Installed vs uninstalled
 
@@ -91,24 +93,58 @@ selects the scenario:
 
 ## Verification
 
-`LLMExpectationJudge` is given only the Expected Result and the redacted observed
-UI and returns a match/mismatch verdict. The runner polls observe→judge within a
-bounded window (PASS on first match; mismatch only after the window elapses) and
-retries deterministically. For installed cases and supported-domain
+The runner first verifies the deeplink delivery evidence, expected package,
+foreground package/activity, non-empty UI, and reliable destination signatures.
+A deterministic contradiction fails and cannot be overridden by the model.
+`LLMExpectationJudge` is then given only the Expected Result and the redacted
+observed UI for semantic ambiguity. A positive semantic verdict is confirmed
+against a fresh observation and uncached model evaluation. The runner polls
+within a per-attempt monotonic deadline created after deeplink launch. Each
+retry receives a fresh verification window; preparation, installation, login,
+retry setup, and cleanup do not consume it. Model, ADB/Maestro, and installer
+operations retain their independent finite bounds. Model transport/timeout,
+Android/Maestro, installer, and genuine destination-mismatch failures remain
+separate. For installed cases and supported-domain
 fresh-install links, one bounded in-attempt recovery handles Android or Maestro
 operational failures and incomplete destination shells by stopping the app,
 reopening it, checking login without allowing another relaunch, and replaying
-the exact deeplink. Other fresh-install links retry from recreated installation
-state. An existing signed-in session requires no login actions. Existing
-supported-link setup is reused; it is repeated only after an uninstall has
-removed that package state. Usable but incorrect destinations are not
-restarted. In both installed and first-install flows, a Researcher screen
-that explicitly offers an Add action is handled deterministically before final
+the exact deeplink. Recovery and deterministic Researcher setup restart the
+verification window. Other fresh-install links retry from recreated
+installation state. An existing signed-in session requires no login actions.
+Existing supported-link setup is reused; it is repeated only after an uninstall
+has removed that package state. Usable but incorrect destinations are not
+restarted. In both installed and first-install flows, a Researcher screen that
+explicitly offers an Add action is handled deterministically before final
 verification and again after a recovery replay when needed; unknown screens go
 directly to the judge. Named destinations are
 distinct: an expected Researcher screen cannot match Cowork or generic Chat,
 and vice versa. Prompt presence, absence, and any specified prompt content must
 also match.
+
+## Device ownership, cleanup, and evidence
+
+The CLI holds a fail-fast lock keyed by normalized Android serial before any
+device mutation. A second process targeting the same device exits with owner
+metadata; different devices use independent locks. Valid local dead-owner locks
+are reclaimed, while malformed/unverifiable lock metadata fails closed.
+
+Credential paste clears the Android clipboard in the same Maestro flow and
+retries cleanup best-effort on failure. Maestro subprocesses receive an explicit
+runtime allowlist plus the temporary credential variable only for credential
+flows; unrelated model, email, telemetry, and profile secrets are not inherited.
+
+Every case attempts target-app stop and clipboard cleanup. Suite-final cleanup
+repeats those operations and restores captured AppPilot-managed supported-link
+selection, handling, and restorable domain-verification state. Cleanup
+failure is reported separately, preserves the original failure, and prevents an
+otherwise matched case from reporting a clean PASS. AppPilot does not restore
+prior APK installation, accounts, permissions, app data/cache, or unrelated
+apps.
+
+Failed cases retain sanitized JSON under
+`.apppilot_artifacts/<run-id>/`. Artifacts are unique per case/attempt and
+capped at 64 KiB. Raw screenshots are intentionally not retained without a safe
+pixel-redaction mechanism.
 
 ## Entry point
 

@@ -21,6 +21,7 @@ from apppilot.android import (
     MaestroHierarchyObserver,
 )
 from apppilot.agent import AppPilotAgent
+
 from apppilot.brain import DecisionRequest, ModelDecision
 from apppilot.models import (
     Action,
@@ -56,7 +57,13 @@ from usecases.deeplink.verification import LLMExpectationJudge
 
 class MaestroExecutorReliabilityTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.executor = MaestroExecutor("com.example.app", "emulator-5554")
+        self.credential_observer = Mock()
+        self.executor = MaestroExecutor(
+            "com.example.app",
+            "emulator-5554",
+            credential_release_check=lambda _timeout: None,
+            credential_observer=self.credential_observer,
+        )
 
     @staticmethod
     def _obstructed_tap_observation(
@@ -109,6 +116,7 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
             is_input=True,
             label="password | Enter password",
             bounds=(100, 200, 900, 300),
+            package_name="com.example.app",
         )
         return target, UIObservation((target,))
 
@@ -127,6 +135,7 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
             is_input=True,
             label="username | Email",
             bounds=(100, 200, 900, 300),
+            package_name="com.example.app",
         )
         return target, UIObservation((target,))
 
@@ -139,6 +148,7 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
     ) -> None:
         run.return_value = subprocess.CompletedProcess([], 0, "", "")
         target, observation = self._username_observation()
+        self.credential_observer.reobserve.return_value = observation
         secret = "person@example.com"
 
         result = self.executor.execute_fast(
@@ -152,23 +162,31 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         )
 
         self.assertEqual(result, CredentialInputMethod.ADB)
-        run.assert_called_once()
+        self.assertEqual(run.call_count, 2)
         self.assertEqual(
-            run.call_args.args[0],
+            run.call_args_list[1].args[0],
             ["adb", "-s", "emulator-5554", "shell", "sh"],
         )
-        self.assertIn("input keycombination 113 29", run.call_args.kwargs["input"])
-        self.assertIn("input text p", run.call_args.kwargs["input"])
+        self.assertIn(
+            "input keycombination 113 29",
+            run.call_args_list[1].kwargs["input"],
+        )
+        self.assertIn(
+            "input text p", run.call_args_list[1].kwargs["input"]
+        )
         run_flow.assert_not_called()
 
     @patch.object(MaestroExecutor, "_run_flow")
-    @patch.object(MaestroExecutor, "_clear_credential_field")
+    @patch.object(MaestroExecutor, "_clear_focused_credential_field")
+    @patch.object(MaestroExecutor, "_focus_credential_target")
     def test_password_uses_single_exact_clipboard_flow(
         self,
+        focus_target,
         clear_field,
         run_flow,
     ) -> None:
         target, observation = self._credential_observation()
+        self.credential_observer.reobserve.return_value = observation
         secret = "P@ssw0rd!"
 
         result = self.executor.execute_fast(
@@ -182,22 +200,26 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         )
 
         self.assertEqual(result, CredentialInputMethod.CLIPBOARD)
-        clear_field.assert_called_once_with(500, 250)
+        focus_target.assert_called_once()
+        clear_field.assert_called_once_with(timeout=15)
         run_flow.assert_called_once()
         flow = run_flow.call_args.args[0]
-        self.assertTrue(flow.startswith("- tapOn:\n"))
+        self.assertTrue(flow.startswith("- setClipboard:"))
         self.assertIn("${MAESTRO_APPPILOT_INPUT_SECRET}", flow)
         self.assertNotIn(secret, flow)
         self.assertEqual(run_flow.call_args.kwargs["secret"], secret)
 
     @patch.object(MaestroExecutor, "_run_flow")
-    @patch.object(MaestroExecutor, "_clear_credential_field")
+    @patch.object(MaestroExecutor, "_clear_focused_credential_field")
+    @patch.object(MaestroExecutor, "_focus_credential_target")
     def test_non_printable_username_falls_back_to_one_maestro_flow(
         self,
+        focus_target,
         clear_field,
         run_flow,
     ) -> None:
         target, observation = self._username_observation()
+        self.credential_observer.reobserve.return_value = observation
 
         result = self.executor.execute_fast(
             Action(
@@ -210,7 +232,8 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         )
 
         self.assertEqual(result, CredentialInputMethod.CLIPBOARD)
-        clear_field.assert_called_once_with(500, 250)
+        focus_target.assert_called_once()
+        clear_field.assert_called_once_with(timeout=15)
         run_flow.assert_called_once()
 
     @patch.object(MaestroExecutor, "_clear_focused_credential_field")
@@ -233,7 +256,10 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
             is_input=True,
             label="password | Enter password",
             bounds=None,
+            package_name="com.example.app",
         )
+        observation = UIObservation((target,))
+        self.credential_observer.reobserve.return_value = observation
         secret = "P@ssw0rd!"
 
         result = self.executor.execute_fast(
@@ -242,13 +268,13 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
                 target_id=target.element_id,
                 credential_kind=CredentialKind.PASSWORD,
             ),
-            UIObservation((target,)),
+            observation,
             secret=secret,
         )
 
         self.assertEqual(result, CredentialInputMethod.CLIPBOARD)
         self.assertEqual(run_flow.call_count, 2)
-        clear_field.assert_called_once_with()
+        clear_field.assert_called_once_with(timeout=15)
         paste_flow = run_flow.call_args_list[1].args[0]
         self.assertIn("${MAESTRO_APPPILOT_INPUT_SECRET}", paste_flow)
         self.assertNotIn(secret, paste_flow)
@@ -287,6 +313,93 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
                 "children": [],
             }
         )
+
+    @staticmethod
+    def _generic_password_hierarchy(value: str) -> str:
+        return json.dumps(
+            {
+                "attributes": {
+                    "resource-id": "com.example:id/input",
+                    "text": value,
+                    "accessibilityText": "",
+                    "hintText": "",
+                    "class": "android.widget.EditText",
+                    "clickable": "true",
+                    "enabled": "true",
+                    "password": "true",
+                },
+                "children": [],
+            }
+        )
+
+    @patch("apppilot.android.subprocess.run")
+    def test_uiautomator_password_attribute_redacts_generic_input(
+        self,
+        run,
+    ) -> None:
+        secret = "P@ssw0rd!"
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            (
+                '<hierarchy rotation="0">'
+                f'<node text="{secret}" resource-id="com.example:id/input" '
+                'class="android.widget.EditText" package="com.example.app" '
+                'content-desc="" clickable="true" enabled="true" '
+                'password="true" bounds="[0,0][100,100]" />'
+                "</hierarchy>"
+            ),
+            "",
+        )
+
+        observation = MaestroHierarchyObserver(
+            "emulator-5554"
+        )._capture_uiautomator()
+
+        self.assertEqual(observation.elements[0].text, "")
+        self.assertNotIn(secret, observation.describe())
+        self.assertNotIn(
+            secret,
+            LLMExpectationJudge._render("Expected destination", observation),
+        )
+
+    @patch("apppilot.android.subprocess.run")
+    def test_maestro_password_attribute_redacts_generic_input(
+        self,
+        run,
+    ) -> None:
+        secret = "P@ssw0rd!"
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            self._generic_password_hierarchy(secret),
+            "",
+        )
+
+        observation = MaestroHierarchyObserver("emulator-5554")._capture_maestro()
+
+        self.assertEqual(observation.elements[0].text, "")
+        self.assertNotIn(secret, observation.describe())
+
+    @patch("apppilot.android.subprocess.run")
+    def test_existing_password_markers_still_redact_without_password_attribute(
+        self,
+        run,
+    ) -> None:
+        secret = "P@ssw0rd!"
+        hierarchy = json.loads(self._password_hierarchy(secret))
+        del hierarchy["attributes"]["password"]
+        run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            json.dumps(hierarchy),
+            "",
+        )
+
+        observation = MaestroHierarchyObserver("emulator-5554")._capture_maestro()
+
+        self.assertEqual(observation.elements[0].text, "")
+        self.assertNotIn(secret, observation.describe())
 
     @patch("apppilot.android.subprocess.run")
     def test_next_observation_verifies_username_without_exposing_it(
@@ -436,7 +549,8 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         self.executor._run_flow("- tapOn: Open\n")
 
         self.assertEqual(run.call_count, 2)
-        reset_adb.assert_called_once_with()
+        reset_adb.assert_called_once()
+        self.assertGreater(reset_adb.call_args.args[0], 0)
 
     @patch("apppilot.android.time.sleep")
     @patch.object(MaestroExecutor, "_reset_adb_connection")
@@ -2140,6 +2254,8 @@ class UninstalledRecoveryTests(unittest.TestCase):
                     SUPPORTED_LINK_DOMAINS
                 ),
                 unittest.mock.call.executor.open_link(case.deep_link),
+                unittest.mock.call.executor.stop_app(),
+                unittest.mock.call.executor.clear_clipboard(),
             ],
         )
 
@@ -2183,7 +2299,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
         installer.ensure_absent.assert_called_once_with()
         installer.install_and_open.assert_called_once_with(via_store_button=True)
         installer.open.assert_called_once_with()
-        executor.stop_app.assert_called_once_with()
+        self.assertEqual(executor.stop_app.call_count, 2)
         executor.launch_app.assert_not_called()
         login_flow.ensure_ready.assert_called_once_with()
         login_flow.ensure_ready_without_relaunch.assert_called_once_with()
@@ -2268,7 +2384,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
         self.assertEqual(installer.ensure_absent.call_count, 2)
         self.assertEqual(installer.install_and_open.call_count, 2)
         installer.open.assert_called_once_with()
-        executor.stop_app.assert_called_once_with()
+        self.assertEqual(executor.stop_app.call_count, 2)
         self.assertEqual(login_flow.ensure_ready.call_count, 2)
 
     def test_failed_in_attempt_recovery_escalates_next_retry_to_fresh(
@@ -2371,7 +2487,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
         self.assertEqual(installer.ensure_absent.call_count, 2)
         self.assertEqual(installer.install_and_open.call_count, 2)
         installer.open.assert_not_called()
-        executor.stop_app.assert_not_called()
+        executor.stop_app.assert_called_once_with()
         self.assertEqual(executor.open_link.call_count, 2)
         executor.enable_supported_links.assert_not_called()
 
@@ -2412,7 +2528,7 @@ class UninstalledRecoveryTests(unittest.TestCase):
         self.assertEqual(installer.ensure_absent.call_count, 2)
         self.assertEqual(installer.install_and_open.call_count, 2)
         installer.open.assert_not_called()
-        executor.stop_app.assert_not_called()
+        executor.stop_app.assert_called_once_with()
         self.assertEqual(executor.open_link.call_count, 2)
 
     def test_legacy_login_capability_remains_compatible(self) -> None:
@@ -3071,7 +3187,7 @@ class ModelClientReliabilityTests(unittest.TestCase):
         return response
 
     @patch("shared.model_client.time.sleep")
-    @patch("shared.model_client.urllib.request.urlopen")
+    @patch("shared.model_client._NO_REDIRECT_OPENER.open")
     def test_throttling_honors_retry_after_then_uses_backoff(
         self, urlopen, sleep
     ) -> None:
@@ -3100,7 +3216,7 @@ class ModelClientReliabilityTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [7.0, 4.0])
 
     @patch("shared.model_client.time.sleep")
-    @patch("shared.model_client.urllib.request.urlopen")
+    @patch("shared.model_client._NO_REDIRECT_OPENER.open")
     def test_malformed_response_is_not_resent(self, urlopen, sleep) -> None:
         urlopen.return_value = self._response(b"not-json")
 

@@ -39,7 +39,7 @@ from .builder import (
     resolve_decision_provider,
     _parse_args,
 )
-from .flow import LoginCapability, SharedLoginFlow, _SignInTracer
+from .flow import LoginCapability, SharedLoginFlow
 from .login_decision_cache import LoginDecisionCache
 from .profiled import ProfiledLoginFlowFactory
 
@@ -61,4 +61,5 @@ __all__ = [
     "build_login_agent",
     "main",
     "resolve_decision_provider",
+    "_parse_args",
 ]

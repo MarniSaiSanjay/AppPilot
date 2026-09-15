@@ -140,8 +140,9 @@ detector is a safety/reliability mechanism only — it never decides *which*
 action to take; the model remains the sole decision-maker.
 
 Configuration precedence for the stuck bound is
-`--max-stuck-actions` &rarr; `APPPILOT_MAX_STUCK_ACTIONS` &rarr; `5`, with
-invalid environment values falling back safely to the default.
+`--max-stuck-actions` &rarr; `APPPILOT_MAX_STUCK_ACTIONS` &rarr; `5`.
+Malformed environment values fall back safely to the default; numeric values
+below `1` are rejected by the CLI or agent validation boundary.
 
 ## Login completion
 
@@ -223,7 +224,11 @@ Boundaries:
   explicitly offers that action; unknown screens are left untouched. An
   expected error that is correctly observed is a PASS, because the result is
   *observed vs expected*, not *did the deeplink succeed*.
-- **Retry and reporting are deterministic.** Two attempts per case by default.
+- **PASS gates, retry, and reporting are deterministic.** Package/activity,
+  non-empty UI, and reliable named-destination evidence are checked before the
+  semantic judge. Contradictory deterministic evidence cannot be overridden.
+  A positive semantic result is checked again using a fresh observation and
+  uncached model call. Two attempts per case by default.
   Installed retries stop, wait 2 seconds, and reopen the same deeplink;
   uninstalled retries recreate the complete fresh-install sequence. Any
   matching attempt is a PASS; exhausted attempts are a FAIL.
@@ -241,7 +246,9 @@ Boundaries:
 
 The Excel has four required fields (Test ID, Deep Link, License, Expected
 Result) and an optional Installed field. Recognized headers may be reordered;
-otherwise columns A-D are used.
+otherwise columns A-D are used. Test IDs are unique, Installed values are
+strict documented booleans, and deeplinks must be HTTPS on supported domains.
+Validation errors identify the worksheet row and column.
 
 ## Android execution layer
 
@@ -252,13 +259,46 @@ entry. The agent does **not** execute any prewritten end-to-end Maestro flow.
 Login, onboarding, and unexpected interruptions are handled by reasoning over
 the current UI and issuing one validated action at a time.
 
+Maestro receives a minimal allowlisted subprocess environment rather than the
+entire AppPilot environment. The temporary credential variable exists only for
+the credential flow, and clipboard contents are cleared immediately after paste
+with best-effort cleanup on exceptional paths.
+
+The deeplink CLI also owns a per-device process lock. It is acquired before
+device mutation, keyed by normalized serial, and released on both success and
+exceptions. Case and suite-final cleanup stop the target app and clear the
+clipboard; suite cleanup additionally restores captured AppPilot-managed
+supported-link user selection, handling, and domain-verification state. Because
+Android domain verification is asynchronous, restoration waits within its
+cleanup deadline and reports failure if the captured state cannot be restored.
+Cleanup failures remain part of the final result and never hide the original
+case failure.
+
+Deeplink verification uses a fresh per-attempt monotonic polling deadline that
+starts after launch. Preparation, installation, login, retry setup, and cleanup
+do not consume that window. ADB, Maestro, model, installer, and app-link
+operations retain their own finite operation-level bounds.
+
+Failed deeplink cases produce bounded, sanitized, run-scoped JSON artifacts
+under `.apppilot_artifacts/<run-id>/`. The result carries the retained path.
+Raw screenshots are excluded until pixel-level secret redaction is available.
+
 ## Prototype execution
 
-Run the agent against the connected emulator:
+Run the agent against the device selected by `/init`, or the only authorized,
+fully booted device when exactly one is available:
 
 ```
-python3 src/apppilot_agent.py --device emulator-5554
+python3 src/apppilot_agent.py
 ```
+
+`--device <serial>` remains an explicit override and is accepted only when that
+device is currently authorized and fully booted. Saved selections are reused
+only when their persisted identity still matches the connected device. A
+matching transport with missing or changed identity fails cleanly and requires
+`/init` or explicit selection. When the saved device is absent, exactly one
+usable device can still be auto-detected; zero or multiple devices fail rather
+than using an implicit `emulator-5554` fallback.
 
 The trace shows the loop explicitly:
 

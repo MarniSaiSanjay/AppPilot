@@ -59,6 +59,7 @@ class UIElement:
     label: str
     bounds: "tuple[int, int, int, int] | None" = None
     checked: "bool | None" = None
+    package_name: str = ""
 
     @property
     def selector_text(self) -> str:

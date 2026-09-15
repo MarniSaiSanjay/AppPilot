@@ -54,8 +54,28 @@ Fixed sender: `DoNotReply@05294377-b44f-48d0-a7a6-9e78ae5ad6a0.azurecomm.net`
   (`telemetry-conn`); it is never in the CLI, never logged, never returned.
 * The relay pulls its image using its **system-assigned managed identity** with
   only the `AcrPull` role — no broad access, no registry admin creds.
-* Callers authenticate with a scoped API key (`api-key` secret), constant-time
-  compared. HTTPS is enforced (`allowInsecure=false`).
+* Email and telemetry callers authenticate with separate scoped API keys,
+  constant-time compared. HTTPS is enforced (`allowInsecure=false`).
+* Provider/storage exceptions are reduced to fixed log and response messages;
+  connection strings and provider exception details are not logged.
+
+## Local development and validation
+
+The relay dependencies are isolated in `email_service/requirements.txt`; the
+main AppPilot runner does not import them.
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m unittest tests.test_email_service
+python -m pip_audit -r email_service/requirements.txt --progress-spinner off
+docker build --tag apppilot-email-relay:local ./email_service
+```
+
+The tests mock ACS Email and Azure Table Storage. They require no Azure
+resources or real credentials and cover scoped authentication, fixed sender,
+recipient handling, telemetry schema, and sanitized provider failures. The PR
+workflow runs these tests and builds the Docker image independently; ordinary
+Python tests do not require a Docker daemon.
 
 ## Server-side environment (set on the Container App, not the CLI)
 
@@ -65,6 +85,7 @@ Fixed sender: `DoNotReply@05294377-b44f-48d0-a7a6-9e78ae5ad6a0.azurecomm.net`
 | `APPPILOT_EMAIL_TO` | default recipient(s) when request omits `to`, comma/semicolon separated |
 | `ACS_CONNECTION_STRING` | `secretref:acs-conn` |
 | `APPPILOT_API_KEY` | `secretref:api-key` |
+| `APPPILOT_TELEMETRY_API_KEY` | `secretref:telemetry-api-key` |
 | `TELEMETRY_TABLE_CONNECTION_STRING` | `secretref:telemetry-conn` |
 
 Retrieve the API key (owner only):
@@ -99,8 +120,8 @@ are rejected (`422`). Each accepted request writes one row to the `SuiteRuns`
 table (via the server-only `telemetry-conn` secret) with `PartitionKey` = suite
 and a random `uuid` `RowKey` (Azure mechanics, not data). The client
 (`src/apppilot/telemetry.py`, stdlib `urllib`) is best-effort. Wire it with
-`APPPILOT_TELEMETRY_URL` = `https://<app-fqdn>/telemetry` and the shared
-`APPPILOT_EMAIL_API_KEY`.
+`APPPILOT_TELEMETRY_URL` = `https://<app-fqdn>/telemetry` and a dedicated
+`APPPILOT_TELEMETRY_API_KEY` matching the relay's telemetry-only secret.
 
 ## Redeploy the image
 

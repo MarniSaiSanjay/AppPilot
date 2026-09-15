@@ -31,7 +31,8 @@ action limit is hit.
   observation. Model decisions are re-observed through the same UIAutomator-first
   observer, then the normal executor uses Maestro selectors or ADB coordinates
   as appropriate. Username entry can use verified paced ADB input; password
-  entry uses Maestro's secure clipboard path.
+  entry uses Maestro's secure clipboard path and clears the Android clipboard
+  immediately after paste, with best-effort cleanup on failure paths.
 - Every action still passes safety validation. Failed or incomplete runs save no
   new decisions.
 
@@ -53,9 +54,41 @@ nodes stay generic and never import a specific use case. Put reusable nodes in
 
 ## Prerequisites
 
+### Python environment
+
+AppPilot supports **Python 3.11, 3.12, and 3.13**. The main Android runner is
+stdlib-only; third-party Python packages are needed only for development checks
+and the separately deployed email relay.
+
+Create a development environment from the repository root:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
+```
+
+`pyproject.toml` declares the supported Python range and root project metadata.
+`requirements-dev.txt` installs pinned pyflakes/pip-audit versions and the
+separately pinned `email_service/requirements.txt`. The root AppPilot package
+has no third-party runtime dependency.
+
+### Tool requirements by validation level
+
+| Level | Requirements |
+| --- | --- |
+| Unit/source checks | Python 3.11-3.13 plus `requirements-dev.txt`. No Android SDK, device, APK, model, or production credentials. |
+| Emulator/device development | Unit requirements plus Android SDK Platform Tools with ADB 1.0.41-compatible commands, Maestro CLI 2.x (known-good: 2.8.0), Java 17+, and one explicitly selected ready Android target. |
+| Full production execution | Device requirements plus `apksigner` and either `apkanalyzer` or `aapt`, a trusted signed APK, expected package/certificate configuration, and required model/account settings. |
+
+ADB, Maestro, Java, Android SDK tools, devices, and APKs are external runtime
+prerequisites; they are intentionally not Python dependencies.
+
 ### macOS
 
-- **Python 3.11+**.
+- **Python 3.11-3.13**.
+- **Android SDK Platform Tools and command-line/build tools** — ensure `adb`,
+  `apksigner`, and either `apkanalyzer` or `aapt` are on `PATH`.
 - **Maestro CLI** (requires Java 17+):
   ```bash
   curl -fsSL "https://get.maestro.mobile.dev" | bash
@@ -73,11 +106,12 @@ nodes stay generic and never import a specific use case. Put reusable nodes in
 AppPilot itself is cross-platform. On Windows, Maestro runs through WSL.
 Install the following prerequisites:
 
-- **Python 3.11+** — from [python.org](https://www.python.org/downloads/windows/)
+- **Python 3.11-3.13** — from [python.org](https://www.python.org/downloads/windows/)
   (tick "Add python.exe to PATH").
 - **Android Studio / Android SDK** — the simplest way to get the emulator and to
-  create an AVD. Add the SDK's `platform-tools` and `emulator` directories to
-  your `PATH` (they ship `adb.exe` and `emulator.exe`, found automatically).
+  create an AVD. Add the SDK's `platform-tools`, `emulator`, `build-tools`, and
+  `cmdline-tools` binaries to your `PATH`; AppPilot requires `adb`,
+  `apksigner`, and either `apkanalyzer` or `aapt`.
 - **Android Platform Tools / ADB** — bundled with the SDK; confirm with
   `adb devices`.
 - **Java 17+** — required by Maestro (JDK 17 or newer on your `PATH`).
@@ -91,8 +125,8 @@ Install the following prerequisites:
   shell. `adb` running on Windows is reachable from WSL, so a device started on
   Windows can still be driven through Maestro under WSL.
 
-The prototype targets the Office hub app id
-`com.microsoft.office.officehubrow`.
+The target package and trusted signing certificate are required configuration;
+AppPilot no longer assumes an application ID from the filename or UI.
 
 ## Setup
 
@@ -128,6 +162,48 @@ Ready
 `/init` **does not** install missing prerequisites, build APKs, or send email —
 it only checks, configures, and reports how to fix what is missing.
 
+## Source validation
+
+Canonical developer commands:
+
+| Purpose | Command |
+| --- | --- |
+| Full unit suite | `python -m unittest discover -s tests -p 'test_*.py'` |
+| Email relay tests | `python -m unittest tests.test_email_service` |
+| Syntax | `python -m compileall -q src tests scripts email_service` |
+| Static checks | `python -m pyflakes src tests scripts email_service` |
+| Workbook contract | `python scripts/validate_workbook.py` |
+| Secret scan | `python scripts/scan_secrets.py` |
+| Dependency audit | `python -m pip_audit -r email_service/requirements.txt --progress-spinner off` |
+| Local PR-equivalent source checks | `python scripts/check.py` |
+| Email container build | `docker build --tag apppilot-email-relay:local ./email_service` |
+
+`scripts/check.py` runs every source check above except Docker. Dependency audit
+requires access to the Python vulnerability index. Intentional compatibility
+re-exports are declared through `__all__`; pyflakes otherwise runs without a
+blanket exclusion, and a regression test proves a new unused import fails.
+
+### CI validation strategy
+
+Every pull request runs `.github/workflows/pr-source-validation.yml` with a
+read-only GitHub token and no repository or production secrets. It validates
+Python 3.11-3.13 syntax/tests, full-tree pyflakes, the 48-case workbook contract,
+high-confidence secret patterns, changed-line whitespace, email relay behavior,
+declared dependency vulnerabilities, and the email-service Docker build.
+Official GitHub actions are pinned to immutable commit SHAs, checkout
+credentials are not persisted, and the workflow uses `pull_request`, never
+`pull_request_target`.
+
+Ordinary PR CI intentionally does **not** run an emulator, physical device,
+Maestro, ADB, APK installation, real model calls, account switching, Store
+handoff, email delivery, or telemetry delivery.
+
+Nightly or manually controlled validation should cover emulator smoke, fake-APK
+integration, a non-sensitive model transport canary, and controlled workbook
+execution. Release validation belongs in a credentialed controlled environment
+and must cover the trusted real APK/signature, a real Android device, account
+switching, Store handoff, supported links, and physical-device acceptance.
+
 ## Configuration
 
 AppPilot reads configuration from environment variables. A local, **git-ignored**
@@ -138,7 +214,9 @@ environment variables always take precedence).
 | --- | --- | --- |
 | `APPPILOT_MODEL` | yes* | Decision-model deployment/name (e.g. `gpt-4.1-mini`). |
 | `APPPILOT_MODEL_API_KEY` | yes* | API key for the model endpoint. |
-| `APPPILOT_MODEL_BASE_URL` | no | OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint). |
+| `APPPILOT_MODEL_BASE_URL` | no | OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint). Remote endpoints must use HTTPS; HTTP is allowed only for loopback development endpoints. |
+| `APPPILOT_EXPECTED_PACKAGE_ID` | yes for APK runs | Android application/package ID expected in the local and installed APK. |
+| `APPPILOT_TRUSTED_CERT_SHA256` | yes for APK runs | Trusted signing-certificate SHA-256 fingerprint. Colons are optional; the value must contain exactly 64 hexadecimal characters. |
 | `APPPILOT_USERNAME` | for standalone login | Default sign-in username/email for the standalone login prototype and legacy non-profile callers. |
 | `APPPILOT_PASSWORD` | for standalone login | Default sign-in password, handled with the same local credential isolation. |
 | `APPPILOT_USERNAME_<LICENSE>` | for Deeplink login | Username for an Excel License profile, where `<LICENSE>` is uppercase and separators become `_` (for example `Entra Premium` → `ENTRA_PREMIUM`). |
@@ -146,9 +224,10 @@ environment variables always take precedence).
 | `APPPILOT_MAX_ACTIONS` | no | Absolute upper bound on actions per run (default `30`). |
 | `APPPILOT_MAX_STUCK_ACTIONS` | no | Consecutive actions with no meaningful UI change before an early controlled FAIL (default `5`). |
 | `APPPILOT_EMAIL_API_URL` | for email | HTTPS relay endpoint used to send the suite report. |
-| `APPPILOT_EMAIL_API_KEY` | for email | Scoped API key for the email relay (also used for telemetry). |
+| `APPPILOT_EMAIL_API_KEY` | for email | Scoped API key for the email relay. |
 | `APPPILOT_CONTACT_EMAIL` | no | Optional contact address shown in the report footer (omitted if unset). |
 | `APPPILOT_TELEMETRY_URL` | for telemetry | HTTPS relay `/telemetry` endpoint. When set, each real suite run best-effort submits one minimal record (suite, test-case count, host OS, target platform) — nothing identifying. Unset disables telemetry. |
+| `APPPILOT_TELEMETRY_API_KEY` | for telemetry | Telemetry-only API key; it must be different from the email relay credential. |
 
 \* If no model is configured, the agent does **not** guess — it reports that it
 cannot proceed and how to configure one.
@@ -157,6 +236,11 @@ Security reminders:
 
 - Login credentials are resolved locally and are never included in model
   prompts, UI observations, logs, or source code.
+- Before credential injection, AppPilot revalidates APK trust, the foreground
+  package/window, and the expected field from a fresh hierarchy. Android's
+  separate ADB/Maestro automation processes do not provide a mathematically
+  atomic focus-and-inject primitive, so a residual platform race remains after
+  that immediate validation.
 - Keep `.env` local and never commit real credentials or API keys.
 
 Example `.env`:
@@ -165,6 +249,8 @@ Example `.env`:
 APPPILOT_MODEL=gpt-4.1-mini
 APPPILOT_MODEL_API_KEY=your-key-here
 APPPILOT_MODEL_BASE_URL=https://your-endpoint.openai.azure.com/openai/v1
+APPPILOT_EXPECTED_PACKAGE_ID=com.example.apppilot
+APPPILOT_TRUSTED_CERT_SHA256=replace-with-the-trusted-64-hex-sha256-fingerprint
 APPPILOT_USERNAME=you@example.com
 APPPILOT_PASSWORD=your-password
 APPPILOT_USERNAME_PREMIUM=premium-user@example.com
@@ -213,9 +299,19 @@ Options: `--excel` (explicit workbook path; otherwise a suite is selected from
 
 `--device` is an **optional** override. When omitted, the device selected during
 `/init` (saved, gitignored, in `.apppilot_device`) is reused when still
-connected; otherwise a single connected device is auto-detected. If several
-usable devices are connected and none is chosen, the run exits cleanly (code `2`)
-asking for `--device <serial>`.
+connected and its saved identity still matches. If the saved device is no longer
+connected, a single usable device is auto-detected. An unverified matching
+transport fails cleanly, and legacy serial-only saved selections must be
+refreshed by running `/init` again. If several usable devices are connected and
+none is chosen, the run exits cleanly (code `2`) asking for
+`--device <serial>`.
+
+Only one AppPilot process may target a given normalized device serial at a
+time. The runner acquires a fail-fast inter-process lock before device mutation
+and releases it on normal completion and exceptions. If a lock error names a
+live owner PID/run ID, stop that run or choose another device. A valid local
+lock whose owner process is no longer alive is reclaimed automatically;
+malformed or unverifiable lock metadata is retained and fails closed.
 
 To run the standalone goal-driven agent prototype (login preparation only):
 
@@ -224,6 +320,14 @@ python3 src/apppilot_agent.py
 ```
 
 Options: `--device`, `--max-actions`, `--max-stuck-actions`, `--guidance`.
+
+Standalone login uses the same device resolution contract as the deeplink
+runner. An explicit `--device` must be authorized and fully booted. When the
+option is omitted, AppPilot reuses a valid device saved by `/init` only after
+its identity is revalidated. If that saved device is absent, it can uniquely
+auto-detect a usable device. It exits cleanly instead of guessing when a
+matching transport's identity cannot be verified or when no usable device or
+multiple usable devices are present.
 
 ## Deeplink test suite
 
@@ -235,14 +339,43 @@ agent. The workbook requires **Test ID**, **Deep Link**, **License**, and
 workbook there, prompts to choose when several exist, and exits cleanly (code
 `2`) when none is found.
 
+Workbook validation is strict. Explicit header rows must contain all required
+columns; Test IDs must be unique case-insensitively; deeplinks must use HTTPS
+and one of the AppPilot supported-link hosts. `Installed` accepts only
+`true`, `t`, `yes`, `y`, `1`, `installed`, `false`, `f`, `no`, `n`, `0`,
+`uninstalled`, `not installed`, or `fresh` (case-insensitive). Invalid data is
+rejected with worksheet row/column context rather than being reinterpreted.
+
 For each case, the suite establishes a clean state, launches the **exact**
 deeplink through an Android VIEW intent over ADB, observes the resulting UI,
-and the **AI judges**
-whether it semantically satisfies the natural-language Expected Result (expected
-error/failure states count as PASS). Failed cases retry (default **2 attempts**
-total) and the suite continues to the next case, ending with a per-test report
-plus totals. See [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md) for
-the installed/uninstalled orchestration details.
+checks package/activity and known destination evidence deterministically, and
+then uses the **AI judge** only for remaining semantic ambiguity. Deterministic
+contradictions and empty UI cannot be overridden by the model. The
+`--verify-timeout` window is a per-attempt monotonic polling deadline that starts
+after the deeplink is launched. Preparation, installation, login, retry setup,
+and cleanup do not consume it. Model, ADB/Maestro, and installer operations keep
+their own finite bounds, and ordinary destination-mismatch failures stay
+distinguishable. Failed cases retry (default **2 attempts** total) with a fresh
+verification window, and the suite continues to the next case.
+
+Case cleanup always attempts to stop the target app and clear the clipboard.
+Suite-final cleanup repeats those safety operations and restores AppPilot's
+temporary supported-link user-selection, handling, and domain-verification
+state when they were captured. Android domain verification is asynchronous, so
+restoration waits within the cleanup deadline and reports a cleanup failure if
+the captured state cannot be re-established. AppPilot intentionally does
+**not** reinstall a previously present APK, restore accounts, permissions, app
+cache/data, or unrelated applications.
+
+Each failed case retains bounded, sanitized JSON evidence under
+`.apppilot_artifacts/<run-id>/`, and the final report prints the artifact path.
+Artifacts include available run/case/device/APK, package/activity,
+deterministic/model, retry, UI-observation, and cleanup context. They are
+uniquely named per case/attempt, capped at 64 KiB, and gitignored. Screenshots
+are not retained because AppPilot cannot currently guarantee pixel-level secret
+redaction. See
+[`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md) for the
+installed/uninstalled orchestration details.
 
 ## APK
 

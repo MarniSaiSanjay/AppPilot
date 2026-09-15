@@ -4,7 +4,8 @@ One best-effort record per real suite run - suite, test_cases, host_os
 (macOS/Windows), target_platform - sent by a single HTTPS POST to the relay's
 ``/telemetry`` endpoint, which owns the Azure Storage credential (none lives in
 this CLI). Never raises, so it can never affect the suite verdict, exit code, or
-timing. Config (env/.env): APPPILOT_TELEMETRY_URL, APPPILOT_EMAIL_API_KEY.
+timing. Config (env/.env): APPPILOT_TELEMETRY_URL,
+APPPILOT_TELEMETRY_API_KEY.
 """
 
 from __future__ import annotations
@@ -13,7 +14,20 @@ import json
 import os
 import platform
 import urllib.request
-from typing import Mapping, Optional
+from typing import Callable, Mapping, Optional
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _default_transport(request: urllib.request.Request) -> None:
+    with _OPENER.open(request, timeout=10):
+        return None
 
 
 def _host_os() -> Optional[str]:
@@ -38,12 +52,13 @@ def record_suite_run(
     test_cases: int,
     target_platform: str,
     env: Optional[Mapping[str, str]] = None,
+    transport: Callable[[urllib.request.Request], None] | None = None,
 ) -> None:
     """Best-effort: POST one telemetry record. Never raises."""
     try:
         env = os.environ if env is None else env
         url = (env.get("APPPILOT_TELEMETRY_URL") or "").strip()
-        key = (env.get("APPPILOT_EMAIL_API_KEY") or "").strip()
+        key = (env.get("APPPILOT_TELEMETRY_API_KEY") or "").strip()
         host_os = _host_os()
         # Skip silently if unconfigured, non-TLS (never leak the key), or an
         # unsupported host.
@@ -63,7 +78,7 @@ def record_suite_run(
             headers={"Content-Type": "application/json", "X-API-Key": key},
             method="POST",
         )
-        urllib.request.urlopen(request, timeout=10).close()
+        (transport or _default_transport)(request)
     except (Exception, KeyboardInterrupt):
         # Best-effort: never affect the suite result. A Ctrl-C landing in the
         # telemetry POST window must not corrupt the already-computed verdict,

@@ -86,28 +86,37 @@ class DeeplinkSuiteOrchestrator:
         # reporting/email still happen. Existing per-case semantics are unchanged.
         report = SuiteReport(suite_name=self.SUITE_NAME)
         try:
-            self._runner.ensure_clean_install_state()
-        except RuntimeError as exc:
-            logtags.trace(
-                f"startup clean-install precondition failed: {exc}; "
-                "skipping all test execution",
-                logtags.SUITE,
-            )
-            for case in cases:
-                report.results.append(_startup_failed_result(case, str(exc)))
-            logtags.trace("Aborted before test execution", logtags.SUITE)
-            return report
+            try:
+                self._runner.ensure_clean_install_state()
+            except RuntimeError as exc:
+                logtags.trace(
+                    f"startup clean-install precondition failed: {exc}; "
+                    "skipping all test execution",
+                    logtags.SUITE,
+                )
+                for case in cases:
+                    report.results.append(_startup_failed_result(case, str(exc)))
+                logtags.trace("Aborted before test execution", logtags.SUITE)
+                return report
 
-        if installed:
-            self.run_installed_batch(installed, report)
-        for case in uninstalled:
-            report.results.append(self.run_uninstalled_case(case))
-        self._restore_workbook_order(report, cases)
-        # Only reached when the startup precondition held and cases executed; a
-        # setup failure is recorded above and returns early, so "Completed" is
-        # never misleading.
-        logtags.trace("Completed", logtags.SUITE)
-        return report
+            if installed:
+                self.run_installed_batch(installed, report)
+            for case in uninstalled:
+                report.results.append(self.run_uninstalled_case(case))
+            self._restore_workbook_order(report, cases)
+            # Only reached when the startup precondition held and cases executed; a
+            # setup failure is recorded above and returns early, so "Completed" is
+            # never misleading.
+            logtags.trace("Completed", logtags.SUITE)
+            return report
+        finally:
+            try:
+                self._runner.finalize_suite(report)
+            except Exception as error:
+                reason = f"suite cleanup failed unexpectedly: {error}"
+                report.cleanup_errors.append(reason)
+                for result in report.results:
+                    result.record_cleanup_failure(reason)
 
     def run_installed_batch(
         self, cases: Sequence[DeeplinkTestCase], report: SuiteReport
