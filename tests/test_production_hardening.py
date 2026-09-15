@@ -34,6 +34,7 @@ from apppilot.agent import (
     _default_max_actions,
     _default_max_stuck_actions,
 )
+from apppilot.brain import DecisionRequest, LLMModelDecisionProvider
 from apppilot.apk_trust import (
     ApkTrustConfig,
     ApkTrustConfigurationError,
@@ -46,6 +47,7 @@ from apppilot.models import (
     ActionKind,
     CredentialInputMethod,
     CredentialKind,
+    ExecutionContext,
     UIElement,
     UIObservation,
 )
@@ -55,6 +57,7 @@ from apppilot.device_lock import DeviceLockError, DeviceProcessLock
 from apppilot.init import Importance, Status, check_apk_tools, check_java
 from shared.installer import LocalApkInstaller
 from shared.login import builder as login_builder
+from shared.login.goal import LLMLoginGoalEvaluator, SemanticStateEvaluator
 from shared.model_client import (
     ChatModelClient,
     ModelConfigurationError,
@@ -652,22 +655,15 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
 
 
 class FakeJudge:
-    def __init__(self, first: bool, fresh: bool | None = None, events=None):
+    def __init__(self, first: bool, events=None):
         self.first = first
-        self.fresh = first if fresh is None else fresh
         self.events = events if events is not None else []
         self.evaluate_calls = 0
-        self.fresh_calls = 0
 
     def evaluate(self, _expected, _observation):
         self.events.append("model")
         self.evaluate_calls += 1
         return ExpectationVerdict(self.first, "first")
-
-    def evaluate_fresh(self, _expected, _observation):
-        self.events.append("fresh-model")
-        self.fresh_calls += 1
-        return ExpectationVerdict(self.fresh, "fresh")
 
 
 class FakeProbe:
@@ -766,8 +762,7 @@ class DeterministicDeeplinkTests(unittest.TestCase):
 
         self.assertTrue(result.passed)
         self.assertEqual(judge.evaluate_calls, 1)
-        self.assertEqual(judge.fresh_calls, 1)
-        observer.reobserve.assert_called_once_with()
+        observer.reobserve.assert_not_called()
 
     def test_wrong_package_cannot_be_overridden_by_model(self) -> None:
         judge = FakeJudge(True)
@@ -897,6 +892,61 @@ class DeterministicDeeplinkTests(unittest.TestCase):
         self.assertEqual(events[:2], ["deterministic", "model"])
 
 
+class ModelResponseShapeTests(unittest.TestCase):
+    @staticmethod
+    def response(content: str) -> dict:
+        return {"choices": [{"message": {"content": content}}]}
+
+    def test_decision_provider_rejects_non_object_json(self) -> None:
+        request = DecisionRequest(
+            goal="sign in",
+            guidance=None,
+            observation=UIObservation(()),
+            available_actions=(),
+            context=ExecutionContext(step=0, max_steps=1),
+        )
+        for content in ("[]", '"hello"'):
+            with self.subTest(content=content):
+                provider = LLMModelDecisionProvider(
+                    model="test-model",
+                    api_key="test-key",
+                    transport=lambda _payload, value=content: self.response(value),
+                )
+
+                decision = provider.decide(request)
+
+                self.assertIsNone(decision.action)
+                self.assertIn("JSON object", decision.reason)
+
+    def test_login_goal_evaluator_rejects_non_object_json(self) -> None:
+        for content in ("[]", '"hello"'):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as directory:
+                    evaluator = LLMLoginGoalEvaluator(
+                        model="test-model",
+                        api_key="test-key",
+                        transport=lambda _payload, value=content: self.response(value),
+                        cache_path=Path(directory) / "goal-cache.json",
+                    )
+                    observation = UIObservation(())
+
+                    self.assertFalse(evaluator.is_reached("sign in", observation))
+                    self.assertTrue(evaluator.has_actionable_step(observation))
+
+    def test_semantic_state_evaluator_rejects_non_object_json(self) -> None:
+        for content in ("[]", '"hello"'):
+            with self.subTest(content=content):
+                evaluator = SemanticStateEvaluator(
+                    model="test-model",
+                    api_key="test-key",
+                    transport=lambda _payload, value=content: self.response(value),
+                )
+
+                self.assertFalse(
+                    evaluator.matches("signed-in home", UIObservation(()))
+                )
+
+
 class ExpectationJudgeFailureTests(unittest.TestCase):
     @staticmethod
     def judge(transport) -> LLMExpectationJudge:
@@ -913,6 +963,24 @@ class ExpectationJudgeFailureTests(unittest.TestCase):
 
         with self.assertRaises(ExpectationJudgeOperationalError):
             judge.evaluate("Chat", DeterministicDeeplinkTests.chat_observation())
+
+    def test_non_object_model_response_is_operational_failure(self) -> None:
+        for content in ("[]", '"hello"'):
+            with self.subTest(content=content):
+                judge = self.judge(
+                    lambda _payload, value=content: {
+                        "choices": [{"message": {"content": value}}]
+                    }
+                )
+
+                with self.assertRaisesRegex(
+                    ExpectationJudgeOperationalError,
+                    "JSON object",
+                ):
+                    judge.evaluate(
+                        "Chat",
+                        DeterministicDeeplinkTests.chat_observation(),
+                    )
 
     def test_model_timeout_is_operational_failure(self) -> None:
         def timeout(_payload):
@@ -935,24 +1003,6 @@ class ExpectationJudgeFailureTests(unittest.TestCase):
             self.judge(failure).evaluate(
                 "Chat", DeterministicDeeplinkTests.chat_observation()
             )
-
-    def test_fresh_evaluation_bypasses_cached_verdict(self) -> None:
-        transport = Mock(
-            return_value={
-                "choices": [
-                    {"message": {"content": '{"match": true, "reason": "ok"}'}}
-                ]
-            }
-        )
-        judge = self.judge(transport)
-        observation = DeterministicDeeplinkTests.chat_observation()
-
-        judge.evaluate("Chat", observation)
-        judge.evaluate("Chat", observation)
-        judge.evaluate_fresh("Chat", observation)
-
-        self.assertEqual(transport.call_count, 2)
-
 
 class NetworkSecurityTests(unittest.TestCase):
     @patch("shared.model_client._NO_REDIRECT_OPENER.open")
@@ -1131,7 +1181,9 @@ class NetworkSecurityTests(unittest.TestCase):
                 "APPPILOT_API_KEY": "email-server-key",
                 "APPPILOT_TELEMETRY_API_KEY": "telemetry-server-key",
                 "ACS_CONNECTION_STRING": "endpoint=fake",
-                "TELEMETRY_TABLE_CONNECTION_STRING": "storage=fake",
+                "TELEMETRY_TABLE_ENDPOINT": (
+                    "https://testaccount.table.core.windows.net"
+                ),
             },
             clear=False,
         ), patch(
@@ -1951,6 +2003,67 @@ class WorkbookValidationTests(unittest.TestCase):
         self.assertTrue(cases[0].installed)
         self.assertFalse(cases[1].installed)
 
+    def test_specific_launch_url_wins_over_optional_documentation_url(
+        self,
+    ) -> None:
+        actual_link = "https://unifiedlink.svc.cloud.microsoft/actual"
+        cases = self.load(
+            [
+                [
+                    "Expected Result",
+                    "Documentation URL",
+                    "License",
+                    "Installed",
+                    "Test ID",
+                    "Launch URL",
+                ],
+                [
+                    "Chat",
+                    "https://m365.cloud.microsoft/documentation",
+                    "Test",
+                    "true",
+                    "TC1",
+                    actual_link,
+                ],
+            ]
+        )
+
+        self.assertEqual(cases[0].deep_link, actual_link)
+
+    def test_ambiguous_deeplink_headers_are_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"header row 1.*ambiguous columns.*Deep Link.*B, C",
+        ):
+            self.load(
+                [
+                    [
+                        "Test ID",
+                        "Deep Link",
+                        "Launch URL",
+                        "License",
+                        "Expected Result",
+                    ],
+                    [
+                        "TC1",
+                        self.LINK,
+                        self.LINK,
+                        "Test",
+                        "Chat",
+                    ],
+                ]
+            )
+
+    def test_tracked_workbook_still_loads_all_cases(self) -> None:
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "testcases"
+            / "deeplinks"
+            / "DeeplinkTestCases.xlsx"
+        )
+
+        self.assertEqual(len(load_deeplink_cases(path)), 48)
+
     def test_unknown_installed_value_has_row_and_column_context(self) -> None:
         with self.assertRaisesRegex(
             ValueError, r"row 2, column E.*flase|row 2, column E.*Installed"
@@ -2496,6 +2609,9 @@ class FailureArtifactTests(unittest.TestCase):
             Path(result.artifact_paths[0]).read_text(encoding="utf-8")
         )
         self.assertEqual(payload["cleanup_status"], "failed")
+        rendered = report.format()
+        self.assertNotIn("Failure artifact:", rendered)
+        self.assertNotIn(result.artifact_paths[0], rendered)
 
 
 class CleanupRestorationTests(unittest.TestCase):
@@ -2987,28 +3103,19 @@ class SupportedLinkVerificationTests(unittest.TestCase):
                 (domain, "verified") for domain in self.DOMAINS
             ),
         )
-        statuses = iter(
-            (
-                self.status(state="none", allowed=False, enabled=False),
-                self.status(state="none", allowed=False, enabled=False),
-                self.status(state="verified", allowed=False, enabled=False),
+        executor._run_adb_checked = Mock(
+            return_value=completed(
+                stdout=self.status(state="none", allowed=False, enabled=False)
             )
         )
 
-        def run(args, **_kwargs):
-            if args[2] == "get-app-links":
-                return completed(stdout=next(statuses))
-            return completed()
-
-        executor._run_adb_checked = Mock(side_effect=run)
-
         executor.restore_supported_link_state(state, timeout=30)
 
-        sleep.assert_called_once()
+        sleep.assert_not_called()
         commands = [
             call.args[0] for call in executor._run_adb_checked.call_args_list
         ]
-        self.assertTrue(
+        self.assertFalse(
             any(command[2] == "verify-app-links" for command in commands)
         )
 
@@ -3035,6 +3142,47 @@ class SupportedLinkVerificationTests(unittest.TestCase):
             AndroidOperationalError, "state changed unexpectedly"
         ):
             executor.restore_supported_link_state(state)
+
+    def test_restore_ignores_unsupported_verification_state(self) -> None:
+        executor = MaestroExecutor(PACKAGE, "device-1")
+        state = SupportedLinkState(
+            user_id="10",
+            domains=self.DOMAINS,
+            handling_allowed=False,
+            enabled_domains=(),
+            verification_states=(
+                (self.DOMAINS[0], "1024"),
+                (self.DOMAINS[1], "none"),
+            ),
+        )
+        executor._run_adb_checked = Mock(
+            side_effect=[
+                completed(),
+                completed(),
+                completed(stdout=self.status(state="verified")),
+                completed(),
+                completed(stdout=self.status(
+                    state="none",
+                    allowed=False,
+                    enabled=False,
+                )),
+            ]
+        )
+
+        executor.restore_supported_link_state(state)
+
+        commands = [
+            call.args[0] for call in executor._run_adb_checked.call_args_list
+        ]
+        self.assertTrue(
+            any(
+                command[2] == "set-app-links"
+                and command[5] == "0"
+                and self.DOMAINS[1] in command[6:]
+                and self.DOMAINS[0] not in command[6:]
+                for command in commands
+            )
+        )
 
 
 class FinalBlockerRegressionTests(unittest.TestCase):
@@ -3157,119 +3305,6 @@ class FinalBlockerRegressionTests(unittest.TestCase):
             agent._goal_evaluator.is_reached("sign in", unrelated_ui)
         )
         is_foreground.assert_called_once_with()
-
-    def test_researcher_unavailable_alternative_reaches_model(self) -> None:
-        unavailable = UIObservation(
-            (
-                UIElement(
-                    element_id="message",
-                    parent_id=None,
-                    text="Researcher is not available for this account",
-                    accessibility_text="",
-                    hint_text="",
-                    resource_id="error_message",
-                    class_name="android.view.View",
-                    clickable=False,
-                    enabled=True,
-                    is_input=False,
-                    label="Researcher is not available for this account",
-                ),
-            )
-        )
-        judge = FakeJudge(True)
-        probe = FakeProbe(
-            ForegroundComponent(PACKAGE, f"{PACKAGE}/.Main")
-        )
-        runner = DeterministicDeeplinkTests().runner(
-            Mock(observe=Mock(return_value=unavailable)),
-            judge,
-            probe,
-        )
-
-        result = runner._run_attempts(
-            DeterministicDeeplinkTests.case(
-                "Researcher screen without any prompt or Message saying "
-                "researcher is not available"
-            ),
-            "[TEST]",
-            Mock(),
-        )
-
-        self.assertTrue(result.passed)
-        self.assertEqual(judge.evaluate_calls, 1)
-
-    def test_researcher_unavailable_with_chat_composer_is_allowed(self) -> None:
-        unavailable = UIElement(
-            element_id="message",
-            parent_id=None,
-            text="Researcher is not available for this account",
-            accessibility_text="",
-            hint_text="",
-            resource_id="error_message",
-            class_name="android.view.View",
-            clickable=False,
-            enabled=True,
-            is_input=False,
-            label="Researcher is not available for this account",
-        )
-        observation = UIObservation(
-            (
-                unavailable,
-                *DeterministicDeeplinkTests.chat_observation().elements,
-            )
-        )
-        runner = DeterministicDeeplinkTests().runner(
-            Mock(),
-            FakeJudge(True),
-            FakeProbe(ForegroundComponent(PACKAGE, f"{PACKAGE}/.Main")),
-        )
-
-        verdict = runner._deterministic_verdict(
-            DeterministicDeeplinkTests.case(
-                "Researcher screen without any prompt or Message saying "
-                "researcher is not available"
-            ),
-            observation,
-        )
-
-        self.assertTrue(verdict.allowed)
-        self.assertFalse(verdict.contradiction)
-
-    def test_unknown_researcher_like_screen_still_fails_deterministically(
-        self,
-    ) -> None:
-        observation = UIObservation(
-            (
-                UIElement(
-                    element_id="message",
-                    parent_id=None,
-                    text="Research tools are loading",
-                    accessibility_text="",
-                    hint_text="",
-                    resource_id="status",
-                    class_name="android.view.View",
-                    clickable=False,
-                    enabled=True,
-                    is_input=False,
-                    label="Research tools are loading",
-                ),
-            )
-        )
-        judge = FakeJudge(True)
-        runner = DeterministicDeeplinkTests().runner(
-            Mock(observe=Mock(return_value=observation)),
-            judge,
-            FakeProbe(ForegroundComponent(PACKAGE, f"{PACKAGE}/.Main")),
-        )
-
-        result = runner._run_attempts(
-            DeterministicDeeplinkTests.case("Researcher screen"),
-            "[TEST]",
-            Mock(),
-        )
-
-        self.assertFalse(result.passed)
-        self.assertEqual(judge.evaluate_calls, 0)
 
     def test_untrusted_prompt_content_is_encoded_as_data(self) -> None:
         transport = Mock(

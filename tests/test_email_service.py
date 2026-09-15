@@ -24,11 +24,10 @@ class EmailServiceTests(unittest.TestCase):
                 "APPPILOT_API_KEY": "email-test-key",
                 "APPPILOT_EMAIL_TO": "default@example.test",
                 "APPPILOT_TELEMETRY_API_KEY": "telemetry-test-key",
-                "TELEMETRY_TABLE_CONNECTION_STRING": (
-                    "DefaultEndpointsProtocol=https;"
-                    "AccountName=testaccount;"
-                    "AccountKey=test-account-key"
+                "TELEMETRY_TABLE_ENDPOINT": (
+                    "https://testaccount.table.core.windows.net"
                 ),
+                "AZURE_CLIENT_ID": "managed-identity-client-id",
             },
             clear=False,
         )
@@ -39,18 +38,24 @@ class EmailServiceTests(unittest.TestCase):
         cls.email_factory_mock = cls.email_factory.start()
         cls.email_client = Mock()
         cls.email_factory_mock.return_value = cls.email_client
+        cls.credential_factory = patch(
+            "azure.identity.DefaultAzureCredential"
+        )
+        cls.credential_factory_mock = cls.credential_factory.start()
+        cls.credential = Mock()
+        cls.credential_factory_mock.return_value = cls.credential
         sys.modules.pop("email_service.app", None)
         cls.relay = importlib.import_module("email_service.app")
 
     @classmethod
     def tearDownClass(cls) -> None:
+        cls.credential_factory.stop()
         cls.email_factory.stop()
         cls.environment.stop()
         sys.modules.pop("email_service.app", None)
 
     def setUp(self) -> None:
         self.email_client.reset_mock()
-        self.relay._telemetry_table_ready = False
 
     def test_health_check_is_credential_free(self) -> None:
         self.assertEqual(self.relay.healthz(), {"status": "ok"})
@@ -113,7 +118,7 @@ class EmailServiceTests(unittest.TestCase):
         self.assertNotIn("provider-secret", raised.exception.detail)
         self.assertNotIn("provider-secret", "\n".join(logs.output))
 
-    @patch("email_service.app.TableClient.from_connection_string")
+    @patch("email_service.app.TableClient")
     def test_telemetry_uses_separate_key_and_exact_schema(
         self, table_factory
     ) -> None:
@@ -135,6 +140,14 @@ class EmailServiceTests(unittest.TestCase):
         )
 
         self.assertEqual(result, {"status": "recorded"})
+        self.credential_factory_mock.assert_called_once_with(
+            managed_identity_client_id="managed-identity-client-id"
+        )
+        table_factory.assert_called_once_with(
+            endpoint="https://testaccount.table.core.windows.net",
+            table_name="SuiteRuns",
+            credential=self.credential,
+        )
         entity = table.create_entity.call_args.args[0]
         self.assertEqual(
             set(entity),
@@ -158,7 +171,7 @@ class EmailServiceTests(unittest.TestCase):
                 email="person@example.test",
             )
 
-    @patch("email_service.app.TableClient.from_connection_string")
+    @patch("email_service.app.TableClient")
     def test_telemetry_provider_failure_does_not_log_credentials(
         self, table_factory
     ) -> None:

@@ -492,7 +492,7 @@ class LLMLoginGoalEvaluator:
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: str = "",
         base_url: str = "https://api.openai.com/v1",
         *,
         foreground_check: "Callable[[], bool] | None" = None,
@@ -500,12 +500,14 @@ class LLMLoginGoalEvaluator:
         timeout: float = 60.0,
         cache_path: "Path | None" = None,
         max_cache_entries: int = _DEFAULT_MAX_LOGIN_GOAL_CACHE_ENTRIES,
+        auth_mode: str = "api_key",
     ) -> None:
         self._client = ChatModelClient(
             model=model,
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
+            auth_mode=auth_mode,
         )
         self._model = model
         self._foreground_check = foreground_check
@@ -550,6 +552,7 @@ class LLMLoginGoalEvaluator:
             model=config["model"],
             api_key=config["api_key"],
             base_url=config["base_url"],
+            auth_mode=config["auth_mode"],
             foreground_check=foreground_check,
             transport=transport,
         )
@@ -611,6 +614,8 @@ class LLMLoginGoalEvaluator:
             response = self._transport(payload)
             content = response["choices"][0]["message"]["content"]
             decoded = json.loads(content)
+            if not isinstance(decoded, dict):
+                raise TypeError("model response content must be a JSON object")
         except (KeyError, IndexError, ValueError, TypeError, RuntimeError):
             # Fail safe: never falsely report login done (reached=False). Leave
             # actionable_step=True so a transient judge/transport failure does not
@@ -841,17 +846,19 @@ class SemanticStateEvaluator:
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: str = "",
         base_url: str = DEFAULT_BASE_URL,
         *,
         transport: "Callable[[dict], dict] | None" = None,
         timeout: float = 60.0,
+        auth_mode: str = "api_key",
     ) -> None:
         self._client = ChatModelClient(
             model=model,
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
+            auth_mode=auth_mode,
         )
         self._model = model
         self._transport = transport or self._http_transport
@@ -876,6 +883,7 @@ class SemanticStateEvaluator:
             model=config["model"],
             api_key=config["api_key"],
             base_url=config["base_url"],
+            auth_mode=config["auth_mode"],
             transport=transport,
         )
 
@@ -905,6 +913,8 @@ class SemanticStateEvaluator:
             response = self._transport(payload)
             content = response["choices"][0]["message"]["content"]
             decoded = json.loads(content)
+            if not isinstance(decoded, dict):
+                raise TypeError("model response content must be a JSON object")
         except (KeyError, IndexError, ValueError, TypeError, RuntimeError):
             return {"matches": False}
         matches = decoded.get("matches")

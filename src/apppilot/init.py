@@ -37,6 +37,10 @@ from . import (
 # `.agent` resolves within the top package in both import styles
 # (`apppilot.agent` and `src.apppilot.agent`).
 from .agent import _load_dotenv
+try:
+    from ..shared.entra_auth import ensure_entra_model_readiness
+except ImportError:
+    from shared.entra_auth import ensure_entra_model_readiness  # type: ignore[no-redef]
 
 try:  # `python -m src.apppilot_init` -> package is `src.apppilot`
     from ..shared.model_client import (
@@ -271,14 +275,13 @@ def _model_config_problem(config: Mapping[str, str]) -> Optional[str]:
 
     Purely syntactic and offline: it verifies the values are well-formed enough
     to be usable - never contacting the endpoint, sending a prompt, or consuming
-    tokens. ``config_from_env`` only checks that the model name and API key are
-    present (non-empty), so whitespace-only values and a malformed base URL slip
-    through as "configured". Those are configured-but-unusable, so /init must not
-    report them as ready. The API key value is inspected but never echoed.
+    tokens. ``config_from_env`` checks the selected authentication mode and
+    required values, while this function rejects whitespace-only values. Secret
+    values are inspected but never echoed.
     """
     if not config["model"].strip():
         return "APPPILOT_MODEL is blank"
-    if not config["api_key"].strip():
+    if config["auth_mode"] == "api_key" and not config["api_key"].strip():
         return "APPPILOT_MODEL_API_KEY is blank"
     try:
         validate_base_url(config["base_url"])
@@ -310,20 +313,61 @@ def check_model(env: Optional[Mapping[str, str]] = None) -> CheckResult:
         return CheckResult(
             "model", _MODEL, Importance.REQUIRED, Status.NOT_CONFIGURED,
             "Model not configured",
-            "Configure APPPILOT_MODEL and APPPILOT_MODEL_API_KEY.",
+            "Configure APPPILOT_MODEL plus either API-key or Entra authentication.",
         )
     problem = _model_config_problem(config)
     if problem is not None:
         return CheckResult(
             "model", _MODEL, Importance.REQUIRED, Status.FAIL,
             f"Model misconfigured ({problem})",
-            "Fix the model configuration: set a non-empty APPPILOT_MODEL and "
-            "APPPILOT_MODEL_API_KEY, and a valid http(s) APPPILOT_MODEL_BASE_URL "
-            "(e.g. https://api.openai.com/v1).",
+            "Fix the model configuration: set APPPILOT_MODEL, select "
+            "APPPILOT_MODEL_AUTH=api_key or entra, and use a valid http(s) "
+            "APPPILOT_MODEL_BASE_URL. API-key mode also requires "
+            "APPPILOT_MODEL_API_KEY.",
         )
     return CheckResult(
         "model", _MODEL, Importance.REQUIRED, Status.PASS,
-        f"Model configured (APPPILOT_MODEL={config['model']})",
+        "Model configured "
+        f"(APPPILOT_MODEL={config['model']}, auth={config['auth_mode']})",
+    )
+
+
+def check_entra_model_authentication(
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    interactive: bool,
+    input_fn: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+) -> Optional[CheckResult]:
+    """Verify Entra token readiness and offer Azure CLI login when appropriate."""
+    source = os.environ if env is None else env
+    try:
+        readiness = ensure_entra_model_readiness(
+            env=source,
+            interactive=interactive,
+            input_fn=input_fn,
+            output=output,
+        )
+    except ModelConfigurationError:
+        # check_model() owns configuration diagnostics in the readiness report.
+        return None
+    if not readiness.required:
+        return None
+    if readiness.ready:
+        return CheckResult(
+            "entra-auth",
+            _MODEL,
+            Importance.REQUIRED,
+            Status.PASS,
+            "Microsoft Entra model authentication ready",
+        )
+    return CheckResult(
+        "entra-auth",
+        _MODEL,
+        Importance.REQUIRED,
+        Status.FAIL,
+        "Microsoft Entra model authentication unavailable",
+        readiness.detail,
     )
 
 
@@ -988,6 +1032,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         _load_dotenv()
         core = run_all_checks()
+        entra_result = check_entra_model_authentication(
+            interactive=_is_interactive()
+        )
+        if entra_result is not None:
+            core.append(entra_result)
         device_results = setup_device(
             adb_available=_adb_available(core),
             interactive=_is_interactive(),

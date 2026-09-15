@@ -16,9 +16,19 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
 from pathlib import Path
 from typing import Sequence
+
+try:  # package-relative (python -m src.apppilot_run)
+    from .apppilot.agent import _load_dotenv
+    from .shared.entra_auth import ensure_entra_model_readiness
+    from .shared.model_client import ModelConfigurationError
+except ImportError:  # top-level (src on sys.path)
+    from apppilot.agent import _load_dotenv
+    from shared.entra_auth import ensure_entra_model_readiness
+    from shared.model_client import ModelConfigurationError
 
 _MAX_ATTEMPTS = 5  # bound the reprompt so bad input can't loop forever
 
@@ -83,14 +93,33 @@ def _load_usecase_main(name: str):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    _load_dotenv()
     parser = argparse.ArgumentParser(add_help=False)  # rest belongs to the use case
     parser.add_argument("--usecase", default=None)
     namespace, passthrough = parser.parse_known_args(argv)
+    interactive = getattr(sys.stdin, "isatty", lambda: False)()
+    if "--help" not in passthrough and "-h" not in passthrough:
+        try:
+            entra_readiness = ensure_entra_model_readiness(
+                env=os.environ,
+                interactive=interactive,
+                output=lambda message: print(message, file=sys.stderr),
+            )
+        except ModelConfigurationError as error:
+            print(f"ERROR: invalid model configuration: {error}", file=sys.stderr)
+            return 2
+        if entra_readiness.required and not entra_readiness.ready:
+            print(
+                f"ERROR: Microsoft Entra model authentication unavailable. "
+                f"{entra_readiness.detail}",
+                file=sys.stderr,
+            )
+            return 2
 
     usecase = _select_usecase(
         namespace.usecase,
         directory=_usecases_dir(),
-        interactive=getattr(sys.stdin, "isatty", lambda: False)(),
+        interactive=interactive,
         output=lambda message: print(message, file=sys.stderr),
     )
     if usecase is None:

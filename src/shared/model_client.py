@@ -11,6 +11,7 @@ parsed response.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import time
@@ -19,11 +20,20 @@ import urllib.request
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from ipaddress import ip_address
-from typing import Mapping
+from typing import Callable, Mapping
 from urllib.parse import urlparse
+
+from azure.core.exceptions import AzureError
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
+AZURE_OPENAI_SCOPE = "https://ai.azure.com/.default"
+AUTH_API_KEY = "api_key"
+AUTH_ENTRA = "entra"
+_AZURE_IDENTITY_CHAIN_LOGGER = logging.getLogger(
+    "azure.identity._credentials.chained"
+)
 _MAX_SEND_ATTEMPTS = 3
 _BASE_RETRY_WAIT_SECONDS = 2.0
 _MAX_RETRY_WAIT_SECONDS = 30.0
@@ -48,6 +58,44 @@ class ModelTransportError(RuntimeError):
 
 class ModelConfigurationError(ValueError):
     """Model endpoint configuration is unsafe or malformed."""
+
+
+def verify_entra_model_authentication() -> None:
+    """Acquire an Azure AI token without sending a model request."""
+    # A signed-out Azure CLI is an expected interactive state. Azure Identity
+    # logs every unavailable credential in its chain at warning level, while
+    # AppPilot presents a concise sign-in prompt below.
+    logger_was_disabled = _AZURE_IDENTITY_CHAIN_LOGGER.disabled
+    _AZURE_IDENTITY_CHAIN_LOGGER.disabled = True
+    try:
+        try:
+            token = DefaultAzureCredential().get_token(AZURE_OPENAI_SCOPE)
+        except AzureError as error:
+            raise ModelTransportError(
+                "Microsoft Entra model authentication failed"
+            ) from error
+    finally:
+        _AZURE_IDENTITY_CHAIN_LOGGER.disabled = logger_was_disabled
+    if not token.token.strip():
+        raise ModelTransportError("model authentication returned an empty token")
+
+
+def validate_entra_base_url(base_url: str) -> str:
+    """Require the Azure OpenAI v1 endpoint before sending an Entra token."""
+    value = validate_base_url(base_url)
+    parsed = urlparse(value)
+    hostname = parsed.hostname.casefold() if parsed.hostname else ""
+    if not hostname.endswith(".openai.azure.com"):
+        raise ModelConfigurationError(
+            "APPPILOT_MODEL_BASE_URL must use an Azure OpenAI "
+            "*.openai.azure.com endpoint when APPPILOT_MODEL_AUTH=entra"
+        )
+    if parsed.path.rstrip("/") != "/openai/v1":
+        raise ModelConfigurationError(
+            "APPPILOT_MODEL_BASE_URL must end with /openai/v1 when "
+            "APPPILOT_MODEL_AUTH=entra"
+        )
+    return value
 
 
 def validate_base_url(base_url: str) -> str:
@@ -95,17 +143,43 @@ class ChatModelClient:
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: str = "",
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 60.0,
+        auth_mode: str = AUTH_API_KEY,
+        token_provider: "Callable[[], str] | None" = None,
     ) -> None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ModelConfigurationError(
                 "model timeout must be a finite positive number"
             )
+        normalized_auth_mode = self._normalize_auth_mode(auth_mode)
+        if normalized_auth_mode == AUTH_API_KEY:
+            if not api_key.strip():
+                raise ModelConfigurationError(
+                    "APPPILOT_MODEL_API_KEY is required for api_key authentication"
+                )
+            if token_provider is not None:
+                raise ModelConfigurationError(
+                    "token_provider is only valid for entra authentication"
+                )
+            self._token_provider = None
+        else:
+            if api_key.strip():
+                raise ModelConfigurationError(
+                    "APPPILOT_MODEL_API_KEY must be blank for entra authentication"
+                )
+            self._token_provider = token_provider or get_bearer_token_provider(
+                DefaultAzureCredential(), AZURE_OPENAI_SCOPE
+            )
         self._model = model
         self._api_key = api_key
-        self._base_url = validate_base_url(base_url)
+        self._auth_mode = normalized_auth_mode
+        self._base_url = (
+            validate_entra_base_url(base_url)
+            if normalized_auth_mode == AUTH_ENTRA
+            else validate_base_url(base_url)
+        )
         self._timeout = timeout
 
     @property
@@ -113,22 +187,60 @@ class ChatModelClient:
         return self._model
 
     @staticmethod
-    def config_from_env(env: "Mapping[str, str] | None" = None) -> "dict | None":
-        """Resolve ``{model, api_key, base_url}`` from the environment, or None.
+    def _normalize_auth_mode(auth_mode: str) -> str:
+        normalized = (auth_mode or AUTH_API_KEY).strip().lower().replace("-", "_")
+        if normalized not in {AUTH_API_KEY, AUTH_ENTRA}:
+            raise ModelConfigurationError(
+                "APPPILOT_MODEL_AUTH must be 'api_key' or 'entra'"
+            )
+        return normalized
 
-        Reads ``APPPILOT_MODEL_API_KEY`` (required), ``APPPILOT_MODEL``
-        (required), and ``APPPILOT_MODEL_BASE_URL`` (optional). Nothing is
-        hardcoded; returns None when a required value is absent so callers can
-        degrade to an honest unconfigured placeholder."""
+    @staticmethod
+    def config_from_env(env: "Mapping[str, str] | None" = None) -> "dict | None":
+        """Resolve model endpoint and authentication configuration, or None.
+
+        ``APPPILOT_MODEL_AUTH`` selects ``api_key`` (the backward-compatible
+        default) or ``entra``. Entra mode uses ``DefaultAzureCredential`` and
+        therefore requires no model API key. Returns None when the model name or
+        the selected mode's required configuration is absent."""
         env = os.environ if env is None else env
-        api_key = env.get("APPPILOT_MODEL_API_KEY")
-        model = env.get("APPPILOT_MODEL")
-        if not api_key or not model:
-            return None
-        base_url = validate_base_url(
-            env.get("APPPILOT_MODEL_BASE_URL") or DEFAULT_BASE_URL
+        auth_mode = ChatModelClient._normalize_auth_mode(
+            env.get("APPPILOT_MODEL_AUTH") or AUTH_API_KEY
         )
-        return {"model": model, "api_key": api_key, "base_url": base_url}
+        api_key = env.get("APPPILOT_MODEL_API_KEY") or ""
+        model = env.get("APPPILOT_MODEL")
+        if not model or (auth_mode == AUTH_API_KEY and not api_key):
+            return None
+        if auth_mode == AUTH_ENTRA and api_key.strip():
+            raise ModelConfigurationError(
+                "APPPILOT_MODEL_API_KEY must be blank when "
+                "APPPILOT_MODEL_AUTH=entra"
+            )
+        base_url_source = env.get("APPPILOT_MODEL_BASE_URL") or DEFAULT_BASE_URL
+        base_url = (
+            validate_entra_base_url(base_url_source)
+            if auth_mode == AUTH_ENTRA
+            else validate_base_url(base_url_source)
+        )
+        return {
+            "model": model,
+            "api_key": api_key,
+            "base_url": base_url,
+            "auth_mode": auth_mode,
+        }
+
+    def _refresh_authentication(self) -> None:
+        if self._auth_mode != AUTH_ENTRA:
+            return
+        try:
+            token = self._token_provider()
+        except AzureError as error:
+            raise ModelTransportError(
+                "Microsoft Entra model authentication failed"
+            ) from error
+        if not token or not token.strip():
+            raise ModelTransportError("model authentication returned an empty token")
+        self._api_key = token
 
     def send(self, payload: dict) -> dict:
         """POST a chat-completions payload and return the parsed JSON response.
@@ -136,8 +248,9 @@ class ChatModelClient:
         Retries this safe, read-only request after transient transport, service,
         or throttling failures. Retry-After is honored with a bounded
         exponential floor. Non-retryable HTTP and response-decoding failures are
-        surfaced immediately. The API key is sent only in the Authorization
-        header and is never logged."""
+        surfaced immediately. The selected credential is sent only in the
+        Authorization header and is never logged."""
+        self._refresh_authentication()
         data = json.dumps(payload).encode("utf-8")
         http_request = urllib.request.Request(
             f"{self._base_url}/chat/completions",

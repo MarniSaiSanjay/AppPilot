@@ -9,6 +9,7 @@ ordered terminal states.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from typing import Callable
@@ -38,6 +39,8 @@ try:  # package-relative (python -m src.shared.login.builder) vs top-level
     from ...apppilot.models import RuntimeContext
     from ...apppilot.safety import SafetyValidator
     from ...apppilot import device_config, logtags
+    from ..entra_auth import ensure_entra_model_readiness
+    from ..model_client import ModelConfigurationError
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.agent import (
         AppPilotAgent,
@@ -63,6 +66,8 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.models import RuntimeContext
     from apppilot.safety import SafetyValidator
     from apppilot import device_config, logtags
+    from shared.entra_auth import ensure_entra_model_readiness
+    from shared.model_client import ModelConfigurationError
 
 from .goal import (
     AuthoritativeLoginGoalEvaluator,
@@ -91,8 +96,9 @@ def resolve_decision_provider(
     provider = LLMModelDecisionProvider.from_env()
     if provider is None:
         provider = UnconfiguredModelDecisionProvider(
-            "Set APPPILOT_MODEL and APPPILOT_MODEL_API_KEY (and optionally "
-            "APPPILOT_MODEL_BASE_URL) to connect a real decision model."
+            "Set APPPILOT_MODEL and configure APPPILOT_MODEL_AUTH as api_key "
+            "or entra (plus APPPILOT_MODEL_API_KEY for api_key mode) to connect "
+            "a real decision model."
         )
     return provider
 
@@ -244,6 +250,23 @@ def main() -> int:
         args = _parse_args()
     except ValueError as error:
         print(f"ERROR: invalid configuration: {error}", file=sys.stderr)
+        return 2
+    interactive = getattr(sys.stdin, "isatty", lambda: False)()
+    try:
+        entra_readiness = ensure_entra_model_readiness(
+            env=os.environ,
+            interactive=interactive,
+            output=lambda message: print(message, file=sys.stderr),
+        )
+    except ModelConfigurationError as error:
+        print(f"ERROR: invalid model configuration: {error}", file=sys.stderr)
+        return 2
+    if entra_readiness.required and not entra_readiness.ready:
+        print(
+            f"ERROR: Microsoft Entra model authentication unavailable. "
+            f"{entra_readiness.detail}",
+            file=sys.stderr,
+        )
         return 2
     if args.max_actions < 1:
         print("ERROR: --max-actions must be at least 1", file=sys.stderr)

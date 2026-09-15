@@ -52,6 +52,7 @@ try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
         build_login_agent,
         resolve_decision_provider,
     )
+    from ...shared.entra_auth import ensure_entra_model_readiness
     from ...shared.model_client import ModelConfigurationError
 except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
     from apppilot.android import (
@@ -85,6 +86,7 @@ except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
         build_login_agent,
         resolve_decision_provider,
     )
+    from shared.entra_auth import ensure_entra_model_readiness
     from shared.model_client import ModelConfigurationError
 
 from .artifacts import FailureArtifactWriter
@@ -258,6 +260,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     interactive = getattr(sys.stdin, "isatty", lambda: False)()
+    try:
+        entra_readiness = ensure_entra_model_readiness(
+            env=os.environ,
+            interactive=interactive,
+            output=lambda message: print(message, file=sys.stderr),
+        )
+    except ModelConfigurationError as error:
+        print(f"ERROR: invalid model configuration: {error}", file=sys.stderr)
+        return 2
+    if entra_readiness.required and not entra_readiness.ready:
+        print(
+            f"ERROR: Microsoft Entra model authentication unavailable. "
+            f"{entra_readiness.detail}",
+            file=sys.stderr,
+        )
+        return 2
+
     # Test-suite selection (runtime CLI concern; never persisted, never in /init).
     # --excel is an explicit override that skips discovery/prompting; otherwise
     # discover the Deeplink workbooks and select (auto when only one).
@@ -315,7 +334,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if judge is None:
         print(
             "ERROR: no evaluation model configured. Set APPPILOT_MODEL and "
-            "APPPILOT_MODEL_API_KEY (and optionally APPPILOT_MODEL_BASE_URL).",
+            "configure APPPILOT_MODEL_AUTH as api_key or entra "
+            "(plus APPPILOT_MODEL_API_KEY for api_key mode).",
             file=sys.stderr,
         )
         return 2
@@ -352,7 +372,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Build one cached shared-login flow per resolved License profile. All flows
     # reuse the same device dependencies and decision provider; only their local,
     # secret RuntimeContext differs.
-    login_provider = resolve_decision_provider()
+    try:
+        login_provider = resolve_decision_provider()
+    except ModelConfigurationError as error:
+        print(f"ERROR: invalid model configuration: {error}", file=sys.stderr)
+        return 2
 
     def recover_login_loading() -> None:
         executor.stop_app()

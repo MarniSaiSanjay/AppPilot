@@ -213,8 +213,9 @@ environment variables always take precedence).
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `APPPILOT_MODEL` | yes* | Decision-model deployment/name (e.g. `gpt-4.1-mini`). |
-| `APPPILOT_MODEL_API_KEY` | yes* | API key for the model endpoint. |
-| `APPPILOT_MODEL_BASE_URL` | no | OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint). Remote endpoints must use HTTPS; HTTP is allowed only for loopback development endpoints. |
+| `APPPILOT_MODEL_AUTH` | no | Model authentication mode: `api_key` (default) or `entra`. |
+| `APPPILOT_MODEL_API_KEY` | for API-key auth | API key for the model endpoint. Must be blank for Entra authentication. |
+| `APPPILOT_MODEL_BASE_URL` | no for API-key auth; yes for Entra auth | OpenAI-compatible base URL. Entra mode requires an `https://<resource>.openai.azure.com/openai/v1` Azure OpenAI endpoint, so an Entra token can never be sent to another host. API-key mode defaults to the OpenAI v1 endpoint; remote endpoints must use HTTPS and HTTP is allowed only for loopback development endpoints. |
 | `APPPILOT_EXPECTED_PACKAGE_ID` | yes for APK runs | Android application/package ID expected in the local and installed APK. |
 | `APPPILOT_TRUSTED_CERT_SHA256` | yes for APK runs | Trusted signing-certificate SHA-256 fingerprint. Colons are optional; the value must contain exactly 64 hexadecimal characters. |
 | `APPPILOT_USERNAME` | for standalone login | Default sign-in username/email for the standalone login prototype and legacy non-profile callers. |
@@ -247,6 +248,7 @@ Example `.env`:
 
 ```dotenv
 APPPILOT_MODEL=gpt-4.1-mini
+APPPILOT_MODEL_AUTH=api_key
 APPPILOT_MODEL_API_KEY=your-key-here
 APPPILOT_MODEL_BASE_URL=https://your-endpoint.openai.azure.com/openai/v1
 APPPILOT_EXPECTED_PACKAGE_ID=com.example.apppilot
@@ -258,6 +260,35 @@ APPPILOT_PASSWORD_PREMIUM=your-premium-password
 APPPILOT_USERNAME_ENTRA_STARTER=starter-user@example.com
 APPPILOT_PASSWORD_ENTRA_STARTER=your-starter-password
 ```
+
+For keyless Azure OpenAI access, sign in with Azure CLI and use:
+
+```dotenv
+APPPILOT_MODEL=gpt-4.1-mini
+APPPILOT_MODEL_AUTH=entra
+APPPILOT_MODEL_API_KEY=
+APPPILOT_MODEL_BASE_URL=https://your-endpoint.openai.azure.com/openai/v1
+# Optional: prevents Azure CLI from showing the subscription selector during
+# AppPilot's interactive sign-in. It does not select or change a subscription.
+APPPILOT_ENTRA_TENANT_ID=your-work-tenant-id
+```
+
+Entra mode uses `DefaultAzureCredential` and requests the
+`https://ai.azure.com/.default` scope. The signed-in identity must have the
+`Cognitive Services OpenAI User` role on the Azure OpenAI resource.
+
+When Entra mode is selected, `/init` and `./run` first check whether an Azure
+AI token can be acquired. In an interactive terminal, a missing or expired
+credential offers to run `az login`; Azure CLI then completes its normal
+browser or device-code sign-in flow. AppPilot never collects Azure passwords,
+never changes the active Azure subscription, and does not launch a login in a
+non-interactive terminal. A successful token check still requires the signed-in
+identity to have the role above.
+
+When `APPPILOT_ENTRA_TENANT_ID` is set, AppPilot limits Azure CLI sign-in to
+that tenant, temporarily disables Azure CLI's subscription selector for that
+one command, and suppresses its subscription-list output. Model inference does
+not need a selected Azure subscription.
 
 Deeplink suites resolve every workbook `License` before touching the APK or
 device. License values are trimmed, compared case-insensitively, and converted

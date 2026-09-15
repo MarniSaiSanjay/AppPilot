@@ -12,8 +12,8 @@ Security model:
   * The caller can NEVER choose the From address - it is fixed server-side via
     environment configuration. The recipient may be supplied per request (and is
     validated); when omitted the configured default recipient is used.
-  * Privileged ACS and Storage credentials live only on the server (Container App
-    secrets), never in the distributed AppPilot CLI.
+  * The privileged ACS credential lives only on the server. Table Storage uses
+    the Container App's managed identity, so no Storage key is stored anywhere.
   * Email and telemetry callers authenticate with separate scoped API keys
     (constant-time compared).
   * Secrets are never logged and never returned in responses.
@@ -29,8 +29,8 @@ import secrets
 import uuid
 
 from azure.communication.email import EmailClient
-from azure.core.exceptions import ResourceExistsError
 from azure.data.tables import TableClient
+from azure.identity import DefaultAzureCredential
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -74,13 +74,16 @@ _TELEMETRY_API_KEY = os.environ.get(
 _validate_api_key_separation(_API_KEY, _TELEMETRY_API_KEY)
 _client = EmailClient.from_connection_string(_required("ACS_CONNECTION_STRING"))
 
-# Telemetry storage is optional/isolated: a missing connection string must never
-# break email. When unset, /telemetry returns 500 while /send-report keeps working.
-_TELEMETRY_CONN = os.environ.get("TELEMETRY_TABLE_CONNECTION_STRING", "").strip()
+# Telemetry storage is optional/isolated: a missing endpoint must never break
+# email. The credential acquires no token until a telemetry request is made.
+_TELEMETRY_ENDPOINT = os.environ.get("TELEMETRY_TABLE_ENDPOINT", "").strip()
+_TELEMETRY_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "").strip() or None
+_TELEMETRY_CREDENTIAL = (
+    DefaultAzureCredential(managed_identity_client_id=_TELEMETRY_CLIENT_ID)
+    if _TELEMETRY_ENDPOINT
+    else None
+)
 _TELEMETRY_TABLE = "SuiteRuns"
-# Set once the SuiteRuns table is known to exist (created here or already
-# present), so the create-table check runs at most once per process.
-_telemetry_table_ready = False
 _HOST_OS_VALUES = {"macOS", "Windows"}
 _TARGET_PLATFORM_VALUES = {"Android", "iOS"}
 
@@ -155,28 +158,6 @@ class TelemetryIn(BaseModel):
     target_platform: str
 
 
-def _ensure_telemetry_table(table: TableClient) -> None:
-    """Ensure the SuiteRuns table exists before the first write.
-
-    ``create_entity`` does not auto-create the table, so on a fresh deployment
-    (storage account present but the table not yet created) the first insert
-    would fail. Creating it here - idempotently - makes the telemetry backend
-    self-provisioning. An already-existing table (ResourceExistsError) is
-    treated as success and never recreated or deleted. Runs at most once per
-    process; a transient failure leaves the flag unset so a later request
-    retries. This stays within the telemetry try/except, so a storage problem
-    only affects best-effort telemetry - never /healthz or /send-report.
-    """
-    global _telemetry_table_ready
-    if _telemetry_table_ready:
-        return
-    try:
-        table.create_table()
-    except ResourceExistsError:
-        pass
-    _telemetry_table_ready = True
-
-
 @app.post("/telemetry")
 def telemetry(payload: TelemetryIn, x_api_key: str = Header(default="")) -> dict:
     if not _TELEMETRY_API_KEY:
@@ -193,7 +174,7 @@ def telemetry(payload: TelemetryIn, x_api_key: str = Header(default="")) -> dict
         or payload.target_platform not in _TARGET_PLATFORM_VALUES
     ):
         raise HTTPException(status_code=422, detail="invalid host_os/target_platform")
-    if not _TELEMETRY_CONN:
+    if not _TELEMETRY_ENDPOINT or _TELEMETRY_CREDENTIAL is None:
         raise HTTPException(status_code=500, detail="telemetry storage not configured")
 
     # PartitionKey/RowKey are Azure Table mechanics, not telemetry data: partition
@@ -208,10 +189,11 @@ def telemetry(payload: TelemetryIn, x_api_key: str = Header(default="")) -> dict
         "target_platform": payload.target_platform,
     }
     try:
-        with TableClient.from_connection_string(
-            _TELEMETRY_CONN, table_name=_TELEMETRY_TABLE
+        with TableClient(
+            endpoint=_TELEMETRY_ENDPOINT,
+            table_name=_TELEMETRY_TABLE,
+            credential=_TELEMETRY_CREDENTIAL,
         ) as table:
-            _ensure_telemetry_table(table)
             table.create_entity(entity)
     except Exception:  # never leak storage/credential details
         _log.error("telemetry insert failed")

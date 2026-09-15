@@ -53,7 +53,9 @@ Android implementation, and `account/safety.py` the scoped action policy.
 The single OpenAI-compatible chat client. It owns endpoint configuration
 (environment resolution via `config_from_env`) and the HTTP transport
 (`send`: Bearer-auth POST + JSON parse, raising `ModelTransportError` on
-failure). It knows nothing about prompts or any use case — callers build the
+failure). It supports API keys and Microsoft Entra tokens from
+`DefaultAzureCredential`, with token caching and refresh delegated to Azure
+Identity. It knows nothing about prompts or any use case — callers build the
 payload and interpret the response. This consolidates the model transport that
 the model decision provider, the deeplink expectation judge, and the login goal
 evaluator previously duplicated.

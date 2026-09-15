@@ -71,9 +71,10 @@ class UnconfiguredModelDecisionProvider:
 class LLMModelDecisionProvider:
     """Model-backed decision provider using an OpenAI-compatible chat API.
 
-    Endpoint, model, and key come from the environment (nothing hardcoded):
-    - ``APPPILOT_MODEL_API_KEY``  (required)
+    Endpoint, model, and authentication come from the environment:
     - ``APPPILOT_MODEL``          (required, e.g. "gpt-4o-mini")
+    - ``APPPILOT_MODEL_AUTH``     (optional: ``api_key`` or ``entra``)
+    - ``APPPILOT_MODEL_API_KEY``  (required only for ``api_key``)
     - ``APPPILOT_MODEL_BASE_URL`` (optional, defaults to the OpenAI v1 endpoint)
 
     The model selects only from the safe actions in the request, so it can never
@@ -161,14 +162,19 @@ class LLMModelDecisionProvider:
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: str = "",
         base_url: str = "https://api.openai.com/v1",
         transport: Callable[[dict], dict] | None = None,
         timeout: float = 60.0,
+        auth_mode: str = "api_key",
     ) -> None:
         self._model = model
         self._client = ChatModelClient(
-            model=model, api_key=api_key, base_url=base_url, timeout=timeout
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            auth_mode=auth_mode,
         )
         self._transport = transport or self._http_transport
 
@@ -196,6 +202,8 @@ class LLMModelDecisionProvider:
             response = self._transport(payload)
             content = response["choices"][0]["message"]["content"]
             decoded = json.loads(content)
+            if not isinstance(decoded, dict):
+                raise TypeError("model response content must be a JSON object")
         except (KeyError, IndexError, ValueError, TypeError, RuntimeError) as error:
             return ModelDecision(
                 action=None, reason=f"Model response could not be parsed: {error}"

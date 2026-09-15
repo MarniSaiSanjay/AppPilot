@@ -46,8 +46,8 @@ class LLMExpectationJudge:
     """Model-backed semantic judge: does the observed UI satisfy Expected Result?
 
     Uses the same OpenAI-compatible configuration as the agent's decision model
-    (``APPPILOT_MODEL``, ``APPPILOT_MODEL_API_KEY``, ``APPPILOT_MODEL_BASE_URL``)
-    so no provider/model/credential is hardcoded. It is given ONLY the natural
+    (model, endpoint, and API-key or Entra authentication) so no
+    provider/model/credential is hardcoded. It is given ONLY the natural
     language Expected Result and the redacted observed UI; it decides match or
     mismatch. It never selects or alters a deeplink.
     """
@@ -107,10 +107,11 @@ class LLMExpectationJudge:
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: str = "",
         base_url: str = "https://api.openai.com/v1",
         transport: Callable[[dict], dict] | None = None,
         timeout: float = 60.0,
+        auth_mode: str = "api_key",
     ) -> None:
         self._model = model
         self._client = ChatModelClient(
@@ -118,6 +119,7 @@ class LLMExpectationJudge:
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
+            auth_mode=auth_mode,
         )
         self._transport = transport or self._http_transport
         self._cache_key: tuple | None = None
@@ -156,6 +158,8 @@ class LLMExpectationJudge:
         try:
             content = response["choices"][0]["message"]["content"]
             decoded = json.loads(content)
+            if not isinstance(decoded, dict):
+                raise TypeError("model response content must be a JSON object")
         except (KeyError, IndexError, ValueError, TypeError) as error:
             raise ExpectationJudgeOperationalError(
                 f"Judge response could not be parsed: {error}"
