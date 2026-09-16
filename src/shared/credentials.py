@@ -7,7 +7,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ..apppilot.models import CredentialKind, RuntimeContext
 except ImportError:
     from apppilot.models import CredentialKind, RuntimeContext

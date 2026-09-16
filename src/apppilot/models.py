@@ -67,11 +67,7 @@ class UIElement:
 
     @property
     def own_text(self) -> str:
-        """Text belonging to THIS node (not merged from a descendant).
-
-        Matching a clickable node by a label that actually lives on a child can
-        tap the child (often zero/opaque bounds in Compose) instead. Only this
-        node's own text is safe to drive a text selector."""
+        """Text belonging to this node."""
         return self.text or self.accessibility_text or self.hint_text
 
     @property
@@ -134,8 +130,6 @@ class Action:
     kind: ActionKind
     target_id: str | None = None
     input_text: str | None = None
-    # For credential inputs the model only requests the *kind*; AppPilot resolves
-    # the secret value locally, so ``input_text`` stays ``None`` for these.
     credential_kind: CredentialKind | None = None
 
     def describe(self, observation: UIObservation) -> str:
@@ -144,8 +138,6 @@ class Action:
         target = observation.find(self.target_id)
         if self.kind == ActionKind.INPUT_TEXT:
             if self.credential_kind is not None:
-                # Never include the field's live value; use only a stable, safe
-                # descriptor (resource id or hint), or the element id.
                 if target is not None:
                     descriptor = target.resource_id or target.hint_text or self.target_id
                 else:
@@ -169,12 +161,7 @@ class ExecutionContext:
 
 
 class RuntimeContext:
-    """Secure, non-UI runtime test data such as credentials.
-
-    Never part of :class:`DecisionRequest`: never in prompts, observations, model
-    responses, or logs. The agent resolves a credential locally and passes it
-    straight to Maestro. ``repr`` deliberately hides values.
-    """
+    """Secure, non-UI runtime test data such as credentials."""
 
     def __init__(self, credentials: dict[CredentialKind, str]) -> None:
         self._credentials = {kind: value for kind, value in credentials.items() if value}

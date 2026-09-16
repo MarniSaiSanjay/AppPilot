@@ -20,12 +20,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class AdaptiveDecisionCache:
-    """Learn model decisions from successful runs and replay exact matches.
-
-    Subclasses may add permanent domain-specific decisions through
-    ``_seeded_decision``. The reusable core owns hashing, success-gated
-    persistence, unique-action replay, and stale fast-path invalidation.
-    """
+    """Learn model decisions from successful runs and replay exact matches."""
 
     def __init__(
         self,

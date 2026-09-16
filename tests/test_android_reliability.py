@@ -2092,18 +2092,26 @@ class LoginCompletionTests(unittest.TestCase):
 
 
 class InstalledGroupOrderingTests(unittest.TestCase):
-    def test_login_runs_again_after_account_preparation_and_warm_up(self) -> None:
-        case = DeeplinkTestCase(
+    @staticmethod
+    def case() -> DeeplinkTestCase:
+        return DeeplinkTestCase(
             test_id="TC001",
             deep_link="https://example.test",
             user_type="Consumer",
             expected_result="Chat",
         )
-        group = LicenseCaseGroup(
+
+    @staticmethod
+    def group(case: DeeplinkTestCase) -> LicenseCaseGroup:
+        return LicenseCaseGroup(
             profile_key="consumer",
             license_name="Consumer",
             cases=(case,),
         )
+
+    def test_login_runs_again_after_account_preparation_and_warm_up(self) -> None:
+        case = self.case()
+        group = self.group(case)
         runner = Mock()
         runner.ensure_logged_in.side_effect = [True, True]
         runner.prepare_account.return_value = Mock(succeeded=True)
@@ -2119,6 +2127,38 @@ class InstalledGroupOrderingTests(unittest.TestCase):
         self.assertEqual(
             [call[0] for call in runner.method_calls],
             [
+                "open_installed_app",
+                "ensure_logged_in",
+                "prepare_supported_links",
+                "prepare_account",
+                "run_warm_up",
+                "open_installed_app",
+                "ensure_logged_in",
+                "run_installed_case",
+            ],
+        )
+
+    def test_installed_group_login_failure_relaunches_and_retries_once(self) -> None:
+        case = self.case()
+        group = self.group(case)
+        runner = Mock()
+        runner.ensure_logged_in.side_effect = [False, True, True]
+        runner.prepare_account.return_value = Mock(succeeded=True)
+        runner.run_installed_case.return_value = Mock(case=case)
+        report = SuiteReport(suite_name="Deeplink")
+
+        DeeplinkSuiteOrchestrator(runner)._run_installed_group(
+            group,
+            report,
+            prepare_supported_links=True,
+        )
+
+        self.assertEqual(report.results, [runner.run_installed_case.return_value])
+        self.assertEqual(
+            [call[0] for call in runner.method_calls],
+            [
+                "open_installed_app",
+                "ensure_logged_in",
                 "open_installed_app",
                 "ensure_logged_in",
                 "prepare_supported_links",

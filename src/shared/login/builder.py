@@ -1,10 +1,4 @@
-"""Shared login agent builder and CLI entry point.
-
-Assembles the generic AppPilotAgent for login/onboarding from a LoginPolicy.
-Recurring, unambiguous login controls use the adaptive fast path; every unknown
-or ambiguous screen remains model-driven. The policy supplies goal/guidance and
-ordered terminal states.
-"""
+"""Shared login agent builder and CLI entry point."""
 
 from __future__ import annotations
 
@@ -14,7 +8,7 @@ import subprocess
 import sys
 from typing import Callable
 
-try:  # package-relative (python -m src.shared.login.builder) vs top-level
+try:
     from ...apppilot.agent import (
         AppPilotAgent,
         DEFAULT_MAX_ACTIONS,
@@ -41,7 +35,7 @@ try:  # package-relative (python -m src.shared.login.builder) vs top-level
     from ...apppilot import device_config, logtags
     from ..entra_auth import ensure_entra_model_readiness
     from ..model_client import ModelConfigurationError
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from apppilot.agent import (
         AppPilotAgent,
         DEFAULT_MAX_ACTIONS,
@@ -88,9 +82,7 @@ from .policy import (
 def resolve_decision_provider(
     provider: ModelDecisionProvider | None = None,
 ) -> ModelDecisionProvider:
-    """Return the given provider, else the env-configured LLM provider, else the
-    honest Unconfigured placeholder. Centralized so the CLI and other flows
-    (e.g. the deeplink runner) share one provider-resolution policy."""
+    """Resolve the login decision provider."""
     if provider is not None:
         return provider
     provider = LLMModelDecisionProvider.from_env()
@@ -115,16 +107,7 @@ def build_login_agent(
     policy: "LoginPolicy | None" = None,
     runtime_context: "RuntimeContext | None" = None,
 ) -> AppPilotAgent:
-    """Build the single, shared login/onboarding agent (AppPilotAgent + Brain).
-
-    The adaptive provider reuses only safe, uniquely matched login actions; the
-    model decides every cache miss and ambiguous screen. The policy (default
-    ``LoginPolicy.default()``) supplies the ordered terminal states. The built-in
-    login-completion terminal - deterministic terminal/blocker evidence first,
-    semantic evaluator only for ambiguous screens - is the sensible default and,
-    unless the policy opts out, the lowest-priority fallback for custom flows.
-    The shared node never encodes use-case-specific meaning; the policy does.
-    """
+    """Build the shared login/onboarding agent."""
     if device is None and (observer is None or executor is None):
         device = device_config.resolve_device(None)
         if device is None:
@@ -161,8 +144,6 @@ def build_login_agent(
         semantic=semantic_evaluator,
     )
 
-    # Use-case semantic terminals author natural language only; the shared node
-    # binds the model plumbing (a semantic judge) when they didn't bring one.
     shared_semantic = SemanticStateEvaluator.from_env()
     terminals = []
     for terminal in policy.terminals:
@@ -172,18 +153,10 @@ def build_login_agent(
     if policy.stop_at_login_completion:
         terminals.append(login_completion_terminal)
 
-    # The default login (only the built-in login-completion terminal) uses that
-    # evaluator DIRECTLY, so today's agent - object identity, verdicts and
-    # actionable-step behavior - is preserved byte-for-byte. Any use case that
-    # adds its own terminals gets the ordered composite instead.
     if terminals == [login_completion_terminal]:
         goal_evaluator = login_completion_terminal
     else:
         goal_evaluator = CompositeTerminalEvaluator(terminals)
-    # Let the login evaluator classify whether the screen presents a genuine
-    # login/onboarding step, so the agent waits/re-observes on transient loading
-    # screens (e.g. "looking for accounts" with only a "Terms of use" link)
-    # instead of asking the Brain, which would pick a diagnostic Back.
     actionable_step_check = getattr(goal_evaluator, "has_actionable_step", None)
     return AppPilotAgent(
         observer=observer,
@@ -241,9 +214,6 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    # Load the local, git-ignored .env first so values such as the model
-    # credentials and APPPILOT_MAX_ACTIONS are available before args are parsed.
-    # Real environment variables always take precedence.
     _load_dotenv()
 
     try:

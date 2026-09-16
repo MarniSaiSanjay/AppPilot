@@ -1,10 +1,10 @@
-@description('Required immutable relay image reference, including its sha256 digest.')
+@description('Relay image reference.')
 param image string
 
-@description('Azure-managed sender address created with the ACS Email domain.')
+@description('ACS sender address.')
 param senderAddress string
 
-@description('Optional default recipient used when a request omits the recipient.')
+@description('Default recipient.')
 param defaultRecipient string = ''
 
 @secure()
@@ -12,11 +12,11 @@ param defaultRecipient string = ''
 param acsConnectionString string
 
 @secure()
-@description('API key accepted only by the email endpoint.')
+@description('Email API key.')
 param emailApiKey string
 
 @secure()
-@description('Different API key accepted only by the telemetry endpoint.')
+@description('Telemetry API key.')
 param telemetryApiKey string
 
 resource environment 'Microsoft.App/managedEnvironments@2024-03-01' existing = {

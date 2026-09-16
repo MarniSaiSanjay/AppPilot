@@ -1,12 +1,4 @@
-"""Deeplink expectation judge (use-case-specific semantic verification).
-
-Decides whether the observed Android UI SEMANTICALLY satisfies a natural-language
-Expected Result after a deeplink launch. The prompt and match/verdict semantics
-are the Deeplink use case's own; the model transport is delegated to the generic
-``shared.model_client.ChatModelClient`` (no provider/model/credential is
-hardcoded). The judge is given ONLY the Expected Result and the redacted observed
-UI; it never selects or alters a deeplink.
-"""
+"""Deeplink expectation judge."""
 
 from __future__ import annotations
 
@@ -14,17 +6,14 @@ import json
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-try:  # package-relative (python -m src.usecases.deeplink.verification) vs top-level
+try:
     from ...apppilot.models import UIObservation
     from ...shared.model_client import ChatModelClient, ModelTransportError
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from apppilot.models import UIObservation
     from shared.model_client import ChatModelClient, ModelTransportError
 
 
-# --------------------------------------------------------------------------- #
-# AI expectation judge (semantic expected-vs-observed evaluation)
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ExpectationVerdict:
     matched: bool
@@ -43,14 +32,7 @@ class ExpectationJudge(Protocol):
 
 
 class LLMExpectationJudge:
-    """Model-backed semantic judge: does the observed UI satisfy Expected Result?
-
-    Uses the same OpenAI-compatible configuration as the agent's decision model
-    (model, endpoint, and API-key or Entra authentication) so no
-    provider/model/credential is hardcoded. It is given ONLY the natural
-    language Expected Result and the redacted observed UI; it decides match or
-    mismatch. It never selects or alters a deeplink.
-    """
+    """Model-backed semantic judge for Expected Result."""
 
     _SYSTEM_PROMPT = (
         "You are AppPilot's deeplink result judge. You are given an EXPECTED "
@@ -193,8 +175,6 @@ class LLMExpectationJudge:
 
     @staticmethod
     def _render(expected_result: str, observation: UIObservation) -> str:
-        # observation.describe() already redacts credential fields, so no secret
-        # can reach the judge prompt.
         evidence = {
             "expected_result": expected_result,
             "current_ui_elements": observation.describe(limit=40),

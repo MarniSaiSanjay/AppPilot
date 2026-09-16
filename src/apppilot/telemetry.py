@@ -1,12 +1,4 @@
-"""Minimal per-suite telemetry (roadmap #9).
-
-One best-effort record per real suite run - suite, test_cases, host_os
-(macOS/Windows), target_platform - sent by a single HTTPS POST to the relay's
-``/telemetry`` endpoint, which owns the Azure Storage credential (none lives in
-this CLI). Never raises, so it can never affect the suite verdict, exit code, or
-timing. Config (env/.env): APPPILOT_TELEMETRY_URL,
-APPPILOT_TELEMETRY_API_KEY.
-"""
+"""Minimal per-suite telemetry."""
 
 from __future__ import annotations
 
@@ -31,8 +23,6 @@ def _default_transport(request: urllib.request.Request) -> None:
 
 
 def _host_os() -> Optional[str]:
-    # macOS and native Windows map directly; WSL (a Linux kernel with a Microsoft
-    # marker) counts as Windows. Any other host is unsupported -> no record.
     system = platform.system()
     if system == "Darwin":
         return "macOS"
@@ -54,14 +44,12 @@ def record_suite_run(
     env: Optional[Mapping[str, str]] = None,
     transport: Callable[[urllib.request.Request], None] | None = None,
 ) -> None:
-    """Best-effort: POST one telemetry record. Never raises."""
+    """POST one telemetry record."""
     try:
         env = os.environ if env is None else env
         url = (env.get("APPPILOT_TELEMETRY_URL") or "").strip()
         key = (env.get("APPPILOT_TELEMETRY_API_KEY") or "").strip()
         host_os = _host_os()
-        # Skip silently if unconfigured, non-TLS (never leak the key), or an
-        # unsupported host.
         if not url.startswith("https://") or not key or host_os is None:
             return
         body = json.dumps(
@@ -80,9 +68,4 @@ def record_suite_run(
         )
         (transport or _default_transport)(request)
     except (Exception, KeyboardInterrupt):
-        # Best-effort: never affect the suite result. A Ctrl-C landing in the
-        # telemetry POST window must not corrupt the already-computed verdict,
-        # skip the report/email, or surface a traceback. The genuine suite
-        # interruption happens earlier, during suite execution, before telemetry
-        # is ever reached - so this cannot swallow the main application's Ctrl-C.
         pass

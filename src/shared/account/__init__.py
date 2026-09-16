@@ -37,11 +37,7 @@ class AccountPreparationResult:
 
 
 class AccountSessionCapability(Protocol):
-    """Ensure that the app is ready under one resolved credential profile.
-
-    Implementations must keep account identifiers local: raw account names and
-    emails must not enter model requests, logs, exceptions, or returned results.
-    """
+    """Ensure that the app is ready under one credential profile."""
 
     def ensure_active(
         self, profile: CredentialProfile

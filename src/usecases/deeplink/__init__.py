@@ -1,22 +1,12 @@
-"""Deeplink use case: authoritative public API.
-
-Data-driven deeplink regression suite. Composes the generic shared nodes
-(``shared.login``, ``shared.installer``, ``shared.warmup``,
-``shared.model_client``) and the ``apppilot`` framework primitives; owns the
-deeplink testcase schema, verification, retry, results and CLI.
-
-This module is the single source of the Deeplink public surface. The
-``deeplink_runner`` and ``flows.deeplink`` compatibility facades re-export from
-here, so existing imports and ``python -m`` entry points keep working.
-"""
+"""Deeplink use case public API."""
 
 from __future__ import annotations
 
-try:  # package-relative (python -m src.usecases.deeplink) vs top-level
+try:
     from ...shared.installer import AppInstaller, LocalApkInstaller
     from ...shared.warmup import MaestroWarmUp, WarmUp
     from ...shared.login import LoginCapability, SharedLoginFlow
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from shared.installer import AppInstaller, LocalApkInstaller
     from shared.warmup import MaestroWarmUp, WarmUp
     from shared.login import LoginCapability, SharedLoginFlow
@@ -38,9 +28,6 @@ from .runner import (
 from .orchestrator import DeeplinkSuiteOrchestrator
 from .cli import main
 
-# The orchestrator owns the suite's identity; re-export its name as the
-# package-level ``SUITE_NAME`` so consumers (reporting, email, facades) have a
-# single public handle without reaching into the orchestrator class.
 SUITE_NAME = DeeplinkSuiteOrchestrator.SUITE_NAME
 
 __all__ = [

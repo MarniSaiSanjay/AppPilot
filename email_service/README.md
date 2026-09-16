@@ -1,9 +1,8 @@
 # AppPilot Email Relay
 
-Minimal, server-side email API. It accepts an already-generated AppPilot test
-report and sends it from ONE fixed, service-owned sender via **Azure
-Communication Services (ACS) Email**. AppPilot end-users provide nothing related
-to email and never authenticate interactively.
+Server-side email API for AppPilot reports. It accepts an already-generated
+report and sends it from one fixed service-owned Azure Communication Services
+sender.
 
 ```
 AppPilot CLI  ──HTTPS + X-API-Key──▶  this relay (Container App)
@@ -14,53 +13,33 @@ AppPilot CLI  ──HTTPS + X-API-Key──▶  this relay (Container App)
                                     ACS Email  ──▶  recipient
 ```
 
-## Why ACS (not Microsoft Graph)
+## Azure resources
 
-Graph app-only mail would require a licensed M365 mailbox, an Entra app
-registration, admin consent, and an Exchange `ApplicationAccessPolicy` to scope
-the mailbox. ACS Email needs none of that: a pure Azure PaaS resource with a
-**free, auto-verified Azure-managed domain** (no DNS, no mailbox, no user, no
-admin consent). Simpler and safer here.
+Required resources:
 
-## Deployed resources (resource group `rg-apppilot`)
-
-| Resource | Name | Purpose |
-| --- | --- | --- |
-| Email Communication Service | `emailcs-apppilot` | India-resident email sending service |
-| Azure-managed domain | `AzureManagedDomain` | Verified fixed sender (no DNS); child of `emailcs-apppilot` |
-| Communication Service | `acs-apppilot` | India-resident ACS resource linked to the domain |
-| Container Registry (Basic) | `acrapppilot` | Hosts the immutable relay image |
-| Log Analytics workspace | `law-apppilot` | Container Apps logs |
-| Container Apps environment | `cae-apppilot` | Serverless host environment |
-| Container App | `ca-apppilot-relay` | Deployed HTTPS relay, scale-to-zero |
-| Storage Account (Standard_LRS) | `stapppilot` | Table Storage for telemetry |
-| Table | `SuiteRuns` | One row per suite run (telemetry) |
-
-Fixed sender: `DoNotReply@88b8341f-dacf-4b32-8040-6962e99cc2a4.azurecomm.net`
-
-Deployed relay endpoint:
-`https://ca-apppilot-relay.ambitioussmoke-8a5df56b.southindia.azurecontainerapps.io`
+| Resource | Purpose |
+| --- | --- |
+| Email Communication Service | Email sending service |
+| Azure-managed domain | Fixed sender domain |
+| Communication Service | ACS Email API |
+| Container Registry | Relay image registry |
+| Log Analytics workspace | Container Apps logs |
+| Container Apps environment | Relay host environment |
+| Container App | HTTPS relay |
+| Storage Account | Table Storage for telemetry |
+| Table | One row per suite run |
 
 ## Security model
 
-* Caller can NEVER set the From address — it is fixed server-side
-  (`ACS_SENDER_ADDRESS`). The request body accepts `subject`, `body`, and an
-  optional `to` recipient (syntactically validated); when `to` is omitted the
-  configured default (`APPPILOT_EMAIL_TO`) is used. **Note:** because `to` is
-  caller-chosen, anyone holding the API key can send from the fixed sender to
-  any address — treat `APPPILOT_API_KEY` as a sensitive credential. Tighten with
-  a recipient-domain allowlist if a narrower blast radius is required.
-* The privileged ACS connection string lives only as a Container App secret
-  (`acs-conn`); it is never in the CLI, never logged, never returned.
-* Table Storage uses the relay's user-assigned managed identity with
-  `Storage Table Data Contributor` scoped only to `SuiteRuns`; no Storage key,
-  connection string, or SAS token is stored.
-* The relay pulls its image using the same **user-assigned managed identity**
-  with only the `AcrPull` role — no broad access or registry admin credentials.
-* Email and telemetry callers authenticate with separate scoped API keys,
-  constant-time compared. HTTPS is enforced (`allowInsecure=false`).
-* Provider/storage exceptions are reduced to fixed log and response messages;
-  connection strings and provider exception details are not logged.
+- Fixed sender: `ACS_SENDER_ADDRESS`
+- Email payload: `{subject, body[, html][, to]}`
+- Default recipient: `APPPILOT_EMAIL_TO`
+- ACS secret: `ACS_CONNECTION_STRING`
+- Email API key: `APPPILOT_API_KEY`
+- Telemetry API key: `APPPILOT_TELEMETRY_API_KEY`
+- Telemetry identity: `AZURE_CLIENT_ID`
+- Telemetry table endpoint: `TELEMETRY_TABLE_ENDPOINT`
+- HTTPS-only ingress: `allowInsecure=false`
 
 ## Local development and validation
 
@@ -74,16 +53,12 @@ python -m pip_audit -r email_service/requirements.txt --progress-spinner off
 docker build --tag apppilot-email-relay:local ./email_service
 ```
 
-The tests mock ACS Email, Azure Identity, and Azure Table Storage. They require no Azure
-resources or real credentials and cover scoped authentication, fixed sender,
-recipient handling, telemetry schema, and sanitized provider failures. The PR
-workflow runs these tests and builds the Docker image independently; ordinary
-Python tests do not require a Docker daemon.
+Tests cover email/telemetry keys, fixed sender, recipient handling, telemetry
+schema, and sanitized provider failures.
 
 `containerapp.bicep` owns the `SuiteRuns` table and its table-scoped role
-assignment declaratively. If `stapppilot` is ever recreated, deploy the template
-again before enabling telemetry so the table and identity authorization are
-restored. The relay intentionally cannot create tables at runtime.
+assignment. Deploy it before enabling telemetry. The relay cannot create tables
+at runtime.
 
 ## Server-side environment (set on the Container App, not the CLI)
 
@@ -94,52 +69,27 @@ restored. The relay intentionally cannot create tables at runtime.
 | `ACS_CONNECTION_STRING` | `secretref:acs-conn` |
 | `APPPILOT_API_KEY` | `secretref:api-key` |
 | `APPPILOT_TELEMETRY_API_KEY` | `secretref:telemetry-api-key` |
-| `TELEMETRY_TABLE_ENDPOINT` | `https://stapppilot.table.core.windows.net` |
-| `AZURE_CLIENT_ID` | client ID of `id-apppilot-relay` |
-
-The relay credentials are already stored in the ignored `.env.work` file for
-local AppPilot execution. If recovery requires retrieving the email key,
-an owner can use:
-
-```bash
-az containerapp secret show -n ca-apppilot-relay -g rg-apppilot \
-  --secret-name api-key --query value -o tsv
-```
+| `TELEMETRY_TABLE_ENDPOINT` | Table service endpoint |
+| `AZURE_CLIENT_ID` | relay managed-identity client ID |
 
 ## AppPilot CLI integration
 
-The relay is the send transport, already wired in `src/apppilot/email_report.py`
-(stdlib `urllib`, no extra deps). The CLI holds no `AZURE_*` credentials — those
-live only server-side. It needs two owner-baked settings, no per-user input:
+The relay is the send transport in `src/apppilot/email_delivery.py`. The CLI holds
+no `AZURE_*` credentials. It needs two settings:
 
 | Variable | Value |
 | --- | --- |
 | `APPPILOT_EMAIL_API_URL` | `https://<app-fqdn>/send-report` |
 | `APPPILOT_EMAIL_API_KEY` | the `api-key` secret value |
 
-The client posts `{subject, body[, to]}` with an `X-API-Key` header over https
-only (cleartext and redirects are refused so the key can't leak) and treats any
-2xx as success. See `_post_report` / `send_suite_report` for the authoritative
-implementation; do not fork the snippet here.
-
-The deployed work configuration uses:
-
-| Variable | Configured endpoint |
-| --- | --- |
-| `APPPILOT_EMAIL_API_URL` | `https://ca-apppilot-relay.ambitioussmoke-8a5df56b.southindia.azurecontainerapps.io/send-report` |
-| `APPPILOT_TELEMETRY_URL` | `https://ca-apppilot-relay.ambitioussmoke-8a5df56b.southindia.azurecontainerapps.io/telemetry` |
+The client posts `{subject, body[, html][, to]}` with an `X-API-Key` header over
+HTTPS only and treats any 2xx as success.
 
 ## Telemetry endpoint (`POST /telemetry`)
 
-The same relay records minimal per-suite telemetry. Authenticated (`X-API-Key`)
-callers post **exactly four** fields — `suite`, `test_cases`, `host_os`
-(`macOS`/`Windows`), `target_platform` (`Android`/`iOS`); extra or invalid fields
-are rejected (`422`). Each accepted request writes one row to the `SuiteRuns`
-table using the relay's managed identity with `PartitionKey` = suite and a
-random `uuid` `RowKey` (Azure mechanics, not data). The client
-(`src/apppilot/telemetry.py`, stdlib `urllib`) is best-effort. Wire it with
-`APPPILOT_TELEMETRY_URL` = `https://<app-fqdn>/telemetry` and a dedicated
-`APPPILOT_TELEMETRY_API_KEY` matching the relay's telemetry-only secret.
+Authenticated callers post `suite`, `test_cases`, `host_os`, and
+`target_platform` with `X-API-Key`. Accepted requests write one row to
+`SuiteRuns`.
 
 ## Redeploy the image
 
@@ -147,16 +97,6 @@ random `uuid` `RowKey` (Azure mechanics, not data). The client
 az acr build -r acrapppilot -t apppilot-relay:<version> ./email_service
 ```
 
-Do **not** use `az containerapp update --image` for releases: that bypasses the
-declarative Bicep configuration and creates drift. Instead, retrieve the
-immutable digest for the newly built tag and deploy
-`containerapp.bicep` with `image=acrapppilot.azurecr.io/apppilot-relay@sha256:...`
-plus the required sender and secure deployment parameters. The `image`
-parameter is intentionally required so a later secret rotation cannot silently
-roll the relay back to an earlier image.
-
-## Live validation
-
-The currently deployed revision is healthy. `/healthz` returns `{"status":"ok"}`,
-the managed-identity telemetry path has recorded a `SuiteRuns` entity, and an
-ACS delivery-status check for a relay validation email returned `Succeeded`.
+Build and deploy an immutable image with `containerapp.bicep`. Required
+parameters: `image`, `senderAddress`, `acsConnectionString`, `emailApiKey`, and
+`telemetryApiKey`. `defaultRecipient` is optional.

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ...shared.credentials import normalize_profile_key
 except ImportError:
     from shared.credentials import normalize_profile_key

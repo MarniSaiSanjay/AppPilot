@@ -1,11 +1,4 @@
-"""Deeplink suite CLI entry point (use-case-specific).
-
-Parses the deeplink flags, loads the Excel test cases, wires the semantic judge,
-the Maestro executor/observer, the shared login/installer/warm-up nodes and the
-user-provided local APK path, then runs the suite via the orchestrator and
-optionally emails the report. Behavior, flags, exit codes and output are the
-Deeplink use case's own contract.
-"""
+"""Deeplink suite CLI."""
 
 from __future__ import annotations
 
@@ -20,7 +13,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 
-try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
+try:
     from ...apppilot.android import (
         MaestroExecutor,
         MaestroHierarchyObserver,
@@ -54,7 +47,7 @@ try:  # package-relative (python -m src.usecases.deeplink.cli) vs top-level
     )
     from ...shared.entra_auth import ensure_entra_model_readiness
     from ...shared.model_client import ModelConfigurationError
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from apppilot.android import (
         MaestroExecutor,
         MaestroHierarchyObserver,
@@ -101,11 +94,6 @@ from .orchestrator import DeeplinkSuiteOrchestrator
 from .stabilization import build_license_group_stabilizer
 
 
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
-# Bound the interactive suite-selection reprompt so bad input can never loop
-# forever (the run fails cleanly instead).
 _MAX_SELECTION_ATTEMPTS = 5
 
 
@@ -115,8 +103,7 @@ def _deeplink_testcases_dir() -> Path:
 
 
 def _discover_workbooks(directory: Path) -> list[Path]:
-    """Return the selectable ``.xlsx`` suites in ``directory`` (sorted by name),
-    ignoring temporary Excel lock files (``~$*.xlsx``)."""
+    """Return selectable Excel workbooks in name order."""
     return sorted(
         (path for path in directory.glob("*.xlsx") if not path.name.startswith("~$")),
         key=lambda path: path.name.casefold(),
@@ -126,9 +113,7 @@ def _discover_workbooks(directory: Path) -> list[Path]:
 def _prompt_for_workbook(
     workbooks: list[Path], *, output, input_fn,
 ) -> "Path | None":
-    """Show a numbered suite list and return the chosen workbook. Empty input
-    picks the first ([1]); invalid input reprompts. Returns None if no valid
-    choice is made (EOF / too many invalid entries) so the caller fails cleanly."""
+    """Prompt for a workbook selection."""
     output("Available test suites:")
     for index, workbook in enumerate(workbooks, start=1):
         output(f"{index}. {workbook.name}")
@@ -153,13 +138,7 @@ def _select_workbook(
     output,
     input_fn=input,
 ) -> "Path | None":
-    """Resolve which workbook to run.
-
-    * An explicit ``--excel`` path always wins and skips discovery/prompting.
-    * Otherwise discover suites in ``directory``: none -> clean failure (None);
-      exactly one -> auto-select; several -> prompt when interactive, else fail
-      cleanly asking for an explicit ``--excel`` (automation contract).
-    """
+    """Resolve which workbook to run."""
     if explicit is not None:
         return Path(explicit)
     workbooks = _discover_workbooks(directory)
@@ -277,9 +256,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
-    # Test-suite selection (runtime CLI concern; never persisted, never in /init).
-    # --excel is an explicit override that skips discovery/prompting; otherwise
-    # discover the Deeplink workbooks and select (auto when only one).
     excel_path = _select_workbook(
         args.excel,
         directory=_deeplink_testcases_dir(),
@@ -311,10 +287,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: invalid runtime configuration: {error}", file=sys.stderr)
         return 2
 
-    # AppPilot installs ONLY a user-provided local APK (no build/acquisition).
-    # Resolve it up front from --apk, a saved path, or an interactive prompt, and
-    # validate before any execution. An unresolved/invalid path is a clean setup
-    # error (exit 2); it never reaches test execution and never leaks a traceback.
     apk_path = apk_config.resolve_apk_path(args.apk, interactive=interactive)
     if apk_path is None:
         print("ERROR: no valid APK path provided", file=sys.stderr)
@@ -340,9 +312,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
-    # Resolve the target device: explicit --device wins; otherwise reuse the
-    # /init selection (revalidated live) or auto-detect a single connected device
-    # (device.py owns detection). Ambiguous multi-device with no choice exits 2.
     device_id = device_config.resolve_device(
         args.device, output=lambda message: print(message, file=sys.stderr),
     )
@@ -369,9 +338,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         else build_license_group_stabilizer(executor)
     )
 
-    # Build one cached shared-login flow per resolved License profile. All flows
-    # reuse the same device dependencies and decision provider; only their local,
-    # secret RuntimeContext differs.
     try:
         login_provider = resolve_decision_provider()
     except ModelConfigurationError as error:
@@ -441,14 +407,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     lock = device_lock.DeviceProcessLock(device_id, run_id=run_id)
     try:
         with lock:
-            # Ask UP FRONT whether to email the report and to whom, so the operator
-            # can start the long suite and walk away. Holding the device lock here
-            # ensures a competing process fails before either process mutates it.
             try:
                 email_recipient = email_delivery.prompt_email_recipient(
                     env=os.environ, interactive=interactive
                 )
-            except Exception as error:  # pragma: no cover - defensive
+            except Exception as error:  # pragma: no cover
                 print(
                     logtags.prefix(
                         logtags.EMAIL,
@@ -457,29 +420,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 email_recipient = None
 
-            # The orchestrator owns the explicit top-level lifecycle and composes
-            # the runner for per-case execution, judging, retry and reporting.
             report = DeeplinkSuiteOrchestrator(runner).run(cases)
     except device_lock.DeviceLockError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
-    # Best-effort telemetry (roadmap #8/#9): one minimal record per real suite
-    # run, submitted from the CLI seam only (never in the orchestrator, so direct
-    # orchestrator/test calls emit nothing). Never raises; never affects results.
     telemetry.record_suite_run(report.suite_name, report.total, "Android")
     print(logtags.prefix(logtags.REPORT, "generating report..."))
     report_text = report.format()
     print(report_text)
     print(logtags.prefix(logtags.REPORT, "report generated"))
-    # TESTS -> FINAL REPORT -> EMAIL. Deliver to the address chosen up front (if
-    # any). Delivery must never affect the verdict, so failure is swallowed.
     if email_recipient is not None:
         print(logtags.prefix(logtags.EMAIL, "triggering email delivery..."))
         try:
             email_delivery.send_suite_report(
                 report, env=os.environ, recipient=email_recipient
             )
-        except Exception as error:  # pragma: no cover - defensive last line
+        except Exception as error:  # pragma: no cover
             print(
                 logtags.prefix(
                     logtags.EMAIL,

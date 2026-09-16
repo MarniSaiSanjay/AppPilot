@@ -11,11 +11,7 @@ def infer_credential_kind(
     class_name: str = "",
     extra: str = "",
 ) -> CredentialKind | None:
-    """Infer whether an input field is a username/email or password field.
-
-    Uses only stable non-secret signals (resource id, hint, class, extra), never
-    the live text. Shared by the observer (redaction) and the safety validator.
-    """
+    """Infer whether an input field is a username/email or password field."""
     haystack = " ".join((resource_id, hint_text, class_name, extra)).casefold()
     password_markers = ("password", "passwd", "textpassword", "i0118")
     if any(marker in haystack for marker in password_markers):
@@ -110,9 +106,6 @@ class SafetyValidator:
             if not target.is_input:
                 raise ValueError("Text input target is not an observed input field")
             if action.credential_kind is not None:
-                # Secret is resolved locally after validation (input_text empty
-                # here); verify the field really is that credential kind so the
-                # model cannot redirect it.
                 if self.credential_kind(target) != action.credential_kind:
                     raise ValueError(
                         "Credential input kind does not match the observed field"
@@ -122,10 +115,7 @@ class SafetyValidator:
 
     @staticmethod
     def credential_kind(element: UIElement) -> CredentialKind | None:
-        """Safely infer whether an input is a username/email or password field.
-
-        Delegates to :func:`infer_credential_kind` (non-secret signals only,
-        which survive the observer's redaction)."""
+        """Infer whether an input is a username/email or password field."""
         if not element.is_input:
             return None
         return infer_credential_kind(

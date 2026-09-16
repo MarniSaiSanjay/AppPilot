@@ -1,14 +1,8 @@
-"""AppPilot deeplink suite (compatibility shim).
-
-The deeplink use case now lives under the ``usecases.deeplink`` package (its
-authoritative public surface is ``usecases.deeplink.__init__``). This module
-re-exports that surface so existing imports (``flows.deeplink``) and
-``python -m flows.deeplink`` keep working unchanged.
-"""
+"""AppPilot deeplink suite compatibility shim."""
 
 from __future__ import annotations
 
-try:  # package-relative (python -m src.flows.deeplink) vs top-level
+try:
     from ..usecases.deeplink import (
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RETRY_WAIT_SECONDS,
@@ -32,7 +26,7 @@ try:  # package-relative (python -m src.flows.deeplink) vs top-level
         load_deeplink_cases,
         main,
     )
-except ImportError:  # top-level (src on sys.path)
+except ImportError:
     from usecases.deeplink import (
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RETRY_WAIT_SECONDS,

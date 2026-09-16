@@ -1,16 +1,4 @@
-"""AppPilot ``/run`` entry point.
-
-Selects a use case (auto when only one exists, else a numbered prompt) and hands
-off to that use case's own CLI ``main``, which owns test-suite selection and runs
-all of its test cases. This runner adds no test logic - it only dispatches.
-
-Usage::
-
-    python3 src/apppilot_run.py                 # pick a use case, then a suite
-    python3 src/apppilot_run.py --usecase deeplink [use-case args...]
-
-Args after use-case resolution (e.g. ``--excel``) pass through unchanged.
-"""
+"""AppPilot ``/run`` entry point."""
 
 from __future__ import annotations
 
@@ -21,16 +9,16 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-try:  # package-relative (python -m src.apppilot_run)
+try:
     from .apppilot.agent import _load_dotenv
     from .shared.entra_auth import ensure_entra_model_readiness
     from .shared.model_client import ModelConfigurationError
-except ImportError:  # top-level (src on sys.path)
+except ImportError:
     from apppilot.agent import _load_dotenv
     from shared.entra_auth import ensure_entra_model_readiness
     from shared.model_client import ModelConfigurationError
 
-_MAX_ATTEMPTS = 5  # bound the reprompt so bad input can't loop forever
+_MAX_ATTEMPTS = 5
 
 
 def _usecases_dir() -> Path:
@@ -49,8 +37,7 @@ def _discover_usecases(directory: Path) -> list[str]:
 
 
 def _select_usecase(explicit, *, directory, interactive, output, input_fn=input):
-    """Resolve which use case to run: explicit ``--usecase`` wins (validated);
-    else none -> None, one -> auto, several -> prompt (or None non-interactive)."""
+    """Resolve which use case to run."""
     usecases = _discover_usecases(directory)
     if explicit is not None:
         if explicit in usecases:
@@ -85,16 +72,16 @@ def _select_usecase(explicit, *, directory, interactive, output, input_fn=input)
 
 
 def _load_usecase_main(name: str):
-    try:  # package-relative (python -m src.apppilot_run)
+    try:
         module = importlib.import_module(f".usecases.{name}.cli", package=__package__)
-    except (ImportError, TypeError):  # top-level (src on sys.path)
+    except (ImportError, TypeError):
         module = importlib.import_module(f"usecases.{name}.cli")
     return module.main
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     _load_dotenv()
-    parser = argparse.ArgumentParser(add_help=False)  # rest belongs to the use case
+    parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--usecase", default=None)
     namespace, passthrough = parser.parse_known_args(argv)
     interactive = getattr(sys.stdin, "isatty", lambda: False)()

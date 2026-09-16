@@ -7,7 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-# Run as a non-root user (defence in depth for an internet-facing process).
 RUN useradd -r -u 10001 appuser
 USER appuser
 

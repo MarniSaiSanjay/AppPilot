@@ -1,13 +1,8 @@
-"""Backward-compatible facade for the AppPilot agent.
-
-The implementation now lives in the ``apppilot`` package and ``flows.login``.
-This module re-exports the public names so existing imports (and
-``python -m src.apppilot_agent``) keep working unchanged.
-"""
+"""Backward-compatible facade for the AppPilot agent."""
 
 from __future__ import annotations
 
-try:  # package-relative (python -m src.apppilot_agent)
+try:
     from .apppilot.models import (
         Action,
         ActionKind,
@@ -51,7 +46,7 @@ try:  # package-relative (python -m src.apppilot_agent)
         _parse_args,
         main,
     )
-except ImportError:  # top-level (src on sys.path)
+except ImportError:
     from apppilot.models import (
         Action,
         ActionKind,

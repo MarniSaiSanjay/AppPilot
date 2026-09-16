@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ...apppilot.models import RuntimeContext
     from ..credentials import (
         CredentialConfigurationError,

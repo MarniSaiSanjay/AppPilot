@@ -1,21 +1,13 @@
-"""Shared login flow adapter (use-case-agnostic).
-
-Wraps the generic login AppPilotAgent as a small ``LoginCapability`` the caller
-can invoke to prepare sign-in/onboarding, plus an observability tracer that
-emits ``[LOGIN]`` execution-trace lines derived only from the agent's real
-verdicts. No login UI is hardcoded and nothing here knows about Deeplink, FRI,
-or any specific use case: the goal/guidance default to the shared prototype and
-can be overridden by the caller.
-"""
+"""Shared login flow adapter."""
 
 from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol
 
-try:  # package-relative (python -m src.shared.login.flow) vs top-level
+try:
     from ...apppilot.models import UIObservation
     from ...apppilot import logtags
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from apppilot.models import UIObservation
     from apppilot import logtags
 
@@ -29,12 +21,7 @@ class LoginCapability(Protocol):
 
 
 class SharedLoginFlow:
-    """Ensures the app is signed-in/ready via the SHARED generic login flow
-    (AppPilotAgent + Brain). No login UI is hardcoded: the agent's goal evaluator
-    reports success immediately when already signed in, otherwise the model
-    drives each onboarding action. The SAME instance is reused across scenarios
-    (DRY). The goal/guidance default to the shared prototype; a use case may pass
-    its own so login stops at the boundary that use case cares about."""
+    """Ensures the app is signed in and ready."""
 
     def __init__(
         self,
@@ -49,9 +36,6 @@ class SharedLoginFlow:
         self._guidance = guidance
         self._loading_recovery = loading_recovery
         self._restarted_last_run = False
-        # Observability only: wrap the agent's goal evaluator so the [LOGIN] trace
-        # reflects real verdicts. The wrapper returns each verdict verbatim, so
-        # behavior is unchanged. Guard against double-wrapping if reused.
         self._tracer: _SignInTracer | None = None
         evaluator = getattr(agent, "_goal_evaluator", None)
         if evaluator is not None and not isinstance(evaluator, _SignInTracer):
@@ -73,8 +57,6 @@ class SharedLoginFlow:
             else 1
         )
         for run in range(max_runs):
-            # Reset the per-run trace state so each login attempt reports its own
-            # already/required/completed verdict.
             if self._tracer is not None:
                 self._tracer.begin_run()
             if self._agent.run(self._goal, self._guidance):
@@ -120,14 +102,7 @@ class SharedLoginFlow:
 
 
 class _SignInTracer:
-    """Observability wrapper around the shared login goal evaluator.
-
-    Emits [LOGIN] trace lines derived only from the real verdicts the underlying
-    evaluator returns, passing those verdicts through unchanged:
-
-    * the first verdict decides "Already signed in" vs "Sign-in required";
-    * a later transition to signed-in is the actual completion.
-    """
+    """Emits login trace lines from goal-evaluator verdicts."""
 
     def __init__(self, inner) -> None:
         self._inner = inner
@@ -137,7 +112,6 @@ class _SignInTracer:
     def begin_run(self) -> None:
         self._seen_first = False
         self._required = False
-        # Reset per-run state, including stable completion confirmation.
         inner_begin = getattr(self._inner, "begin_run", None)
         if callable(inner_begin):
             inner_begin()

@@ -189,9 +189,9 @@
       </ul>
       <div class="note">
         <strong>Quick version checks</strong>
-        <pre><code>        python3 --version   <span class="cmt"># 3.11, 3.12, or 3.13</span>
-java -version       <span class="cmt"># 17 or newer</span>
-adb --version       <span class="cmt"># from Android SDK platform-tools</span></code></pre>
+        <pre><code>        python3 --version
+java -version
+adb --version</code></pre>
       </div>
     </section>
 
@@ -207,7 +207,6 @@ cd AppPilot</code></pre>
           <h3>Install the Maestro CLI</h3>
           <p>Maestro needs Java 17+. On macOS:</p>
           <pre><code>curl -fsSL "https://get.maestro.mobile.dev" | bash
-<span class="cmt"># add Maestro to your PATH (zsh shown; use ~/.bashrc for bash)</span>
 echo 'export PATH="$HOME/.maestro/bin:$PATH"' &gt;&gt; ~/.zshrc
 source ~/.zshrc
 maestro --version</code></pre>
@@ -283,10 +282,7 @@ APPPILOT_PASSWORD=your-password</code></pre>
     <section id="emulator">
       <h2><span class="num">4</span>Start the emulator</h2>
       <p>Launch an Android emulator (from Android Studio → Device Manager, or the terminal), then confirm it is connected. The standalone login CLI requires the target app to be installed; the deeplink suite manages its local APK installation.</p>
-      <pre><code>adb devices
-<span class="cmt"># expected output, e.g.:</span>
-<span class="cmt"># List of devices attached</span>
-<span class="cmt"># emulator-5554   device</span></code></pre>
+      <pre><code>adb devices</code></pre>
       <p>Note the device id (e.g. <code>emulator-5554</code>) if you want to select it explicitly. Otherwise AppPilot reuses a valid device saved by <code>/init</code> only when its identity still matches, or uniquely auto-detects an authorized, fully booted device.</p>
     </section>
 
@@ -294,7 +290,6 @@ APPPILOT_PASSWORD=your-password</code></pre>
       <h2><span class="num">5</span>Run the agent</h2>
       <p>With the emulator running and <code>.env</code> in place:</p>
       <pre><code>python3 src/apppilot_agent.py
-<span class="cmt"># Optional explicit selection:</span>
 python3 src/apppilot_agent.py --device emulator-5554</code></pre>
       <h3>Options</h3>
       <table>

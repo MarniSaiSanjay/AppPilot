@@ -1,13 +1,4 @@
-"""Deeplink per-case runner (use-case-specific deterministic orchestration).
-
-Owns the deeplink attempt/retry recipe and bounded verification: launch the
-EXACT deeplink, observe the Android UI, ask the judge whether it matches the
-Expected Result, and retry deterministically on mismatch. Installed and
-uninstalled scenarios differ only in how each attempt PREPARES the app; the
-retry loop, verification, per-attempt recording and PASS/FAIL reporting are
-identical. The model only judges - it never decides how to install, launch or
-retry. Composes the shared login/installer/warm-up nodes.
-"""
+"""Deeplink per-case execution and verification."""
 
 from __future__ import annotations
 
@@ -18,7 +9,7 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 from urllib.parse import urlsplit
 
-try:  # package-relative (python -m src.usecases.deeplink.runner) vs top-level
+try:
     from ...apppilot.android import (
         AndroidOperationalError,
         MaestroExecutor,
@@ -37,7 +28,7 @@ try:  # package-relative (python -m src.usecases.deeplink.runner) vs top-level
     from ...shared.installer import AppInstaller
     from ...shared.login import LoginCapability
     from ...shared.warmup import WarmUp
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from apppilot.android import (
         AndroidOperationalError,
         MaestroExecutor,
@@ -63,19 +54,9 @@ from .artifacts import FailureArtifactWriter
 from .results import AttemptResult, SuiteReport, TestCaseResult
 from .supported_links import SUPPORTED_LINK_DOMAINS
 
-# Deterministic bounds for the deeplink suite (separate from the agent's
-# action/stuck limits). A failed test is retried once (1 attempt + 1 retry).
 DEFAULT_MAX_ATTEMPTS = 2
 DEFAULT_RETRY_WAIT_SECONDS = 2.0
-# Settle time after a deeplink launch before the first verification observation.
-# Injected via the sleep hook so tests can no-op it.
 DEFAULT_SETTLE_SECONDS = 3.0
-# Bounded verification polling: observe -> judge repeatedly, PASS on first match,
-# mismatch only after the window elapses. Same for installed AND uninstalled.
-# Each observe+judge (a11y dump + AI judge) takes a few seconds, so this window
-# fits ~3 validations - enough for a slow-settling screen to appear and be caught
-# by a cheap re-check, instead of falling through to an expensive full retry
-# (which re-opens the deeplink and, when uninstalled, re-installs the app).
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 30.0
 DEFAULT_VERIFY_POLL_INTERVAL_SECONDS = 2.0
 _RESEARCHER_ADD_VERBS = {"add", "get", "install"}
@@ -92,10 +73,6 @@ class _DeterministicVerdict:
     reason: str
     contradiction: bool = False
 
-
-# --------------------------------------------------------------------------- #
-# The runner (deterministic orchestration; AI only judges)
-# --------------------------------------------------------------------------- #
 class DeeplinkTestRunner:
     def __init__(
         self,
@@ -158,10 +135,6 @@ class DeeplinkTestRunner:
         self._supported_link_state = None
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
-        # Delegate the top-level lifecycle to the explicit orchestrator, which
-        # composes this runner's per-case execution. Kept as a convenience entry
-        # point so existing callers/tests that hold a runner still work. Imported
-        # lazily to avoid an import cycle (the orchestrator imports the runner).
         from .orchestrator import DeeplinkSuiteOrchestrator
 
         return DeeplinkSuiteOrchestrator(self).run(cases)
@@ -174,8 +147,6 @@ class DeeplinkTestRunner:
         return self._login_flow
 
     def ensure_logged_in(self, case: DeeplinkTestCase | None = None) -> bool:
-        # Login only if needed, via the shared login capability. Returns True iff
-        # login succeeded (True when no login flow is configured).
         if self._login_flow_for_license is not None:
             if case is None:
                 raise RuntimeError(
@@ -189,8 +160,6 @@ class DeeplinkTestRunner:
         return True
 
     def run_warm_up(self) -> None:
-        # Installed stabilization (launch -> wait -> stop). Invoked once per
-        # successfully prepared License group - never per case or retry.
         if self._warm_up is not None:
             self._warm_up()
 
@@ -228,15 +197,10 @@ class DeeplinkTestRunner:
         return self._account_session.ensure_active(profile)
 
     def install_local_build(self) -> None:
-        # Put the freshly built local APK on the device (adb install -r). Used by
-        # the installed batch so every installed case runs against the local build.
         if self._installer is not None:
             self._installer.install_fresh()
 
     def ensure_clean_install_state(self) -> None:
-        # One-time suite-startup cleanup: guarantee the app is uninstalled so
-        # every run starts from a deterministic clean state. No-op if absent or
-        # no installer is configured.
         if self._installer is None:
             return
         is_installed = getattr(self._executor, "is_installed", None)
@@ -258,9 +222,6 @@ class DeeplinkTestRunner:
             logtags.trace("No existing app install to remove", logtags.SUITE)
 
     def open_installed_app(self) -> None:
-        # Launch the already-installed build to the foreground so login observes
-        # the APP, not the launcher home screen. The batch only installs the APK
-        # (install_fresh); the uninstalled path launches via install_and_open.
         if self._installer is not None:
             self._installer.open()
 
@@ -355,17 +316,7 @@ class DeeplinkTestRunner:
         case: DeeplinkTestCase,
         attempt: int,
     ):
-        """Shared, bounded verification polling for a single attempt.
-
-        Used IDENTICALLY by installed and uninstalled cases. After the deeplink
-        has been executed and the app is ready to be observed, add Researcher
-        when its own screen explicitly offers that action, then repeatedly
-        observe -> judge the resulting destination until the expected result
-        matches (PASS immediately) or the bounded verification window elapses
-        (genuine mismatch -> caller retries). Unknown screens go directly to the
-        judge. Uses a monotonic clock so the window can never be skewed by
-        wall-clock jumps, and always makes at least one observe/judge call.
-        """
+        """Poll one attempt until the expected result matches or times out."""
         evidence = {
             "deeplink": case.deep_link,
             "expected_destination": case.expected_result,
@@ -744,14 +695,7 @@ class DeeplinkTestRunner:
         on_start: "Callable[[], None] | None" = None,
         on_replay_recovery_failure: "Callable[[], None] | None" = None,
     ) -> TestCaseResult:
-        """Generic attempt loop shared by every scenario.
-
-        Scenarios differ ONLY in how each attempt PREPARES the app before
-        verification (``prepare``); the retry loop, shared bounded verification,
-        per-attempt result recording and PASS/FAIL reporting are identical. A
-        preparation failure is a retryable failed attempt, never a crash, so the
-        suite always continues.
-        """
+        """Run case attempts with scenario-specific preparation."""
         result = TestCaseResult(case=case)
         logtags.trace(f"{case.test_id} starting", label)
         if on_start is not None:
@@ -910,7 +854,6 @@ class DeeplinkTestRunner:
                 self._installer.ensure_absent()
                 self._supported_links_prepared = False
                 logtags.trace(f"{case.test_id} app is uninstalled", logtags.UNINSTALLED)
-            # 1) The EXACT deeplink routes to the store window while absent.
             logtags.trace(f"{case.test_id} opening deeplink", logtags.UNINSTALLED)
             self._executor.open_link(case.deep_link)
             logtags.trace(
@@ -919,24 +862,14 @@ class DeeplinkTestRunner:
                 logtags.UNINSTALLED,
             )
             if self._installer is not None:
-                # 2) Install the local build via adb, then 3) open it by tapping
-                # the store's Open button via Maestro (NOT re-firing the
-                # deeplink). "app opened" is only emitted after the app is
-                # confirmed foreground.
                 logtags.trace(
                     f"{case.test_id} installing local build and opening via store button",
                     logtags.INSTALL,
                 )
                 self._installer.install_and_open(via_store_button=True)
                 logtags.trace(f"{case.test_id} app opened", logtags.INSTALL)
-            if login_flow is not None:  # SAME shared login as the installed path
+            if login_flow is not None:
                 logtags.trace(f"{case.test_id} ensuring login", logtags.UNINSTALLED)
-                # On login failure, raise into the per-attempt setup-failure path
-                # (failed attempt -> skip _verify() -> retry fresh / else FAIL)
-                # instead of reporting ready.
-                # Relaunch recovery is safe when this attempt will replay the
-                # exact supported link after login. Other URLs still depend on
-                # the store's deferred handoff and must not relaunch.
                 if replay_supported_link:
                     login_ready = login_flow.ensure_ready()
                 else:
@@ -976,10 +909,6 @@ class DeeplinkTestRunner:
             login_completed = True
             restart_replay_failed = False
             if replay_supported_link:
-                # Android cannot associate an App Link with a package that was
-                # absent when the original URL opened. After installation and
-                # login, approve the declared domain and replay the exact URL so
-                # the destination intent reaches the app instead of Chrome.
                 logtags.trace(
                     f"{case.test_id} enabling supported-link handoff",
                     logtags.UNINSTALLED,

@@ -1,9 +1,8 @@
 # Deeplink use case
 
-Data-driven deeplink regression suite. Each row of an Excel workbook is one test
-case: launch the **exact** deeplink, observe the resulting Android UI, and let
-the model **judge** whether the observed screen satisfies the natural-language
-Expected Result — with deterministic retries and reporting.
+Data-driven deeplink regression suite. Each workbook row launches the exact
+deeplink, observes the Android UI, and verifies the natural-language Expected
+Result.
 
 ## High-level flow
 
@@ -16,8 +15,7 @@ load test cases (Excel)
   -> final report (+ optional email)
 ```
 
-The Deeplink and Expected Result come from the Excel verbatim; the model only
-judges expected-vs-observed. Retry and reporting are fully deterministic.
+The deeplink and Expected Result come from the workbook.
 
 ## Excel-driven testcases
 
@@ -27,124 +25,46 @@ Installed is optional. Headerless positional A-D compatibility remains.
 Duplicate Test IDs, missing required values, non-HTTPS links, and links outside
 the supported App Link domains are rejected with row/column context.
 `Installed` accepts only the documented true/false tokens listed in the root
-README; unknown values are errors rather than truthy fallbacks. The License
-selects profile-specific credentials from local environment variables;
-credentials are never stored in the workbook.
+README. The License selects profile-specific credentials from local environment
+variables; credentials are never stored in the workbook.
 
 ## Installed vs uninstalled
 
-The `INSTALLED` column (or a deterministic signal derived from the deeplink)
-selects the scenario:
+The `INSTALLED` column selects the scenario:
 
-- **INSTALLED=TRUE** — the APK is installed once, then cases are grouped by
-  normalized License in first-seen order. Each group brings the app foreground,
-  and ensures login. After the first successful login, supported-link routing is
-  configured once for the installed app. Each group then adds or switches to the
-  required account when necessary, verifies the active account, runs exactly two
-  launch/settle/stop stabilization cycles, then reopens the app and runs the same
-  login boundary again so delayed post-account privacy sheets, dialogs, and
-  onboarding are completed before the first deeplink. It then runs that group's
-  cases contiguously. Account switches and retries do not repeat supported-link
-  preparation. Per-case retry is *kill → wait → reopen app → conditionally
-  restore login → reopen the same deeplink*. Final report order is restored to
-  workbook order.
-- **INSTALLED=FALSE** — the genuine first-open-after-install: uninstall, fire the
-  deeplink (routes to the store window), install the local APK via adb, then open
-  via the store's Open button. After login, AppPilot approves any declared App
-  Link domain and replays the exact workbook URL so Android hands the destination
-  to the newly installed app rather than the browser. Because replay preserves
-  the destination, these links may also use the shared login flow's one-time
-  relaunch recovery when first-open loading stalls. No warm-up. A failure before
-  login completes makes the next attempt uninstall and recreate the full fresh
-  state. For supported-domain links, a failure after login preserves the
-  authenticated installation and retries by restarting the app and replaying
-  the exact deeplink. Other fresh-install links retry from recreated fresh
-  installation state because their deferred handoff cannot be replayed. If
-  restart-and-replay recovery itself fails, AppPilot also recreates fresh
-  installation state within the bounded retry.
-  For links outside the supported domain list, relaunch-based login recovery
-  remains disabled because it cannot preserve the store's pending first-open
-  deeplink; a stalled login instead retries from fresh installation state.
+- **INSTALLED=TRUE** — install once, group by normalized License, prepare the
+  active account, run two stabilization cycles, and execute each group
+  contiguously. Per-case retry reopens the same deeplink.
+- **INSTALLED=FALSE** — uninstall, open the deeplink through the store handoff,
+  install the local APK, complete login, enable supported App Link domains, and
+  replay the exact workbook URL. Retries recreate fresh state before login and
+  replay supported-domain links after login.
 
-## How it consumes shared nodes
+## Shared dependencies
 
-- **Login** — resolves every License profile before device work, builds the
-  shared login agent with the **default** `LoginPolicy`, and caches one
-  `SharedLoginFlow` per profile. Login stops at the normal sign-in boundary and
-  returns control; Deeplink then does its own verification. (A different use
-  case could pass a custom `LoginPolicy` to the same shared login node.)
-- **Installer** — `shared.installer.LocalApkInstaller` installs the locally built
-  APK and opens the app (adb launcher or store Open button).
-- **Warm-up** — `shared.warmup.MaestroWarmUp` performs first-install preparation;
-  Deeplink configures exactly two cycles and runs them once per successfully
-  prepared License group.
-- **Account session** — `shared.account.session.AndroidAccountSession` navigates
-  Menu → drawer account → Settings account, handles the optional overlay
-  permission detour, then switches or adds the required account. Account
-  identifiers are matched locally and never enter model requests, logs, result
-  reasons, or reports.
-- **Model client** — the expectation judge (`verification.py`) delegates HTTP
-  transport to `shared.model_client.ChatModelClient`; only the prompt and
-  match/verdict semantics are Deeplink's own.
-- **Supported links** — `supported_links.py` owns the extensible domain list.
-  Android approval and user selection run once after the first successful
-  installed-batch login and after each relevant fresh installation before the
-  exact deeplink is replayed.
+Deeplink composes shared login, installer, warm-up, account-session, and model
+client nodes. `supported_links.py` owns the App Link domain list.
 
 ## Verification
 
-The runner first verifies the deeplink delivery evidence, expected package,
+The runner first verifies deeplink delivery evidence, expected package,
 foreground package/activity, non-empty UI, and reliable destination signatures.
-A deterministic contradiction fails and cannot be overridden by the model.
-`LLMExpectationJudge` is then given only the Expected Result and the redacted
-observed UI for semantic ambiguity. A positive semantic verdict is confirmed
-against a fresh observation and uncached model evaluation. The runner polls
-within a per-attempt monotonic deadline created after deeplink launch. Each
-retry receives a fresh verification window; preparation, installation, login,
-retry setup, and cleanup do not consume it. Model, ADB/Maestro, and installer
-operations retain their independent finite bounds. Model transport/timeout,
-Android/Maestro, installer, and genuine destination-mismatch failures remain
-separate. For installed cases and supported-domain
-fresh-install links, one bounded in-attempt recovery handles Android or Maestro
-operational failures and incomplete destination shells by stopping the app,
-reopening it, checking login without allowing another relaunch, and replaying
-the exact deeplink. Recovery and deterministic Researcher setup restart the
-verification window. Other fresh-install links retry from recreated
-installation state. An existing signed-in session requires no login actions.
-Existing supported-link setup is reused; it is repeated only after an uninstall
-has removed that package state. Usable but incorrect destinations are not
-restarted. In both installed and first-install flows, a Researcher screen that
-explicitly offers an Add action is handled deterministically before final
-verification and again after a recovery replay when needed; unknown screens go
-directly to the judge. Named destinations are
-distinct: an expected Researcher screen cannot match Cowork or generic Chat,
-and vice versa. Prompt presence, absence, and any specified prompt content must
-also match.
+Deterministic contradictions cannot be overridden by the model.
+`LLMExpectationJudge` receives the Expected Result and redacted observed UI for
+semantic ambiguity. Each retry receives a fresh verification window; preparation,
+installation, login, retry setup, and cleanup do not consume it. Researcher Add
+setup is handled deterministically when the screen explicitly offers that
+action. Named destinations and prompt requirements must match.
 
 ## Device ownership, cleanup, and evidence
 
-The CLI holds a fail-fast lock keyed by normalized Android serial before any
-device mutation. A second process targeting the same device exits with owner
-metadata; different devices use independent locks. Valid local dead-owner locks
-are reclaimed, while malformed/unverifiable lock metadata fails closed.
+The CLI holds a per-device process lock before mutation. Case cleanup stops the
+target app and clears the clipboard. Suite cleanup restores captured
+supported-link state. Cleanup failures are reported separately.
 
-Credential paste clears the Android clipboard in the same Maestro flow and
-retries cleanup best-effort on failure. Maestro subprocesses receive an explicit
-runtime allowlist plus the temporary credential variable only for credential
-flows; unrelated model, email, telemetry, and profile secrets are not inherited.
-
-Every case attempts target-app stop and clipboard cleanup. Suite-final cleanup
-repeats those operations and restores captured AppPilot-managed supported-link
-selection, handling, and restorable domain-verification state. Cleanup
-failure is reported separately, preserves the original failure, and prevents an
-otherwise matched case from reporting a clean PASS. AppPilot does not restore
-prior APK installation, accounts, permissions, app data/cache, or unrelated
-apps.
-
-Failed cases retain sanitized JSON under
-`.apppilot_artifacts/<run-id>/`. Artifacts are unique per case/attempt and
-capped at 64 KiB. Raw screenshots are intentionally not retained without a safe
-pixel-redaction mechanism.
+Failed cases with recorded verification attempts retain sanitized JSON under
+`.apppilot_artifacts/<run-id>/`. Artifact paths are not printed in reports or
+email.
 
 ## Entry point
 

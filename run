@@ -1,8 +1,4 @@
 #!/bin/sh
-# Launch the AppPilot use-case runner (a.k.a. /run) using a Python 3.11+
-# interpreter. It selects a use case (auto when only one exists) and then that
-# use case's test suite, then runs all of its test cases.
-# Usage: ./run [--usecase NAME] [use-case args...]
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 

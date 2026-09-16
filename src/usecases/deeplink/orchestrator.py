@@ -1,20 +1,13 @@
-"""Deeplink suite orchestrator (use-case-specific top-level lifecycle).
-
-Makes the deeplink suite lifecycle explicit: split cases by the deterministic
-INSTALLED value, prepare the installed batch (login, one-time supported links,
-and per-License warm-up), and drive each case while COMPOSING the
-DeeplinkTestRunner for individual case execution, semantic judging, retry and
-reporting.
-"""
+"""Deeplink suite orchestration."""
 
 from __future__ import annotations
 
 from collections import defaultdict, deque
 from typing import Sequence, TYPE_CHECKING
 
-try:  # package-relative (python -m src.usecases.deeplink.orchestrator) vs top-level
+try:
     from ...apppilot import logtags
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from apppilot import logtags
 
 from .deeplink_testcase_loader import DeeplinkTestCase
@@ -27,49 +20,22 @@ from .results import (
     _startup_failed_result,
 )
 
-if TYPE_CHECKING:  # avoid an import cycle (runner.run imports the orchestrator)
+if TYPE_CHECKING:
     from .runner import DeeplinkTestRunner
 
 
 class _SupportedLinkPreparationError(Exception):
     """Installed-batch supported-link configuration failed."""
 
-
-# --------------------------------------------------------------------------- #
-# Suite orchestrator (explicit top-level lifecycle; composes the runner)
-# --------------------------------------------------------------------------- #
 class DeeplinkSuiteOrchestrator:
-    """Makes the deeplink suite lifecycle explicit and readable.
+    """Runs the deeplink suite lifecycle."""
 
-    It owns only the top-level flow - splitting cases by the deterministic
-    INSTALLED value, preparing the installed batch (login, one-time supported
-    links, and per-License warm-up), and driving each case while COMPOSING the
-    existing DeeplinkTestRunner for individual case execution, semantic
-    judging, retry behavior, and reporting. Nothing here duplicates the runner,
-    the shared login capability, the judge, the app installer, or
-    Maestro/Android behavior.
-
-        run()
-            -> INSTALLED batch: prepare_installed_batch() then run each case
-            -> UNINSTALLED cases: run each first-open case (no warm-up)
-            -> final SuiteReport
-    """
-
-    #: Canonical, human-readable name of the suite this orchestrator runs. The
-    #: orchestrator owns the suite's identity: it stamps every ``SuiteReport``
-    #: it produces with this name, and reporting / the email subject and header
-    #: derive their labels from it rather than hardcoding "Deeplink". A use case
-    #: may have several suites; each suite's orchestrator declares its own
-    #: ``SUITE_NAME``.
     SUITE_NAME = "Deeplink"
 
     def __init__(self, runner: "DeeplinkTestRunner") -> None:
         self._runner = runner
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
-        # INSTALLED is deterministic (from Excel); installed cases run as one
-        # batch (single login-if-needed + single warm-up), then each uninstalled
-        # first-open case runs independently.
         installed = [case for case in cases if case.installed]
         uninstalled = [case for case in cases if not case.installed]
 
@@ -78,12 +44,6 @@ class DeeplinkSuiteOrchestrator:
         logtags.trace(f"Installed cases: {len(installed)}", logtags.SUITE)
         logtags.trace(f"Uninstalled cases: {len(uninstalled)}", logtags.SUITE)
 
-        # One-time clean state: uninstall the app once at suite startup so every
-        # run begins deterministically. If this operational precondition fails
-        # (e.g. device offline / adb uninstall failure) no case can run safely,
-        # so record every case as a startup failure and return the report -
-        # never abort. The real reason is preserved (no false PASS) and final
-        # reporting/email still happen. Existing per-case semantics are unchanged.
         report = SuiteReport(suite_name=self.SUITE_NAME)
         try:
             try:
@@ -104,9 +64,6 @@ class DeeplinkSuiteOrchestrator:
             for case in uninstalled:
                 report.results.append(self.run_uninstalled_case(case))
             self._restore_workbook_order(report, cases)
-            # Only reached when the startup precondition held and cases executed; a
-            # setup failure is recorded above and returns early, so "Completed" is
-            # never misleading.
             logtags.trace("Completed", logtags.SUITE)
             return report
         finally:
@@ -127,10 +84,7 @@ class DeeplinkSuiteOrchestrator:
             logtags.trace("Installing local build", logtags.INSTALLED_BATCH)
             self._runner.install_local_build()
         except RuntimeError as exc:
-            # Operational install/launch/setup failure (includes
-            # AndroidOperationalError): record every case as a batch-setup failure
-            # and continue the suite so unrelated cases still run and the final
-            # report/email are still produced.
+
             logtags.trace(f"installed batch setup failed: {exc}", logtags.INSTALLED_BATCH)
             for case in cases:
                 logtags.trace(
@@ -176,7 +130,7 @@ class DeeplinkSuiteOrchestrator:
             )
             self._runner.open_installed_app()
             logtags.trace("Ensuring login", logtags.INSTALLED_BATCH)
-            if not self._runner.ensure_logged_in(representative):
+            if not self._ensure_installed_group_login(representative):
                 for case in group.cases:
                     report.results.append(_login_failed_result(case))
                 return False
@@ -195,7 +149,7 @@ class DeeplinkSuiteOrchestrator:
                 return prepared_supported_links
             self._runner.run_warm_up()
             self._runner.open_installed_app()
-            if not self._runner.ensure_logged_in(representative):
+            if not self._ensure_installed_group_login(representative):
                 for case in group.cases:
                     report.results.append(_login_failed_result(case))
                 return prepared_supported_links
@@ -210,6 +164,16 @@ class DeeplinkSuiteOrchestrator:
         for case in group.cases:
             report.results.append(self._runner.run_installed_case(case))
         return prepared_supported_links
+
+    def _ensure_installed_group_login(self, case: DeeplinkTestCase) -> bool:
+        if self._runner.ensure_logged_in(case):
+            return True
+        logtags.trace(
+            "Login preparation failed; relaunching app and retrying once",
+            logtags.INSTALLED_BATCH,
+        )
+        self._runner.open_installed_app()
+        return self._runner.ensure_logged_in(case)
 
     @staticmethod
     def _restore_workbook_order(
@@ -234,6 +198,4 @@ class DeeplinkSuiteOrchestrator:
         report.results = ordered
 
     def run_uninstalled_case(self, case: DeeplinkTestCase) -> TestCaseResult:
-        # First-open-after-install: NO warm-up. The runner preserves authenticated
-        # state only when the exact link can be replayed; otherwise retries rebuild.
         return self._runner.run_uninstalled_case(case)

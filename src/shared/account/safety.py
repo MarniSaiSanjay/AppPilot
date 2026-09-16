@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ...apppilot.models import Action, ActionKind, UIElement, UIObservation
 except ImportError:
     from apppilot.models import Action, ActionKind, UIElement, UIObservation

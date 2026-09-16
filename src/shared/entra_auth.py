@@ -98,12 +98,7 @@ def ensure_entra_model_readiness(
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
     verifier: Callable[[], None] = verify_entra_model_authentication,
 ) -> EntraReadiness:
-    """Check Entra model access and optionally perform a user-approved login.
-
-    The selected Azure subscription is deliberately never changed: model
-    inference needs an Entra token and resource RBAC, not a CLI default
-    subscription. The browser/device-code flow remains entirely Azure CLI's.
-    """
+    """Check Entra model access and optionally perform a user-approved login."""
     config = ChatModelClient.config_from_env(env)
     if not config or config["auth_mode"] != AUTH_ENTRA:
         return EntraReadiness(required=False, ready=True)
@@ -135,8 +130,6 @@ def ensure_entra_model_readiness(
     login_command = ["az", "login"]
     login_environment: dict[str, str] | None = None
     if tenant_id:
-        # Keep Azure CLI's subscription selector off for this login process only.
-        # AppPilot requires an Entra token, not a selected subscription.
         login_command.extend(["--tenant", tenant_id, "--output", "none"])
         login_environment = {
             **os.environ,

@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable
 from typing import Protocol
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ...apppilot.models import (
         Action,
         ActionKind,
@@ -147,9 +147,6 @@ class AndroidAccountSession:
             home, ("menu", "navigation menu", "open navigation")
         )
         if menu is None:
-            # The newer Copilot home replaces the hamburger menu with a bottom
-            # navigation "More" destination. It leads to the same account/profile
-            # entry used to switch the active account.
             menu = self._find_exact_text_control(home, ("more",))
         if menu is None:
             raise _NavigationError("home menu or More navigation is unavailable")
@@ -185,17 +182,12 @@ class AndroidAccountSession:
             for _ in range(2):
                 if overlay_control is not None:
                     break
-                # Android Settings can expose the page title before its switch
-                # has appeared in the accessibility hierarchy.
                 self._sleep(self._settle_seconds)
                 observation = self._observer.observe()
                 if not self._is_overlay_settings(observation):
                     return observation
                 overlay_control = self._find_overlay_switch(observation)
             if overlay_control is None:
-                # Permission state is not required to identify or verify the
-                # requested account. Leave Settings and let the existing
-                # account-sheet and final active-account checks decide.
                 self._execute(
                     observation,
                     Action(ActionKind.PRESS_BACK),

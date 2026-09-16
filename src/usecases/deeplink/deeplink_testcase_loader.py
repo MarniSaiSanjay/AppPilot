@@ -1,12 +1,4 @@
-"""Deeplink test-case model and Excel loader (use-case-specific).
-
-The Excel workbook is the source of truth for the deeplink suite: each data row
-becomes a ``DeeplinkTestCase``. The parser is intentionally tolerant of layout -
-it recognises a header row by name and maps columns accordingly, falling back to
-a fixed positional layout when no header is present. This schema (Deep Link,
-Expected Result, Installed, ...) is the Deeplink use case's own contract; the
-model never decides any of it.
-"""
+"""Deeplink Excel testcase loading."""
 
 from __future__ import annotations
 
@@ -20,25 +12,14 @@ from urllib.parse import urlsplit
 from .supported_links import SUPPORTED_LINK_DOMAINS
 
 
-# --------------------------------------------------------------------------- #
-# Test cases (Excel is the source of truth)
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class DeeplinkTestCase:
-    """One row of the Excel plus the deterministic INSTALLED selector.
-
-    ``user_type`` remains the stored field for compatibility with existing
-    callers and reports. The workbook's License value is exposed explicitly via
-    :attr:`license` for credential-profile selection.
-    """
+    """One deeplink testcase row."""
 
     test_id: str
     deep_link: str
     user_type: str
     expected_result: str
-    # Deterministic scenario selector from the Excel INSTALLED column. Absent or
-    # blank preserves the legacy contract (installed=True). The model NEVER
-    # decides this - it comes straight from the workbook.
     installed: bool = True
 
     @property
@@ -48,16 +29,9 @@ class DeeplinkTestCase:
 
 
 _SHEET_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
-# Relationship namespaces used to resolve the workbook's first worksheet part:
-# the r:id attribute on <sheet> and the package-relationship <Relationship>.
 _REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _PKG_REL_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
-# Fallback worksheet member, used only when the workbook relationships cannot be
-# resolved (e.g. a minimal package without workbook.xml). This preserves the
-# historical behavior for such inputs.
 _FALLBACK_SHEET = "xl/worksheets/sheet1.xml"
-# Positional fallback used only when no header row is recognised; otherwise
-# columns are mapped by header name (see _map_header).
 _COLUMNS = {
     "A": "test_id",
     "B": "deep_link",
@@ -65,9 +39,6 @@ _COLUMNS = {
     "D": "expected_result",
     "E": "installed",
 }
-# Header-name synonyms per logical field (casefolded, whitespace-collapsed).
-# Matching is substring-based and tolerant so real-world headers like
-# "Launch URL", "Expected Screen" or "License" map without exact-string coupling.
 _FIELD_SYNONYMS: dict[str, tuple[str, ...]] = {
     "test_id": ("test case id", "test id", "testid", "test case", "testcase", "case id"),
     "deep_link": ("launch url", "deep link", "deeplink", "launch link", "url", "link", "launch"),
@@ -92,9 +63,6 @@ _FIELD_DISPLAY = {
     "installed": "Installed",
 }
 _ALLOWED_SCHEMES = {"https"}
-# Deterministic signal (not model-driven) that a deeplink targets the genuine
-# first-open-after-install experience: the URL asks the app store to open on
-# load, which only makes sense when the app is not yet installed.
 _APP_STORE_ON_LOAD = "openappstoreonload=true"
 
 
@@ -111,9 +79,7 @@ def _parse_installed(raw: str) -> bool:
 
 
 def _derive_installed(deep_link: str) -> bool:
-    """Deterministically infer the INSTALLED scenario from the deeplink when the
-    workbook has no explicit INSTALLED column. A deeplink that routes to the app
-    store on load is a first-open-after-install (uninstalled) case."""
+    """Infer the installed scenario from the deeplink."""
     return _APP_STORE_ON_LOAD not in (deep_link or "").casefold()
 
 
@@ -122,9 +88,7 @@ def _normalize_label(text: str) -> str:
 
 
 def _field_match(label: str) -> tuple[str, int] | None:
-    """Map a header cell label to a logical field, preferring the most specific
-    (longest) synonym match so e.g. 'Expected Screen' maps to expected_result
-    rather than the shorter 'screen'."""
+    """Map a header cell label to a logical field."""
     norm = _normalize_label(label)
     if not norm:
         return None
@@ -158,15 +122,7 @@ def _column_letter(cell_ref: str) -> str:
 
 
 def _first_worksheet_member(archive: zipfile.ZipFile) -> str:
-    """Resolve the archive member holding the workbook's FIRST worksheet.
-
-    A valid ``.xlsx`` does not have to store its first sheet as
-    ``xl/worksheets/sheet1.xml``: the first ``<sheet>`` in ``xl/workbook.xml``
-    references a relationship id, which ``xl/_rels/workbook.xml.rels`` maps to
-    the actual worksheet part (which may be ``sheet2.xml`` etc.). Resolve it
-    through that metadata and fall back to ``sheet1.xml`` when the relationship
-    cannot be determined, so minimal/legacy packages keep working unchanged.
-    """
+    """Resolve the archive member for the first worksheet."""
     try:
         workbook = ET.fromstring(archive.read("xl/workbook.xml"))
         rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
@@ -184,8 +140,6 @@ def _first_worksheet_member(archive: zipfile.ZipFile) -> str:
             break
     if not target:
         return _FALLBACK_SHEET
-    # Relationship targets are relative to the workbook part (in ``xl/``); an
-    # absolute "/xl/..." target is relative to the package root.
     if target.startswith("/"):
         return target.lstrip("/")
     return posixpath.normpath(posixpath.join("xl", target))
@@ -231,9 +185,6 @@ def _row_cells(row: ET.Element, shared: list[str]) -> dict[str, str]:
 
 
 def _looks_like_data(cells: dict[str, str]) -> bool:
-    # A data row carries an actual deeplink (has a URL scheme); header/title rows
-    # do not. This cleanly separates the first data row from any leading
-    # title/header rows without depending on exact positions.
     return any("://" in value for value in cells.values())
 
 
@@ -242,8 +193,7 @@ def _map_header(
     *,
     row_number: int | None = None,
 ) -> dict[str, str]:
-    """Map header cells to logical fields: {column_letter: field}. Each field is
-    assigned at most once, preferring the strongest semantic match."""
+    """Map header cells to logical fields."""
     mapping: dict[str, str] = {}
     assigned: set[str] = set()
     deep_link_candidates: list[tuple[int, str]] = []
@@ -284,18 +234,7 @@ def _map_header(
 
 
 def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
-    """Load deeplink test cases from the Excel workbook (stdlib only).
-
-    The parser is intentionally tolerant of layout. It recognises a header row by
-    name (e.g. "Launch URL", "Expected Screen", "License") and maps columns
-    accordingly, so leading title rows, renamed/reordered columns and optional
-    extra columns are all handled. When no header is present it falls back to the
-    positional layout A=Test ID, B=Deep Link, C=User Type, D=Expected Result.
-
-    Every data row must provide a Test ID, a Deep Link, a License and an Expected
-    Result. The INSTALLED scenario is taken from an explicit INSTALLED column
-    when present, otherwise derived deterministically from the deeplink.
-    """
+    """Load deeplink test cases from an Excel workbook."""
     path = Path(path)
     with zipfile.ZipFile(path) as archive:
         shared = _read_shared_strings(archive)
@@ -303,11 +242,6 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
         try:
             sheet_bytes = archive.read(member)
         except KeyError as error:
-            # A valid ZIP/XLSX that lacks the resolved worksheet member (e.g. a
-            # non-workbook zip, or a workbook whose relationships point at a
-            # missing part). Surface a stable domain-level error instead of
-            # leaking zip-internal KeyError, so the CLI reports it cleanly
-            # (exit 2) rather than a traceback.
             raise ValueError(
                 f"{path} is not a readable deeplink workbook: expected worksheet "
                 f"'{member}' was not found"
@@ -324,8 +258,6 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
             row_number = int(raw_number) if raw_number.isdigit() else fallback_number
             rows.append((row_number, cells))
 
-    # Recognise a header among the leading non-data rows (title rows are simply
-    # ignored: they map too few fields to be a usable header).
     column_map = _COLUMNS
     data_start = 0
     header_row: int | None = None
@@ -338,7 +270,6 @@ def load_deeplink_cases(path: str | Path) -> list[DeeplinkTestCase]:
             column_map = candidate
             header_row = row_number
     else:
-        # No data row found (only title/header rows, or empty sheet).
         data_start = len(rows)
 
     if header_row is not None:

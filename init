@@ -1,6 +1,4 @@
 #!/bin/sh
-# Launch the AppPilot setup flow (a.k.a. /init) using a Python 3.11+ interpreter.
-# Usage: ./init [args...]
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 

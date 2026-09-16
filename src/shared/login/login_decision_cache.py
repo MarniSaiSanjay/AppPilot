@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ...apppilot.adaptive_decision_cache import AdaptiveDecisionCache
     from ...apppilot import logtags
     from ...apppilot.brain import (
@@ -26,12 +26,7 @@ _EMAIL = re.compile(r"\b[^@\s]+@[^@\s]+\.[^@\s]+\b")
 
 
 class LoginDecisionCache(AdaptiveDecisionCache):
-    """Add login controls and credential sequencing to generic replay.
-
-    Seeded decisions cover only unique, unambiguous controls. Model decisions
-    are learned and replayed by ``AdaptiveDecisionCache`` only after the
-    complete login run succeeds.
-    """
+    """Add login controls and credential sequencing to generic replay."""
 
     def __init__(
         self,

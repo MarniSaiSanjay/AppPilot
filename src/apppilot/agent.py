@@ -28,23 +28,10 @@ from .models import (
 from .safety import SafetyValidator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Safety bound on the number of actions per run, to prevent an infinite agent
-# loop. Configurable via --max-actions or the APPPILOT_MAX_ACTIONS env var; this
-# is only the fallback default.
 DEFAULT_MAX_ACTIONS = 30
-# Stop with a controlled FAIL after this many actions without a meaningful UI
-# change. Configurable via --max-stuck-actions or APPPILOT_MAX_STUCK_ACTIONS.
 DEFAULT_MAX_STUCK_ACTIONS = 5
-# Generic loading/transition handling: when the goal is not reached AND the
-# screen exposes no actionable UI (a transient loading/sync state), the agent
-# waits this long and re-observes instead of asking the Brain to invent an
-# action. Bounded by DEFAULT_MAX_NONACTIONABLE_WAITS so it can never loop
-# forever. These are deliberately generic (no string/coordinate detection).
 DEFAULT_NONACTIONABLE_WAIT_SECONDS = 2.0
 DEFAULT_MAX_NONACTIONABLE_WAITS = 10
-# A completely empty hierarchy after credential submission is a narrower
-# failure mode than general app loading. Recover sooner instead of spending the
-# full generic wait budget on a stalled authentication WebView.
 DEFAULT_MAX_POST_SUBMIT_EMPTY_OBSERVATIONS = 5
 _T = TypeVar("_T")
 
@@ -90,14 +77,7 @@ class AppPilotAgent:
         self._sleep = sleep
         self._nonactionable_wait_seconds = nonactionable_wait_seconds
         self._max_nonactionable_waits = max_nonactionable_waits
-        # Optional domain gate: returns True only when the observation presents a
-        # genuine actionable step for THIS flow, so an incidental control (e.g. a
-        # "Terms of use" link on a loading splash) is not mistaken for one. When
-        # None, any non-Back action counts as actionable.
         self._actionable_step_check = actionable_step_check
-        # Optional subsystem tag (e.g. "LOGIN") prefixed to every emitted line so
-        # the trace is greppable and this run's PASS is never read as a whole test
-        # case passing. Empty => untagged lines (generic reuse).
         self._log_tag = log_tag
         self._timing_enabled = os.environ.get("APPPILOT_TIMING") == "1"
         self._last_failure_reason: str | None = None
@@ -159,17 +139,10 @@ class AppPilotAgent:
         self._emit(f"MAX STUCK ACTIONS:\n{self._max_stuck_actions}\n")
 
         history: list[str] = []
-        # Track the last credential we entered and the screen it was entered on,
-        # to avoid re-entering the same credential when the UI has not changed.
         last_credential_key: tuple[str, str] | None = None
         last_credential_fingerprint: tuple | None = None
-        # Credentials already entered on the current (unchanged) screen. Their
-        # input actions are withheld from the model until the screen changes, so
-        # it advances to submit instead of re-typing a field that looks empty (a
-        # password box never echoes its value, so the screen appears unchanged).
         filled_credential_keys: set[tuple[str, str]] = set()
         filled_fingerprint: tuple | None = None
-        # Track consecutive actions that leave the meaningful UI unchanged.
         last_acted_fingerprint: tuple | None = None
         consecutive_stuck = 0
         pending_fast_submit_fingerprint: tuple | None = None
@@ -316,10 +289,6 @@ class AppPilotAgent:
                 self._log_fail(failure_reason)
                 return False
 
-            # Loading/transition invariant: when the goal is not reached and no
-            # actionable step exists, wait and re-observe (never invent an action
-            # or a diagnostic Back) until a step appears, the goal is reached, or
-            # the wait budget is exhausted.
             available_actions, filled_fingerprint = self._offer_actions(
                 observation, filled_credential_keys, filled_fingerprint
             )
@@ -417,9 +386,6 @@ class AppPilotAgent:
                 pending_fast_submit_identity = None
             pending_fast_submit_waits = 0
 
-            # Advance the stuck counter when the last action left the meaningful
-            # UI unchanged; a meaningful change resets it. Only counts once an
-            # action has been taken (last_acted_fingerprint is set).
             meaningful_fingerprint = self._meaningful_fingerprint(observation)
             if last_acted_fingerprint is not None:
                 if meaningful_fingerprint == last_acted_fingerprint:
@@ -446,7 +412,6 @@ class AppPilotAgent:
                     step=step, max_steps=self._max_actions, history=tuple(history)
                 ),
             )
-            # The model is the decision-maker; the agent only asks and validates.
             decision = self._timed_call(
                 "decision",
                 lambda: self._decision_provider.decide(request),
@@ -496,9 +461,6 @@ class AppPilotAgent:
                 return False
             self._emit("SAFETY VALIDATION:\npassed\n")
 
-            # Resolve any requested credential locally, after safety validation.
-            # The secret value is never printed and never leaves this scope
-            # except to be handed directly to the local Android executor.
             secret: str | None = None
             action = current_action
             if action.credential_kind is not None:
@@ -513,9 +475,6 @@ class AppPilotAgent:
                     )
                     return False
 
-                # Guard against re-entering the same credential on an unchanged
-                # screen (prevents redundant entry loops). The model remains the
-                # decision-maker; this is only a safety guard, not a login step.
                 credential_key = self._credential_field_key(action, observation)
                 fingerprint = self._observation_fingerprint(observation)
                 if (
@@ -572,18 +531,11 @@ class AppPilotAgent:
             if callable(record_executed):
                 record_executed(action)
             if action.credential_kind is not None:
-                # Withhold this field's input next turn (until the meaningful UI
-                # changes) so the model proceeds to submit rather than re-typing
-                # it. Set the withhold baseline from the observation we actually
-                # acted on (fresh_observation, post-reobserve/rebind), not the
-                # pre-reobserve one, so next turn compares against the right
-                # screen. ``meaningful_fingerprint`` is that observation's.
                 filled_credential_keys.add(
                     self._credential_field_key(action, observation)
                 )
                 filled_fingerprint = meaningful_fingerprint
             history.append(action.describe(observation))
-            # Remember the state we just acted on, to detect progress next step.
             last_acted_fingerprint = meaningful_fingerprint
             if (
                 not decision.reobserve_required
@@ -746,20 +698,7 @@ class AppPilotAgent:
         observation,
         available_actions,
     ) -> bool:
-        """Whether the agent should act now, or wait/re-observe instead.
-
-        Two conditions must hold:
-
-        1. The observation exposes at least one non-Back action (otherwise the
-           screen is a blank/loading state - only the global Back is available).
-        2. If a domain ``actionable_step_check`` was injected, it must also agree
-           this screen presents a genuine step for the current flow. This is what
-           stops a transient "loading accounts" splash - which happens to carry an
-           incidental clickable "Terms of use" link - from being treated as
-           actionable and handed to the Brain, where the model would otherwise
-           choose a diagnostic Back because no login/onboarding control is visible
-           yet. When the check is absent, behaviour is the purely generic rule.
-        """
+        """Return whether the observation presents an actionable step."""
         if not self._has_actionable_ui(available_actions):
             return False
         if self._actionable_step_check is not None:
@@ -787,18 +726,7 @@ class AppPilotAgent:
         original: UIObservation,
         fresh: UIObservation,
     ) -> "Action | None":
-        """Return the decision retargeted to the fresh pre-action observation,
-        or None if the screen meaningfully changed / the target is unresolvable.
-
-        ``element_id`` is a positional handle over the raw view hierarchy: the
-        top-level window ORDER can differ between two observations of the SAME
-        screen, so an identical control may carry a different id each observe
-        (seen as e:0.1.* one observe, e:0.0.* the next). Re-locating the target
-        by its stable identity - resource id, selector text and interaction
-        traits - keeps an otherwise-current decision from being thrown away as
-        "stale", and rebinds it to the id that exists NOW so the executor taps
-        the right node instead of failing to find a phantom id.
-        """
+        """Retarget a decision to a fresh observation."""
         if cls._meaningful_fingerprint(original) != cls._meaningful_fingerprint(
             fresh
         ):
@@ -822,10 +750,7 @@ class AppPilotAgent:
 
     @staticmethod
     def _target_identity(element: UIElement) -> tuple:
-        """Stable, position-independent signature identifying a target element.
-
-        Excludes ``element_id`` (a volatile hierarchy path) on purpose so the
-        same control matches across a window-order reshuffle."""
+        """Return a stable target-element signature."""
         return (
             element.resource_id,
             element.selector_text,
@@ -842,11 +767,7 @@ class AppPilotAgent:
     def _relocate_target(
         cls, original_target: UIElement, fresh: UIObservation
     ) -> "UIElement | None":
-        """Find the same target in ``fresh`` by stable identity.
-
-        Requires a UNIQUE identity match: if the trait signature is ambiguous
-        (or absent) in the fresh observation, return None so the decision is
-        treated as stale rather than risk tapping the wrong element."""
+        """Find the same target in a fresh observation."""
         identity = cls._target_identity(original_target)
         matches = [
             element
@@ -859,25 +780,14 @@ class AppPilotAgent:
 
     @staticmethod
     def _has_actionable_ui(available_actions) -> bool:
-        """True if any available action targets a UI element (not just Back).
-
-        SafetyValidator.available_actions always appends a single global
-        PRESS_BACK. A result containing ONLY that means the observation exposed
-        no actionable element - a blank/loading/transition screen - and the
-        Brain must not be asked to invent an action against it.
-        """
+        """Return whether any available action targets a UI element."""
         return any(
             action.kind != ActionKind.PRESS_BACK for action in available_actions
         )
 
     @staticmethod
     def _observation_fingerprint(observation: UIObservation) -> tuple:
-        """A stable signature of the screen using non-secret element traits.
-
-        Credential-field values are already redacted by the observer, so this
-        never incorporates a secret. Used to detect whether the UI meaningfully
-        changed between steps.
-        """
+        """Return a stable screen signature."""
         return tuple(
             (
                 element.resource_id,
@@ -891,19 +801,7 @@ class AppPilotAgent:
 
     @staticmethod
     def _meaningful_fingerprint(observation: UIObservation) -> "Counter":
-        """An order-independent signature of the meaningful UI state.
-
-        Non-secret, like ``_observation_fingerprint``, but limited to elements
-        with a resource id or that are interactive (clickable/input). Decorative,
-        id-less, non-interactive text (volatile clocks/animation) is excluded, so
-        such noise does not reset the stuck counter.
-
-        Returned as a multiset (``Counter``) rather than an ordered tuple so a
-        pure re-ordering of the same windows/elements - which can happen between
-        two observations of the SAME screen (see ``_rebind_current_action``) - is
-        NOT treated as a change, while any genuine add/remove/trait change still
-        is (multiplicity is preserved).
-        """
+        """Return an order-independent signature of the meaningful UI state."""
         return Counter(
             (
                 element.resource_id,
@@ -917,20 +815,7 @@ class AppPilotAgent:
         )
 
     def _offer_actions(self, observation, filled_keys, filled_fingerprint):
-        """Safe actions for this screen, withholding already-entered credential
-        fields until that credential field leaves the UI.
-
-        A credential input whose field was already filled on this same screen is
-        removed, so the model advances to submit instead of re-typing a field
-        that still looks empty. Credential memory follows the stable field key
-        itself rather than the whole-screen fingerprint: transient Android
-        overlays such as Autofill can appear/disappear without making the
-        password field new. A key is forgotten only after its field is absent,
-        so returning to a later password screen can legitimately enter it again.
-        Withholding is skipped if it would leave no actionable (non-Back) step,
-        so the agent is never stranded on a screen whose only action was the
-        already-entered field.
-        """
+        """Return safe actions for the current screen."""
         current_fingerprint = self._meaningful_fingerprint(observation)
         actions = self._safety_validator.available_actions(observation)
         present_credential_keys = {
@@ -957,12 +842,7 @@ class AppPilotAgent:
 
     @staticmethod
     def _credential_field_key(action, observation) -> tuple[str, str]:
-        """Stable per-field key for a credential input.
-
-        Keyed on the field's resource id (stable across identical re-renders,
-        unlike the element path, which can shift), so an entered field is
-        recognised again on the unchanged screen.
-        """
+        """Return a stable per-field key for a credential input."""
         target = observation.find(action.target_id)
         field_id = (
             target.resource_id
@@ -974,16 +854,7 @@ class AppPilotAgent:
 
 
 def _default_max_actions() -> int:
-    """Resolve the default action bound from the environment, else the constant.
-
-    Only a POSITIVE integer is a meaningful bound. A non-positive value (0 or
-    negative) is invalid config - like a non-integer - and falls back to the
-    default rather than reaching the agent: a negative bound makes the action
-    loop run zero times and crash (``range(max_actions + 1)`` is empty ->
-    ``AssertionError``), and a zero bound makes every run fail immediately. The
-    explicit ``--max-actions`` CLI flag still hard-errors on ``< 1`` at its own
-    boundary; this only governs the env-derived default.
-    """
+    """Resolve the default action bound."""
     raw = os.environ.get("APPPILOT_MAX_ACTIONS")
     if raw:
         try:
@@ -997,11 +868,7 @@ def _default_max_actions() -> int:
 
 
 def _default_max_stuck_actions() -> int:
-    """Resolve the stuck bound from the environment, else the constant.
-
-    Precedence: --max-stuck-actions -> APPPILOT_MAX_STUCK_ACTIONS -> constant;
-    invalid environment values fall back safely.
-    """
+    """Resolve the stuck bound."""
     raw = os.environ.get("APPPILOT_MAX_STUCK_ACTIONS")
     if raw:
         try:
@@ -1013,12 +880,7 @@ def _default_max_stuck_actions() -> int:
 
 
 def _load_dotenv(path: Path | None = None) -> None:
-    """Load KEY=VALUE pairs from a local .env into os.environ, if present.
-
-    Existing environment variables always win, so real env/CI values are never
-    overridden. No secret is hardcoded here; the file is git-ignored and only
-    read at runtime. Lines that are blank or start with '#' are ignored.
-    """
+    """Load KEY=VALUE pairs from a local .env into os.environ."""
     env_path = path or (REPO_ROOT / ".env")
     try:
         raw = env_path.read_text(encoding="utf-8")
@@ -1033,12 +895,6 @@ def _load_dotenv(path: Path | None = None) -> None:
         if key.startswith("export "):
             key = key[len("export ") :].strip()
         value = value.strip()
-        # Strip at most ONE matching surrounding quote pair (both ends the same
-        # quote char). The previous greedy ``.strip('"').strip("'")`` removed any
-        # number of both quote types from both ends, corrupting values whose
-        # content legitimately begins/ends with the other quote (e.g.
-        # ``"abc'"`` -> ``abc`` or ``"'x'"`` -> ``x``). Whitespace inside the
-        # quotes is preserved; an unquoted value keeps its own quote characters.
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
             value = value[1:-1]
         if key and key not in os.environ:

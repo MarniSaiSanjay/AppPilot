@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ...apppilot.android import MaestroExecutor
     from ...shared.warmup import (
         DEFAULT_WARM_UP_SETTLE_SECONDS,

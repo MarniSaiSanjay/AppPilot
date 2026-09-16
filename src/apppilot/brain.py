@@ -8,7 +8,7 @@ from typing import Callable, Protocol
 
 from .models import Action, ActionKind, CredentialKind, ExecutionContext, UIObservation
 
-try:  # package-relative vs top-level (src on sys.path)
+try:
     from ..shared.model_client import ChatModelClient, ModelTransportError
 except ImportError:
     from shared.model_client import ChatModelClient, ModelTransportError
@@ -16,11 +16,7 @@ except ImportError:
 
 @dataclass(frozen=True)
 class DecisionRequest:
-    """Everything the decision model is given for a single step.
-
-    The model chooses from ``available_actions`` only, so it can never invent an
-    element that is not present in ``observation``.
-    """
+    """Decision-model input for a single step."""
 
     goal: str
     guidance: str | None
@@ -32,11 +28,7 @@ class DecisionRequest:
 
 @dataclass(frozen=True)
 class ModelDecision:
-    """The model's structured answer: one safe UI action, or cannot proceed.
-
-    ``action is None`` means the model decided it cannot safely proceed. The
-    model never executes anything; the agent validates and executes.
-    """
+    """Model decision for one UI step."""
 
     action: Action | None
     reason: str
@@ -45,17 +37,14 @@ class ModelDecision:
 
 
 class ModelDecisionProvider(Protocol):
-    """Boundary for a real, model-backed decision maker: turns a
-    :class:`DecisionRequest` into a :class:`ModelDecision`. The concrete model is
-    chosen via configuration so the agent loop never depends on a provider."""
+    """Decision-provider boundary."""
 
     def decide(self, request: DecisionRequest) -> ModelDecision:
         ...
 
 
 class UnconfiguredModelDecisionProvider:
-    """Placeholder used when no model is configured: every request returns
-    "cannot safely proceed", so the agent loop runs without guessing."""
+    """Decision provider used when no model is configured."""
 
     def __init__(self, detail: str) -> None:
         self._detail = detail
@@ -69,17 +58,7 @@ class UnconfiguredModelDecisionProvider:
 
 
 class LLMModelDecisionProvider:
-    """Model-backed decision provider using an OpenAI-compatible chat API.
-
-    Endpoint, model, and authentication come from the environment:
-    - ``APPPILOT_MODEL``          (required, e.g. "gpt-4o-mini")
-    - ``APPPILOT_MODEL_AUTH``     (optional: ``api_key`` or ``entra``)
-    - ``APPPILOT_MODEL_API_KEY``  (required only for ``api_key``)
-    - ``APPPILOT_MODEL_BASE_URL`` (optional, defaults to the OpenAI v1 endpoint)
-
-    The model selects only from the safe actions in the request, so it can never
-    invent an off-screen element. The HTTP call is isolated in ``transport``.
-    """
+    """Model-backed decision provider."""
 
     _SYSTEM_PROMPT = (
         "You are AppPilot, a goal-driven decision model that drives real Android "
@@ -246,8 +225,6 @@ class LLMModelDecisionProvider:
                             f"a {chosen.credential_kind.value} field."
                         ),
                     )
-                # Keep credential_kind; input_text stays None so the model never
-                # sees or produces the secret. The agent resolves it locally.
             else:
                 text = decoded.get("text")
                 if not isinstance(text, str) or not text:
@@ -290,7 +267,6 @@ class LLMModelDecisionProvider:
         label = target.label if target else action.target_id
         if action.kind == ActionKind.INPUT_TEXT:
             if action.credential_kind is not None:
-                # Safe descriptor only; never expose the field's live value.
                 descriptor = (
                     (target.resource_id or target.hint_text or action.target_id)
                     if target is not None

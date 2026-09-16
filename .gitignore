@@ -10,20 +10,14 @@ venv/
 .env.*
 *.key
 
-# Office temporary lock files
 ~$*
 
-# Regression workbook contains local test credentials; keep it out of git
 testcases/regressions/*.xlsx
 
-# Locally remembered email recipient (never commit)
 .apppilot_recipient
 
-# Locally remembered APK path (never commit)
 .apppilot_apk
 
-# Locally remembered device serial selected during /init (never commit)
 .apppilot_device
 
-# Run-scoped sanitized failure evidence
 .apppilot_artifacts/

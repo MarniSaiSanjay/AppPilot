@@ -1,27 +1,18 @@
-"""Shared, use-case-agnostic app warm-up capability.
-
-A generic first-install preparation node: launch the app a few times so its
-feature/config gates and initialization are fetched, then leave it stopped. It
-knows nothing about Login, Deeplink, FRI, or any use case - only how to exercise
-the app through the generic Maestro executor. WHEN to run it (e.g. once per
-installed batch, never on retry) is scheduling owned by the calling use case.
-"""
+"""Shared app warm-up capability."""
 
 from __future__ import annotations
 
 import time
 from typing import Callable, Protocol
 
-try:  # package-relative (python -m src.shared.warmup) vs top-level
+try:
     from ..apppilot.android import MaestroExecutor
     from ..apppilot import logtags
-except ImportError:  # top-level (src on sys.path, e.g. via the compat shim)
+except ImportError:
     from apppilot.android import MaestroExecutor
     from apppilot import logtags
 
-# Default per-cycle settle after a launch before stopping the app.
 DEFAULT_WARM_UP_SETTLE_SECONDS = 3.0
-# Default number of launch/settle/stop cycles.
 DEFAULT_WARM_UP_LAUNCHES = 3
 
 
@@ -31,11 +22,7 @@ class WarmUp(Protocol):
 
 
 class MaestroWarmUp:
-    """Default first-install warm-up: launch the app a few times so its
-    feature/config gates and initialization are fetched. Deterministic; the
-    caller decides when to run it (e.g. once before a batch) and it is NOT
-    repeated for per-case retries.
-    """
+    """Default first-install warm-up."""
 
     def __init__(
         self,

@@ -1,16 +1,4 @@
-"""AppPilot setup / readiness command (``/init``).
-
-Framework-level, use-case-agnostic onboarding: probes prerequisites and model
-configuration, collects every result, and finishes with a single readiness
-summary. This module must never import from ``usecases/``.
-
-The file is organised into clearly separated sections (result models, the
-individual check groups, the readiness summary, and the CLI). Generic, reusable
-system probing lives separately in :mod:`apppilot.environment`.
-
-Phase 1 scope: environment prerequisites (Python, adb, Maestro, Java) and model
-configuration. Device, APK and email setup are now integrated.
-"""
+"""AppPilot setup / readiness command."""
 
 from __future__ import annotations
 
@@ -34,31 +22,25 @@ from . import (
     environment,
 )
 
-# `.agent` resolves within the top package in both import styles
-# (`apppilot.agent` and `src.apppilot.agent`).
 from .agent import _load_dotenv
 try:
     from ..shared.entra_auth import ensure_entra_model_readiness
 except ImportError:
     from shared.entra_auth import ensure_entra_model_readiness  # type: ignore[no-redef]
 
-try:  # `python -m src.apppilot_init` -> package is `src.apppilot`
+try:
     from ..shared.model_client import (
         ChatModelClient,
         ModelConfigurationError,
         validate_base_url,
     )
-except ImportError:  # `python3 src/apppilot_init.py` -> `src` is on sys.path
+except ImportError:
     from shared.model_client import (  # type: ignore[no-redef]
         ChatModelClient,
         ModelConfigurationError,
         validate_base_url,
     )
 
-
-# =============================================================================
-# Result Models
-# =============================================================================
 
 class Importance(enum.Enum):
     """How much a check matters to overall readiness."""
@@ -80,12 +62,7 @@ class Status(enum.Enum):
 
 @dataclass(frozen=True)
 class CheckResult:
-    """A single readiness finding.
-
-    ``detail`` is the full human-readable line rendered after the status symbol
-    (it already embeds the item name). ``remediation``, when set, is surfaced in
-    the summary's "Required actions" list for blocking failures.
-    """
+    """A single readiness finding."""
 
     name: str
     group: str
@@ -101,10 +78,6 @@ _DEVICE = "Android Device"
 _APK = "APK"
 _EMAIL = "Email"
 
-
-# =============================================================================
-# Environment Checks
-# =============================================================================
 
 _MIN_PYTHON = (3, 11)
 
@@ -136,11 +109,7 @@ def _check_required_tool(
     which,
     runner,
 ) -> CheckResult:
-    """Shared logic for a REQUIRED PATH tool (adb, Maestro).
-
-    Missing -> FAIL (blocking). Present with a version -> PASS. Present but the
-    version could not be read -> WARNING (usable, non-blocking).
-    """
+    """Check a required PATH tool."""
     probe = environment.probe_executable(
         name, version_args, which=which, runner=runner,
     )
@@ -188,7 +157,7 @@ def check_maestro(*, which=None, runner=None) -> CheckResult:
 
 
 def check_java(*, which=None, runner=None) -> CheckResult:
-    """Verify Java 17+ availability because Maestro requires it."""
+    """Verify Java 17+ availability."""
     which = which or shutil.which
     if not which("java"):
         return CheckResult(
@@ -266,19 +235,8 @@ def check_apk_tools(
     )
 
 
-# =============================================================================
-# Model Checks
-# =============================================================================
-
 def _model_config_problem(config: Mapping[str, str]) -> Optional[str]:
-    """Return a human-readable reason the model config is unusable, else None.
-
-    Purely syntactic and offline: it verifies the values are well-formed enough
-    to be usable - never contacting the endpoint, sending a prompt, or consuming
-    tokens. ``config_from_env`` checks the selected authentication mode and
-    required values, while this function rejects whitespace-only values. Secret
-    values are inspected but never echoed.
-    """
+    """Return a human-readable reason the model config is unusable."""
     if not config["model"].strip():
         return "APPPILOT_MODEL is blank"
     if config["auth_mode"] == "api_key" and not config["api_key"].strip():
@@ -291,14 +249,7 @@ def _model_config_problem(config: Mapping[str, str]) -> Optional[str]:
 
 
 def check_model(env: Optional[Mapping[str, str]] = None) -> CheckResult:
-    """Verify model configuration is present and well-formed (REQUIRED).
-
-    Reuses :meth:`ChatModelClient.config_from_env`. Reads only the model *name*
-    for display - the API key is never included in the result. This is a
-    configuration/readiness check, not a health check: it confirms the values
-    are present and syntactically usable, but does NOT contact the model
-    endpoint or consume tokens, so ``PASS`` means "configured", not "reachable".
-    """
+    """Verify model configuration is present and well-formed."""
     source = os.environ if env is None else env
     try:
         config = ChatModelClient.config_from_env(source)
@@ -349,7 +300,6 @@ def check_entra_model_authentication(
             output=output,
         )
     except ModelConfigurationError:
-        # check_model() owns configuration diagnostics in the readiness report.
         return None
     if not readiness.required:
         return None
@@ -371,22 +321,12 @@ def check_entra_model_authentication(
     )
 
 
-# =============================================================================
-# Device Setup
-# =============================================================================
-#
-# Interactive discovery/validation of the Android execution environment
-# (physical device or emulator). Orchestration + UX only; the generic device
-# capability lives in :mod:`apppilot.device`. Selection is for this run only -
-# nothing is persisted and the runtime ``--device`` contract is unchanged.
-
 _RUN_TARGET_PROMPT = (
     "How would you like to run AppPilot?\n\n"
     "  1. Physical Android device\n"
     "  2. Android Emulator\n"
 )
 
-# Exact approved copy shown when the emulator path finds no AVD.
 _NO_AVD_MESSAGE = (
     "✗ No Android Emulator is configured.\n\n"
     "Please create an Android Virtual Device using Android Studio.\n\n"
@@ -403,10 +343,6 @@ def _device_result(
     importance: Importance = Importance.REQUIRED,
     serial: Optional[str] = None,
 ) -> CheckResult:
-    # A PASS carries the resolved, already-validated (authorized + booted) serial,
-    # which is persisted here so normal runtime can reuse the /init selection.
-    # FAIL/SKIPPED paths pass no serial, so a bad device never overwrites a good
-    # saved one. Persistence is best-effort and never blocks readiness.
     if status == Status.PASS and serial:
         device_config.save_device(serial)
     return CheckResult(name, _DEVICE, importance, status, detail, remediation)
@@ -643,11 +579,7 @@ def _setup_emulator(
 
 
 def _setup_device_noninteractive(*, runner, timeout: float) -> List[CheckResult]:
-    """Auto-detect without prompting or starting anything (non-interactive).
-
-    Never asks physical-vs-emulator and never starts an emulator; reports the
-    first authorized, booted device or a clear not-ready action.
-    """
+    """Auto-detect a device without prompting."""
     devices = device.list_adb_devices(runner=runner, timeout=timeout)
     for d in devices:
         if d.is_authorized and device.is_boot_completed(
@@ -680,12 +612,7 @@ def setup_device(
     sleep=time.sleep,
     which=None,
 ) -> List[CheckResult]:
-    """Run the Android device readiness setup and return its check results.
-
-    Collect-all: always returns results (never raises for a device problem).
-    When adb itself is unavailable, device checks are SKIPPED (non-blocking) -
-    adb's own REQUIRED failure already owns that remediation.
-    """
+    """Run Android device readiness setup."""
     runner = runner or subprocess.run
     which = which or shutil.which
     if not adb_available:
@@ -707,18 +634,6 @@ def setup_device(
     )
 
 
-# =============================================================================
-# APK Configuration
-# =============================================================================
-#
-# Readiness wrapper around the existing generic APK capability
-# (:mod:`apppilot.apk_config`). ``resolve_apk_path`` is the single APK
-# mechanism - it owns validation, the bracketed-default interactive prompt, and
-# persistence of the last good path. This section only maps its result onto a
-# ``CheckResult`` for the readiness summary; it adds no new prompting,
-# persistence, or validation.
-
-
 def check_apk(
     *,
     interactive: bool,
@@ -728,22 +643,11 @@ def check_apk(
     env: Optional[Mapping[str, str]] = None,
     guard_factory: Callable = apk_trust.ApkTrustGuard,
 ) -> CheckResult:
-    """Resolve/validate the local APK and map it to a REQUIRED readiness check.
-
-    Reuses :func:`apppilot.apk_config.resolve_apk_path` exactly: interactive runs
-    get the ``APK path [<saved>]:`` prompt + persistence, non-interactive runs
-    reuse a saved, still-valid path only. In non-interactive mode the resolver's
-    runtime-flavoured inline messages are suppressed so the readiness summary
-    owns the user-facing remediation.
-
-    Collect-all: never raises. ``resolve_apk_path`` is already exception-safe,
-    but any unexpected error is defensively turned into a clean REQUIRED FAIL so
-    every other check still reports.
-    """
+    """Resolve/validate the local APK and map it to a readiness check."""
     sink = output if interactive else (lambda _message: None)
     try:
         path = resolve(None, interactive=interactive, input_fn=input_fn, output=sink)
-    except Exception:  # defensive collect-all guard; never surface a traceback
+    except Exception:
         path = None
     if path is None:
         return CheckResult(
@@ -771,23 +675,8 @@ def check_apk(
     )
 
 
-# =============================================================================
-# Email Configuration
-# =============================================================================
-#
-# Optional readiness wrapper around the existing generic email capability
-# (:mod:`apppilot.email_delivery`). ``configure_recipient`` is the single,
-# shared recipient mechanism - it owns the saved-recipient store, validation,
-# the bracketed-default prompt, Enter-keeps/replace behaviour and EOF/Ctrl-C
-# handling (the same helper the normal-run send flow uses). This section only
-# gates it behind an opt-in question and maps the outcome onto an OPTIONAL
-# ``CheckResult``. It NEVER sends an email or makes a network request, and email
-# never blocks readiness. Missing relay config is surfaced as a non-blocking
-# WARNING reporting only the missing key NAMES (never any secret value).
-
-
 def _email_result(recipient: Optional[str], env: Mapping[str, str]) -> CheckResult:
-    """Map a resolved recipient (+ relay config presence) to an OPTIONAL result."""
+    """Map recipient and relay config to an email readiness result."""
     if recipient is None:
         return CheckResult(
             "email", _EMAIL, Importance.OPTIONAL, Status.NOT_CONFIGURED,
@@ -815,29 +704,13 @@ def check_email(
     configure: Callable = email_delivery.configure_recipient,
     load_saved: Callable[[], Optional[str]] = email_delivery._load_saved_recipient,
 ) -> CheckResult:
-    """Optionally configure email reporting and map it to an OPTIONAL check.
-
-    Email is never REQUIRED, so it can never make ``/init`` NOT ready. When a
-    recipient was saved on a previous run it is offered as the default straight
-    away (Enter keeps it) - matching ``./run`` - so the saved address is never
-    silently skipped. Only when nothing is saved does the interactive run first
-    ask ``Configure email reporting? [y/N]`` (default No). Non-interactive runs
-    never prompt and simply reuse a saved recipient if one exists. ``/init``
-    NEVER sends an email or contacts the relay - it only inspects local config.
-
-    Collect-all: never raises on error - any unexpected failure becomes a clean
-    OPTIONAL "not configured" result so every other check still reports. A
-    genuine Ctrl-C (KeyboardInterrupt) is NOT swallowed here; it propagates so
-    ``/init`` aborts consistently instead of reporting a misleading result.
-    """
+    """Optionally configure email reporting."""
     resolved_env = os.environ if env is None else env
     try:
         if not interactive:
             outcome = configure(interactive=False)
             return _email_result(outcome.recipient, resolved_env)
 
-        # With no saved recipient, gate behind a y/N so fresh setups can decline;
-        # with one saved, skip the gate and let ``configure`` offer it as default.
         if load_saved() is None and not _prompt_yes_no(
             "Configure email reporting?",
             default=False,
@@ -860,23 +733,12 @@ def check_email(
             )
         return _email_result(outcome.recipient, resolved_env)
     except Exception:
-        # Collect-all for ERRORS only: an email-config failure becomes a clean
-        # OPTIONAL "not configured" so every other check still reports. A genuine
-        # Ctrl-C (KeyboardInterrupt) is intentionally NOT caught here - it
-        # propagates to main()'s handler so /init aborts ("Aborted." / exit 130)
-        # instead of being silently turned into a "not configured, ready" result.
         return CheckResult(
             "email", _EMAIL, Importance.OPTIONAL, Status.NOT_CONFIGURED,
             "Email not configured (optional)",
         )
 
 
-# =============================================================================
-# Readiness Summary
-# =============================================================================
-
-# Status symbols (design-approved):
-#   ✓ pass   ✗ required missing   ○ optional/informational   ! warning/degraded
 _PASS = "✓"
 _FAIL = "✗"
 _INFO = "○"
@@ -902,11 +764,7 @@ def _symbol(result: CheckResult) -> str:
 
 
 def _blocks_readiness(result: CheckResult) -> bool:
-    """A check blocks readiness only if it is REQUIRED and failed/unconfigured.
-
-    A REQUIRED tool that is present but version-unknown (WARNING) is usable and
-    does not block. OPTIONAL/INFORMATIONAL items never block.
-    """
+    """Return whether a check blocks readiness."""
     return (
         result.importance == Importance.REQUIRED
         and result.status in (Status.FAIL, Status.NOT_CONFIGURED)
@@ -923,10 +781,7 @@ def _ordered_groups(results: Sequence[CheckResult]) -> List[str]:
 
 
 def render(results: Sequence[CheckResult]) -> Tuple[str, int]:
-    """Render the readiness summary and return ``(text, exit_code)``.
-
-    ``exit_code`` is 0 when every REQUIRED check passes, otherwise 1.
-    """
+    """Render the readiness summary and return ``(text, exit_code)``."""
     lines: List[str] = ["AppPilot Setup", ""]
 
     for group in _ordered_groups(results):
@@ -955,10 +810,6 @@ def render(results: Sequence[CheckResult]) -> Tuple[str, int]:
     return "\n".join(lines), 1
 
 
-# =============================================================================
-# CLI
-# =============================================================================
-
 _DESCRIPTION = (
     "Check whether this machine is ready to run AppPilot and print a "
     "readiness summary."
@@ -972,10 +823,7 @@ def run_all_checks(
     env: Optional[Mapping[str, str]] = None,
     version_info: Optional[Sequence[int]] = None,
 ) -> List[CheckResult]:
-    """Run every Phase 1 check and return all results in display order.
-
-    Collect-all: a failure in one check never prevents the others from running.
-    """
+    """Run readiness checks in display order."""
     which = which or shutil.which
     runner = runner or subprocess.run
     return [
@@ -998,11 +846,7 @@ def _is_interactive() -> bool:
 
 
 def _adb_available(core: Sequence[CheckResult]) -> bool:
-    """Whether adb is usable (found), from the environment check results.
-
-    A present-but-version-unknown adb (WARNING) is still usable; only a missing
-    adb (FAIL) makes device checks impossible.
-    """
+    """Return whether adb is usable."""
     adb = next((r for r in core if r.name == "adb"), None)
     return adb is not None and adb.status in (Status.PASS, Status.WARNING)
 
@@ -1023,11 +867,7 @@ def _compose_results(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Run ``/init`` and return the process exit code (0 ready, 1 not ready).
-
-    ``argparse`` handles ``--help`` (exit 0) and usage errors (exit 2) by
-    raising ``SystemExit`` before any checks run.
-    """
+    """Run ``/init`` and return the process exit code."""
     _parse_args(argv)
     try:
         _load_dotenv()

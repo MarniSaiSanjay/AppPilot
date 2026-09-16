@@ -1,14 +1,8 @@
-"""Backward-compatible facade for the deeplink runner.
-
-The implementation now lives under ``usecases.deeplink`` (authoritative public
-surface: ``usecases.deeplink.__init__``). This module re-exports the public
-names so existing imports (and ``python -m src.deeplink_runner``) keep working
-unchanged.
-"""
+"""Backward-compatible facade for the deeplink runner."""
 
 from __future__ import annotations
 
-try:  # package-relative (python -m src.deeplink_runner)
+try:
     from .usecases.deeplink import (
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RETRY_WAIT_SECONDS,
@@ -33,7 +27,7 @@ try:  # package-relative (python -m src.deeplink_runner)
         load_deeplink_cases,
         main,
     )
-except ImportError:  # top-level (src on sys.path)
+except ImportError:
     from usecases.deeplink import (
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RETRY_WAIT_SECONDS,

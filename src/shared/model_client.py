@@ -1,12 +1,4 @@
-"""Shared client for OpenAI-compatible chat completions.
-
-Consolidates the endpoint configuration (environment resolution) and the HTTP
-transport (Bearer-auth POST + JSON parse) that the model decision provider, the
-deeplink expectation judge, and the login goal evaluator all previously
-duplicated. It knows nothing about Login, Deeplink, FRI, or any use case - only
-how to reach the model endpoint. Callers build the payload and interpret the
-parsed response.
-"""
+"""Shared client for OpenAI-compatible chat completions."""
 
 from __future__ import annotations
 
@@ -49,11 +41,7 @@ _NO_REDIRECT_OPENER = urllib.request.build_opener(_RejectRedirects())
 
 
 class ModelTransportError(RuntimeError):
-    """Raised when the model HTTP transport fails (network / decode error).
-
-    Subclasses RuntimeError so existing callers that catch RuntimeError keep
-    working; a consumer may re-map it to its own operational error type while
-    preserving the original message (``str(error)``)."""
+    """Raised when the model HTTP transport fails."""
 
 
 class ModelConfigurationError(ValueError):
@@ -62,9 +50,6 @@ class ModelConfigurationError(ValueError):
 
 def verify_entra_model_authentication() -> None:
     """Acquire an Azure AI token without sending a model request."""
-    # A signed-out Azure CLI is an expected interactive state. Azure Identity
-    # logs every unavailable credential in its chain at warning level, while
-    # AppPilot presents a concise sign-in prompt below.
     logger_was_disabled = _AZURE_IDENTITY_CHAIN_LOGGER.disabled
     _AZURE_IDENTITY_CHAIN_LOGGER.disabled = True
     try:
@@ -135,10 +120,7 @@ def validate_base_url(base_url: str) -> str:
 
 
 class ChatModelClient:
-    """Minimal OpenAI-compatible chat client owning endpoint config + transport.
-
-    Nothing about prompts, response interpretation, or any use case lives here.
-    """
+    """OpenAI-compatible chat client."""
 
     def __init__(
         self,
@@ -197,12 +179,7 @@ class ChatModelClient:
 
     @staticmethod
     def config_from_env(env: "Mapping[str, str] | None" = None) -> "dict | None":
-        """Resolve model endpoint and authentication configuration, or None.
-
-        ``APPPILOT_MODEL_AUTH`` selects ``api_key`` (the backward-compatible
-        default) or ``entra``. Entra mode uses ``DefaultAzureCredential`` and
-        therefore requires no model API key. Returns None when the model name or
-        the selected mode's required configuration is absent."""
+        """Resolve model endpoint and authentication configuration."""
         env = os.environ if env is None else env
         auth_mode = ChatModelClient._normalize_auth_mode(
             env.get("APPPILOT_MODEL_AUTH") or AUTH_API_KEY
@@ -243,13 +220,7 @@ class ChatModelClient:
         self._api_key = token
 
     def send(self, payload: dict) -> dict:
-        """POST a chat-completions payload and return the parsed JSON response.
-
-        Retries this safe, read-only request after transient transport, service,
-        or throttling failures. Retry-After is honored with a bounded
-        exponential floor. Non-retryable HTTP and response-decoding failures are
-        surfaced immediately. The selected credential is sent only in the
-        Authorization header and is never logged."""
+        """POST a chat-completions payload and return parsed JSON."""
         self._refresh_authentication()
         data = json.dumps(payload).encode("utf-8")
         http_request = urllib.request.Request(

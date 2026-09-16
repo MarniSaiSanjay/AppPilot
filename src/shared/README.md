@@ -1,115 +1,51 @@
 # Shared nodes
 
-This folder holds **reusable, use-case-agnostic building blocks** ("shared
-nodes") that more than one AppPilot use case can consume. A use case (Deeplink
-today; FRI and others later) wires these nodes together and adds its own
-orchestration, but the nodes themselves live here so they are never duplicated.
+This folder holds reusable, use-case-agnostic building blocks.
 
-## The one rule: shared nodes stay generic
+## Rules
 
-A shared node must **not** contain use-case-specific knowledge. There is no
-`if deeplink: ...` or `if fri: ...` branching anywhere in this folder.
-
-Instead:
-
-- **A shared node provides a generic capability plus sensible defaults.**
-  It owns *how* something is done.
-- **A use case supplies its own intent** through runtime configuration/policy.
-  It owns *what* it wants and *why*.
-
-So the same shared node can serve different use cases without being copied or
-edited. When a use case needs different behavior, it passes that behavior in at
-runtime (as a policy, a terminal-state description, a predicate, or an injected
-collaborator) — it does not reach into the shared node and add a special case.
-
-Every shared node should ship **sensible defaults** so that, with no extra
-configuration, it behaves exactly as it does today.
-
-## Add reusable nodes here
-
-If you build something another use case could reuse, put it in this folder (a
-module, or a subpackage like `login/`). Keep it generic, give it defaults, and
-document how a use case customizes it. Keep use-case-specific orchestration out
-of here — that belongs with the use case.
+- Shared nodes stay generic.
+- Use cases pass policy, context, predicates, or collaborators at runtime.
+- Use-case-specific orchestration belongs in `src/usecases/`.
+- Shared nodes provide defaults for common flows.
 
 ## Current shared nodes
 
 ### `credentials.py` — credential profile resolution
-A generic resolver converts a non-secret runtime label to a stable environment
-suffix and builds a secret-safe `RuntimeContext`. It validates missing values
-and ambiguous normalized labels without rendering usernames or passwords.
+Builds a credential-backed `RuntimeContext` from profile labels and environment
+variables.
 
 ### `account/` — account sessions
-The account contract and Android implementation prepare one resolved credential
-profile as the active app account. Navigation and account matching are
-deterministic and local; raw names/emails never cross the model, logging,
-exception, or result boundaries. A dedicated narrow validator allows only Menu,
-account navigation, exact account selection, Add account, and the optional
-overlay-permission return path while continuing to prohibit Sign Out and account
-removal. `account/__init__.py` owns the contract, `account/session.py` the
-Android implementation, and `account/safety.py` the scoped action policy.
+Prepares one resolved credential profile as the active app account.
+`account/__init__.py` owns the contract, `account/session.py` the Android
+implementation, and `account/safety.py` the scoped action policy.
 
 ### `model_client.py` — `ChatModelClient`
-The single OpenAI-compatible chat client. It owns endpoint configuration
-(environment resolution via `config_from_env`) and the HTTP transport
-(`send`: Bearer-auth POST + JSON parse, raising `ModelTransportError` on
-failure). It supports API keys and Microsoft Entra tokens from
-`DefaultAzureCredential`, with token caching and refresh delegated to Azure
-Identity. It knows nothing about prompts or any use case — callers build the
-payload and interpret the response. This consolidates the model transport that
-the model decision provider, the deeplink expectation judge, and the login goal
-evaluator previously duplicated.
+OpenAI-compatible chat transport. It owns endpoint configuration, API-key auth,
+Entra token acquisition, JSON parsing, and `ModelTransportError` failures.
+Callers build prompts and interpret responses.
 
 ### `login/` — the shared login node
-A generic AppPilotAgent-based login/onboarding capability. Unique known login
-controls are handled deterministically; successful model decisions can be
-learned through the generic adaptive replay core, and unknown states still use
-the model. A use case describes what it wants via a **`LoginPolicy`**; the node
-drives sign-in and stops at the first terminal state the policy declares,
-before offering any action. The default login boundary includes blocking
-post-authentication dialogs, bottom sheets, privacy notices, and welcome
-prompts; it completes only after an unobstructed app destination remains usable
-across consecutive observations.
+A generic AppPilotAgent-based login/onboarding capability. A use case supplies a
+**`LoginPolicy`** that defines when login stops.
 
-- `policy.py` — `LoginPolicy` plus the terminal abstractions
-  (`DeterministicTerminalState`, `SemanticTerminalState`,
-  `CompositeTerminalEvaluator`). A use case authors terminals in natural
-  language (e.g. *"the First-Run / FRI screen is displayed"*) or, when it
-  already has reliable structured evidence, as a deterministic predicate.
+- `policy.py` — `LoginPolicy` plus terminal abstractions.
 - `goal.py` — the goal evaluators: the deterministic Copilot login-completion
   detector, the model-backed login-completion judge, their authoritative
-  composition (the sensible **default** terminal), and a generic
+  composition (the **default** terminal), and a generic
   `SemanticStateEvaluator` used to judge natural-language terminal states.
-- `builder.py` — `build_login_agent(...)` (assembles the agent from a policy;
-  default = today's behavior), `resolve_decision_provider`, and the CLI entry
-  point.
+- `builder.py` — `build_login_agent(...)`, `resolve_decision_provider`, and the
+  CLI entry point.
 - `login_decision_cache.py` — `LoginDecisionCache`, containing only validated
   login-specific seeded states over the generic `AdaptiveDecisionCache`.
-- `flow.py` — `SharedLoginFlow` / `LoginCapability`: a small adapter the caller
-  invokes to prepare login, plus the `[LOGIN]` execution-trace observability.
+- `flow.py` — `SharedLoginFlow` / `LoginCapability`.
 - `profiled.py` — `ProfiledLoginFlowFactory`: binds resolved credential profiles
   to login agents and caches one reusable `SharedLoginFlow` per normalized key.
 
-Customization at a glance:
-
-- **Defaults** — `LoginPolicy.default()` reproduces today's login exactly: the
-  prototype goal/guidance and only the built-in login-completion terminal.
-- **Terminal states** — a use case lists ordered terminal states; terminal
-  detection happens *before* any action is offered, so reaching a terminal
-  always wins over dismissing/continuing an incidental screen. Declaration order
-  is priority.
-- **Precedence** — the first terminal that reports "reached" wins. Unless a
-  policy opts out, the built-in login-completion terminal is appended as the
-  lowest-priority fallback so login still stops normally when the custom
-  terminals never appear.
-- **Safety** — a policy only chooses *when login stops*; it cannot bypass the
-  agent's existing safety validation, credential isolation, or action bounds.
-
-The invariant this preserves across use cases:
+Login flow:
 
 ```
 LOGIN PREPARES  ->  LOGIN STOPS  ->  USE-CASE VERIFIES
 ```
 
-Login gets the app to the boundary the use case declared and returns control;
-the use case then performs its own verification.
+Login gets the app to the declared boundary and returns control.

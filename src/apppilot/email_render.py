@@ -1,22 +1,4 @@
-"""Generic, professional presentation of a test-suite report as an email.
-
-Pure formatting only - no I/O, no transport, no configuration, and **no
-knowledge of any particular use case**. These builders render a small,
-use-case-agnostic view model (:class:`EmailReport`) into the email subject,
-plain-text body, and HTML body. Each use case is responsible for mapping its own
-result model into an :class:`EmailReport` (via its own
-``to_email_report()``); this module only knows how to render that view.
-
-:mod:`apppilot.email_delivery` owns recipient handling, authentication, and
-delivery, and delegates all presentation here so the concerns stay cleanly
-separated.
-
-The rendered email keeps a clean, professional layout: a product header, a suite
-summary, a compact results table (whatever columns the view supplies), an
-optional per-case Details section, and a small footer with an optional contact
-address. Every dynamic value in the HTML is escaped, and the plain-text and HTML
-bodies carry the same facts.
-"""
+"""Render test-suite reports as email text and HTML."""
 
 from __future__ import annotations
 
@@ -25,13 +7,9 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 
-# --------------------------------------------------------------------------- #
-# View model (use-case-agnostic). A use case maps its own results into these.
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Cell:
-    """One results-table cell. ``status`` (when set) renders a PASS/FAIL pill
-    and ``text`` is ignored; otherwise ``text`` is shown (HTML-escaped)."""
+    """One results-table cell."""
 
     text: str = ""
     muted: bool = False
@@ -42,8 +20,7 @@ class Cell:
 
 @dataclass(frozen=True)
 class DetailAttempt:
-    """One attempt line inside a Details card: a label, a pass/fail chip, and
-    free text (e.g. the sanitized reason)."""
+    """One attempt line inside a Details card."""
 
     label: str
     ok: bool
@@ -52,8 +29,7 @@ class DetailAttempt:
 
 @dataclass(frozen=True)
 class DetailCard:
-    """One case's Details card: a title, verdict, a small badge, a single
-    labeled meta field, and its per-attempt lines."""
+    """One case's Details card."""
 
     title: str
     passed: bool
@@ -65,13 +41,7 @@ class DetailCard:
 
 @dataclass(frozen=True)
 class EmailReport:
-    """Everything the renderer needs, with zero use-case coupling.
-
-    ``summary_segments`` are short secondary-summary strings (rendered as
-    separate lines in text and joined inline in HTML). ``columns``/``rows`` are
-    the compact results table. ``details`` is the optional per-case section.
-    ``body_text`` is the detailed plain-text report (the console report, used
-    verbatim as the source of truth for the plain-text body)."""
+    """Email report view model."""
 
     suite_name: str
     total: int
@@ -89,35 +59,26 @@ def _status(view: EmailReport) -> str:
 
 
 def _contact(contact: Optional[str]) -> Optional[str]:
-    """Normalize the optional contact address; blank/None means 'not set'."""
+    """Normalize the optional contact address."""
     if not contact:
         return None
     contact = contact.strip()
     return contact or None
 
 
-# --------------------------------------------------------------------------- #
-# Subject
-# --------------------------------------------------------------------------- #
 def build_subject(view: EmailReport) -> str:
-    """Suite verdict and pass ratio, e.g.
-    ``AppPilot <Suite> Suite: FAIL (3/4 passed)``. The suite name comes from
-    the view (``view.suite_name``), not hardcoded."""
+    """Build the email subject."""
     return (
         f"AppPilot {view.suite_name} Suite: {_status(view)} "
         f"({view.passed}/{view.total} passed)"
     )
 
 
-# --------------------------------------------------------------------------- #
-# Plain text
-# --------------------------------------------------------------------------- #
 _SEP = "-" * 60
 
 
 def build_text_body(view: EmailReport, contact: Optional[str] = None) -> str:
-    """Summary header (suite result + any secondary segments), the detailed
-    report text (the source of truth), then a small footer."""
+    """Build the plain-text email body."""
     lines = [
         f"Suite result: {_status(view)}",
         f"Total cases: {view.total}",
@@ -136,9 +97,6 @@ def build_text_body(view: EmailReport, contact: Optional[str] = None) -> str:
     return "\n".join(lines) + view.body_text + "\n" + "\n".join(footer)
 
 
-# --------------------------------------------------------------------------- #
-# HTML (inline styles only - email clients strip <style>/external CSS)
-# --------------------------------------------------------------------------- #
 _FONT = "font-family:'Segoe UI',Arial,sans-serif;"
 _TEXT = "#202124"
 _MUTED = "#5f6368"
@@ -240,10 +198,7 @@ def _details(cards: Sequence[DetailCard]) -> str:
 
 
 def build_html_body(view: EmailReport, contact: Optional[str] = None) -> str:
-    """Clean, professional HTML email: product header, suite summary, the
-    results table, an optional Details section, and a small footer with an
-    optional contact line. Inline styles only. Same facts as
-    :func:`build_text_body`."""
+    """Build the HTML email body."""
     suite_color = _PASS if view.failed == 0 else _FAIL
 
     parts = [

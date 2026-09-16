@@ -8,9 +8,6 @@ from dataclasses import dataclass, field
 from .deeplink_testcase_loader import DeeplinkTestCase
 
 
-# --------------------------------------------------------------------------- #
-# Results and reporting (deterministic)
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class AttemptResult:
     attempt: int
@@ -55,10 +52,6 @@ class TestCaseResult:
 @dataclass
 class SuiteReport:
     results: list[TestCaseResult] = field(default_factory=list)
-    # Human-readable name of the suite, stamped by the orchestrator (its
-    # ``SUITE_NAME``). Reporting and the email derive their labels from it.
-    # Left generic here because ``SuiteReport`` is a plain data carrier and
-    # does not own the suite's identity - the orchestrator does.
     suite_name: str = "Test"
     cleanup_errors: list[str] = field(default_factory=list)
 
@@ -112,12 +105,7 @@ class SuiteReport:
         return "\n".join(lines)
 
     def to_email_report(self):
-        """Map this deeplink report onto the generic ``EmailReport`` view model
-        consumed by :mod:`apppilot.email_render`. The results-table columns, the
-        Installed/Uninstalled summary split, the natural Test ID ordering, and
-        the per-case Details cards are this use case's own email presentation;
-        the renderer stays generic and deeplink-free. ``email_render`` is
-        imported lazily so importing this module never pulls in the framework."""
+        """Map this deeplink report onto the generic email view model."""
         from apppilot.email_render import (
             Cell,
             DetailAttempt,
@@ -176,9 +164,6 @@ class SuiteReport:
         )
 
 
-# --------------------------------------------------------------------------- #
-# Email-view helpers (deeplink presentation shaping for the generic renderer)
-# --------------------------------------------------------------------------- #
 _TESTID_CHUNK_RE = re.compile(r"(\d+)")
 
 _EMAIL_COLUMNS = (
@@ -187,10 +172,7 @@ _EMAIL_COLUMNS = (
 
 
 def _testid_sort_key(test_id: str):
-    """Natural sort key for a Test ID so e.g. TC2 sorts before TC10.
-
-    Splits into alternating text/number chunks; numbers compare numerically,
-    text case-insensitively. Purely deterministic (no locale dependence)."""
+    """Natural sort key for a Test ID."""
     chunks = _TESTID_CHUNK_RE.split(str(test_id))
     return [
         (1, int(chunk)) if chunk.isdigit() else (0, chunk.lower())
@@ -206,9 +188,7 @@ def _segment(label: str, group: list) -> str:
 
 
 def _login_failed_result(case: DeeplinkTestCase) -> TestCaseResult:
-    """FAIL result for a case whose login failed: one failed attempt, no deeplink
-    verdict (``_verify()`` never ran). Used by the installed batch on login
-    failure; the uninstalled flow reaches this via the per-attempt setup path."""
+    """FAIL result for a case whose login failed."""
     return TestCaseResult(
         case=case,
         attempts=[
@@ -224,9 +204,7 @@ def _login_failed_result(case: DeeplinkTestCase) -> TestCaseResult:
 def _batch_setup_failed_result(
     case: DeeplinkTestCase, reason: str
 ) -> TestCaseResult:
-    """FAIL result for a case in an installed batch whose shared install/launch
-    setup failed operationally: one failed attempt, no deeplink verdict. The
-    suite still continues and the report/email are still produced."""
+    """FAIL result for an installed-batch setup failure."""
     return TestCaseResult(
         case=case,
         attempts=[
@@ -245,10 +223,7 @@ def _batch_setup_failed_result(
 def _startup_failed_result(
     case: DeeplinkTestCase, reason: str
 ) -> TestCaseResult:
-    """FAIL result for a case that never ran because the one-time suite-startup
-    clean-install precondition failed operationally: one failed attempt, no
-    deeplink verdict. The real reason is preserved (never masked, never a false
-    PASS) and the suite still returns a report so final reporting/email happen."""
+    """FAIL result for a case that never ran."""
     return TestCaseResult(
         case=case,
         attempts=[

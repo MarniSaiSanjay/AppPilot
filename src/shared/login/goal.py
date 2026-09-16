@@ -1,11 +1,4 @@
-"""Shared login goal evaluators (use-case-agnostic).
-
-The generic authentication/onboarding boundary detectors used by the shared
-login node: a deterministic Copilot terminal detector, the model-backed
-login-completion judge, the authoritative composition of the two, and a generic
-semantic screen-state judge used by SemanticTerminalState. Nothing here knows
-about Deeplink, FRI, or any specific use case.
-"""
+"""Shared login goal evaluators."""
 
 from __future__ import annotations
 
@@ -16,7 +9,7 @@ import re
 from pathlib import Path
 from typing import Callable
 
-try:  # package-relative (python -m src.shared.login.goal) vs top-level (src on path)
+try:
     from ...apppilot import logtags
     from ...apppilot.models import UIElement, UIObservation
     from ...apppilot.safety import infer_credential_kind
@@ -33,8 +26,6 @@ _DEFAULT_MAX_LOGIN_GOAL_CACHE_ENTRIES = 200
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
-# The agent reasons over the observed UI and drives Maestro action-by-action;
-# it does not execute any prewritten Maestro flow.
 PROTOTYPE_GOAL = (
     "Complete authentication and all required first-launch or post-authentication "
     "onboarding. Dismiss every blocking dialog, bottom sheet, popup, privacy "
@@ -77,35 +68,15 @@ DEFAULT_GUIDANCE = (
 
 
 class SignedInCopilotGoalEvaluator:
-    """Decides when the shared login flow has PREPARED the app and must stop.
-
-    Login is preparation, not navigation: get past auth and any onboarding
-    present, then hand the current screen to the caller. One stateless rule:
-
-        login complete  <=>  no login BLOCKER present  AND  SETTLED inside
-
-    * BLOCKER: an auth surface (credential field / sign-in affordance) or the
-      optional intro/suggested-prompt interruption (dismiss if shown; its
-      absence never blocks completion).
-    * SETTLED inside: a recognizable Copilot home/composer, or any actionable app
-      screen. Nothing to act on = transient loading (wait, don't press Back).
-
-    Screens are matched against marker tables (data), so extending recognition
-    edits a table, not a branch.
-    """
+    """Detects when shared login has prepared the app."""
 
     def __init__(
         self, foreground_check: "Callable[[], bool] | None" = None
     ) -> None:
-        # Optional deterministic "is the target app foreground?" check. When
-        # supplied (e.g. by the deeplink flow), login is never reported complete
-        # while the target app is not foreground. None for standalone use.
         self._foreground_check = foreground_check
 
-    # Recognizable signed-in Copilot home/composer.
     _HOME_TEXT = ("message copilot",)
     _HOME_RESOURCE = ("home_screen", "copilot_composer", "copilot_input")
-    # Composer hints that count only on an input field (a text field, not a label).
     _COMPOSER_INPUT_TEXT = (
         "message copilot",
         "ask copilot",
@@ -123,15 +94,6 @@ class SignedInCopilotGoalEvaluator:
     )
     _AUTH_LOADING_TEXT = ("looking for accounts", "reviewing accounts")
     _SAFE_PERMISSION_DISMISS_RESOURCE = ("permission_deny",)
-    # Explicit negative authentication terminals: restricted/denied access,
-    # blocked/disabled accounts and outright sign-in failures. These are NOT a
-    # successful login - the login form merely disappearing behind such a screen
-    # must never be reported as reached. This is only a lean deterministic
-    # SAFETY NET for the explicit, common negatives (and the no-AI fallback
-    # path); the semantic judge handles novel wordings. Generic multi-word
-    # English phrases whose negative sense is carried by the paired word (e.g.
-    # "denied"/"restricted"/"failed"), so a legitimate screen merely mentioning
-    # "access", "permission" or "account" does not match. App-agnostic.
     _NEGATIVE_AUTH_TEXT = (
         "not eligible",
         "access denied",
@@ -166,7 +128,6 @@ class SignedInCopilotGoalEvaluator:
         "account_blocked",
         "signin_error",
     )
-    # Optional intro/suggested-prompt interruption to dismiss when present.
     _INTRO = (
         "let's get started",
         "lets get started",
@@ -188,9 +149,6 @@ class SignedInCopilotGoalEvaluator:
         "don't miss anything",
         "don’t miss anything",
     )
-    # Sign-in affordances. Kept specific so an authenticated screen is not
-    # misread. Generic auth patterns (incl. the federated "Continue with
-    # <provider>" landing), not app-specific.
     _SIGNIN = (
         "sign in",
         "signin",
@@ -213,8 +171,6 @@ class SignedInCopilotGoalEvaluator:
         verdict = self.deterministic_verdict(observation)
         if verdict is not None:
             return verdict
-        # Preserve the legacy fallback for standalone/offline callers. Production
-        # wraps this evaluator and sends ambiguous screens to the semantic judge.
         return self._settled_inside(observation)
 
     def deterministic_verdict(
@@ -229,14 +185,8 @@ class SignedInCopilotGoalEvaluator:
             return False
         if self._blocked(observation):
             return False
-        # An explicit restricted/denied/failed authentication screen is a
-        # NEGATIVE terminal: login definitively did not succeed. Decide it
-        # deterministically as not-reached so it can never be mistaken for a
-        # usable in-app screen (and never reach the semantic judge to be flipped).
         if self._negative_auth_terminal(observation):
             return False
-        # A normal destination is positive evidence, but the semantic judge must
-        # still inspect the whole screen for a dialog/bottom sheet overlay.
         if self._signed_in_home(observation) or self._search_screen(observation):
             return None
         if not self._has_actionable_ui(observation):
@@ -260,9 +210,6 @@ class SignedInCopilotGoalEvaluator:
             return False
         if self._blocked(observation):
             return True
-        # A negative-auth terminal offers no login/onboarding step to act on: the
-        # agent should stop driving and reach a bounded, controlled non-PASS
-        # rather than hand the dead-end screen to the Brain.
         if self._negative_auth_terminal(observation):
             return False
         if self._signed_in_home(observation) or self._search_screen(observation):
@@ -272,7 +219,6 @@ class SignedInCopilotGoalEvaluator:
         return None
 
     def _blocked(self, observation: UIObservation) -> bool:
-        # Not yet past authentication + onboarding.
         return (
             self._authenticating(observation)
             or self._intro_present(observation)
@@ -281,16 +227,7 @@ class SignedInCopilotGoalEvaluator:
         )
 
     def has_actionable_step(self, observation: UIObservation) -> bool:
-        """Whether this screen presents a genuine login/onboarding step to act on.
-
-        Used by the agent's wait-gate to tell a real authentication/onboarding
-        screen (a sign-in affordance, a credential field, or the optional intro
-        interruption to dismiss) apart from a transient loading/splash screen that
-        merely carries an incidental clickable element (e.g. a "Terms of use" link
-        on a "looking for accounts" screen). The terminal, signed-in states are
-        handled by ``is_reached`` returning True before the wait-gate runs, so
-        here a step exists iff the screen is a login BLOCKER. If the target app is
-        not yet foreground, there is nothing to act on - wait."""
+        """Whether this screen has a login/onboarding step to act on."""
         if self._matches(
             observation,
             resource=self._SAFE_PERMISSION_DISMISS_RESOURCE,
@@ -310,7 +247,6 @@ class SignedInCopilotGoalEvaluator:
         )
 
     def _settled_inside(self, observation: UIObservation) -> bool:
-        # Positive evidence we are in the authenticated app (not mid-transition).
         return self._signed_in_home(observation) or self._has_actionable_ui(observation)
 
     def _authenticating(self, observation: UIObservation) -> bool:
@@ -372,7 +308,6 @@ class SignedInCopilotGoalEvaluator:
 
     @staticmethod
     def _has_actionable_ui(observation: UIObservation) -> bool:
-        # Same "actionable" definition as SafetyValidator/the agent's loading wait.
         return any(
             (element.clickable or element.is_input)
             and (element.resource_id or element.selector_text)
@@ -413,8 +348,6 @@ class SignedInCopilotGoalEvaluator:
 
     @staticmethod
     def _has_credential_field(observation: UIObservation) -> bool:
-        # Match on stable field identity (resource id / hint / class) only, so a
-        # composer prompt merely mentioning "email" is not misread as a field.
         for element in observation.elements:
             if not element.is_input:
                 continue
@@ -426,18 +359,7 @@ class SignedInCopilotGoalEvaluator:
 
 
 class LLMLoginGoalEvaluator:
-    """Model-backed login-completion judge: the AI reads the WHOLE screen.
-
-    Instead of matching fixed app-specific strings, asks the same model the agent
-    uses whether the user has finished authentication + any required onboarding
-    and is now INSIDE the app (not on a sign-in/welcome/account-picker/consent
-    screen, the optional suggested-prompt interruption, or a loading screen).
-
-    The only non-AI part is the deterministic foreground precondition (adb):
-    login is never complete while the app is not foreground. The model judges
-    only the in-app-vs-auth/onboarding distinction, by meaning - robust to
-    wording/layout changes, needing no hardcoded labels.
-    """
+    """Model-backed login-completion judge."""
 
     _SYSTEM_PROMPT = (
         "You are AppPilot's login-completion judge for an Android app. You are "
@@ -516,9 +438,6 @@ class LLMLoginGoalEvaluator:
         self._max_cache_entries = max(1, max_cache_entries)
         self._persistent_cache = self._load_cache()
         self._pending_cache: dict[str, dict[str, bool]] = {}
-        # 1-entry cache for repeated evaluation of the same goal and observation.
-        # The goal remains part of the key because is_reached() and
-        # has_actionable_step() intentionally render different prompts.
         self._cache_key: tuple | None = None
         self._cache_val: dict | None = None
 
@@ -558,21 +477,12 @@ class LLMLoginGoalEvaluator:
         )
 
     def is_reached(self, goal: str, observation: UIObservation) -> bool:
-        # Deterministic precondition: never "logged in" while the target app is
-        # not foreground (e.g. the store window is still up). Not an AI decision.
         if self._foreground_check is not None and not self._foreground_check():
             return False
         return bool(self._evaluate(goal, observation)["reached"])
 
     def has_actionable_step(self, observation: UIObservation) -> bool:
-        """Whether the AI sees a concrete login/onboarding control to act on now.
-
-        Consulted by the agent's wait-gate: when the model reports the screen is a
-        transient loading/splash state with no real sign-in/onboarding control
-        (even if it carries an incidental link), this returns False so the agent
-        WAITS and re-observes instead of asking the Brain - which is exactly what
-        stops the model from pressing a diagnostic Back on a 'looking for
-        accounts' screen. Foreground stays a deterministic precondition."""
+        """Whether the model sees a login/onboarding control to act on."""
         if self._foreground_check is not None and not self._foreground_check():
             return False
         verdict = self._evaluate("", observation)
@@ -617,10 +527,6 @@ class LLMLoginGoalEvaluator:
             if not isinstance(decoded, dict):
                 raise TypeError("model response content must be a JSON object")
         except (KeyError, IndexError, ValueError, TypeError, RuntimeError):
-            # Fail safe: never falsely report login done (reached=False). Leave
-            # actionable_step=True so a transient judge/transport failure does not
-            # trap a real sign-in screen in the wait loop - the Brain (a separate
-            # model) can still be asked to drive login, as it was before.
             return {
                 "reached": False,
                 "actionable_step": True,
@@ -642,8 +548,6 @@ class LLMLoginGoalEvaluator:
 
     @staticmethod
     def _fingerprint(observation: UIObservation) -> tuple:
-        # Stable, secret-free screen signature (credential values are already
-        # redacted by the observer). Identical screens reuse one verdict.
         return tuple(
             (
                 element.element_id,
@@ -742,8 +646,6 @@ class LLMLoginGoalEvaluator:
 
     @staticmethod
     def _render(goal: str, observation: UIObservation) -> str:
-        # observation.describe() already redacts credential fields, so no secret
-        # can reach the judge prompt.
         return (
             f"GOAL: {goal}\n"
             "CURRENT UI ELEMENTS:\n"
@@ -761,12 +663,7 @@ class LLMLoginGoalEvaluator:
 
 
 class AuthoritativeLoginGoalEvaluator:
-    """Production login boundary: deterministic evidence first, AI if ambiguous.
-
-    A positive completion verdict must remain positive across three observations.
-    This gives delayed post-authentication sheets time to appear before control is
-    returned to the caller.
-    """
+    """Production login boundary evaluator."""
 
     _REQUIRED_COMPLETION_OBSERVATIONS = 3
 
@@ -829,13 +726,7 @@ class AuthoritativeLoginGoalEvaluator:
 
 
 class SemanticStateEvaluator:
-    """Generic model-backed judge: is a natural-language screen state displayed?
-
-    Reusable by any use case via SemanticTerminalState. It knows nothing about
-    login, Deeplink, or FRI - the caller's natural-language ``description`` carries
-    all the intent. Fail-safe: any transport/decode error yields "not matched" so
-    a transient failure never fabricates a terminal state.
-    """
+    """Generic model-backed screen-state judge."""
 
     _SYSTEM_PROMPT = (
         "You judge whether a described Android screen state is CURRENTLY on "
