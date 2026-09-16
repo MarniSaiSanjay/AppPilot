@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import math
 import os
 import sys
@@ -32,12 +33,17 @@ try:
         logtags,
     )
     from ...apppilot import telemetry
+    from ...apppilot.work_defaults import (
+        RelayConfigurationError,
+        load_relay_secrets,
+    )
     from ...shared.installer import LocalApkInstaller
     from ...shared.account.session import AndroidAccountSession
     from ...shared.credentials import (
         CredentialConfigurationError,
         CredentialProfile,
         CredentialProfileResolver,
+        normalize_profile_key,
     )
     from ...shared.login import (
         ProfiledLoginFlowFactory,
@@ -66,12 +72,14 @@ except ImportError:
         logtags,
     )
     from apppilot import telemetry
+    from apppilot.work_defaults import RelayConfigurationError, load_relay_secrets
     from shared.installer import LocalApkInstaller
     from shared.account.session import AndroidAccountSession
     from shared.credentials import (
         CredentialConfigurationError,
         CredentialProfile,
         CredentialProfileResolver,
+        normalize_profile_key,
     )
     from shared.login import (
         ProfiledLoginFlowFactory,
@@ -161,11 +169,51 @@ def _select_workbook(
 def _resolve_credential_profiles(
     cases: Sequence[DeeplinkTestCase],
     env: "Mapping[str, str] | None" = None,
+    *,
+    interactive: bool = False,
+    input_fn=input,
+    password_fn=getpass.getpass,
+    output=print,
 ) -> dict[str, CredentialProfile]:
-    """Validate and resolve every workbook License before device operations."""
-    return CredentialProfileResolver(env).resolve_all(
-        case.license for case in cases
-    )
+    """Resolve workbook profiles, prompting only for missing local credentials."""
+    source = dict(os.environ if env is None else env)
+    profiles: dict[str, str] = {}
+    for case in cases:
+        label = " ".join((case.license or "").split())
+        key = normalize_profile_key(label)
+        profiles.setdefault(key, label)
+
+    for key, label in profiles.items():
+        username_key = f"APPPILOT_USERNAME_{key}"
+        password_key = f"APPPILOT_PASSWORD_{key}"
+        missing = [
+            name
+            for name in (username_key, password_key)
+            if not source.get(name)
+        ]
+        if not missing:
+            continue
+        if not interactive:
+            raise CredentialConfigurationError(
+                f"Credential profile {label!r} is missing required environment "
+                f"variable(s): {', '.join(missing)}"
+            )
+        output(f"Credentials required for workbook profile: {label}")
+        try:
+            if username_key in missing:
+                source[username_key] = input_fn(
+                    f"Test account username for {label}: "
+                ).strip()
+            if password_key in missing:
+                source[password_key] = password_fn(
+                    f"Test account password for {label}: "
+                ).strip()
+        except (EOFError, KeyboardInterrupt) as error:
+            raise CredentialConfigurationError(
+                f"Credential entry cancelled for profile {label!r}"
+            ) from error
+
+    return CredentialProfileResolver(source).resolve_all(case.license for case in cases)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -271,7 +319,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: could not load deeplink test cases: {error}", file=sys.stderr)
         return 2
     try:
-        credential_profiles = _resolve_credential_profiles(cases)
+        credential_profiles = _resolve_credential_profiles(
+            cases,
+            interactive=interactive,
+            output=lambda message: print(message, file=sys.stderr),
+        )
     except CredentialConfigurationError as error:
         print(f"ERROR: invalid credential configuration: {error}", file=sys.stderr)
         return 2
@@ -305,8 +357,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     if judge is None:
         print(
-            "ERROR: no evaluation model configured. Set APPPILOT_MODEL and "
-            "APPPILOT_MODEL_BASE_URL for work Azure OpenAI.",
+            "ERROR: AppPilot model configuration is unavailable. Update "
+            "AppPilot and retry.",
             file=sys.stderr,
         )
         return 2
@@ -342,6 +394,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ModelConfigurationError as error:
         print(f"ERROR: invalid model configuration: {error}", file=sys.stderr)
         return 2
+
+    try:
+        relay_env = {**os.environ, **load_relay_secrets()}
+    except RelayConfigurationError as error:
+        relay_env = os.environ
+        print(
+            logtags.prefix(
+                logtags.EMAIL,
+                f"AppPilot relay configuration unavailable: {error}",
+            ),
+            file=sys.stderr,
+        )
 
     def recover_login_loading() -> None:
         executor.stop_app()
@@ -408,7 +472,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         with lock:
             try:
                 email_recipient = email_delivery.prompt_email_recipient(
-                    env=os.environ, interactive=interactive
+                    env=relay_env, interactive=interactive
                 )
             except Exception as error:  # pragma: no cover
                 print(
@@ -423,7 +487,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except device_lock.DeviceLockError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
-    telemetry.record_suite_run(report.suite_name, report.total, "Android")
+    telemetry.record_suite_run(
+        report.suite_name,
+        report.total,
+        "Android",
+        env=relay_env,
+    )
     print(logtags.prefix(logtags.REPORT, "generating report..."))
     report_text = report.format()
     print(report_text)
@@ -432,7 +501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(logtags.prefix(logtags.EMAIL, "triggering email delivery..."))
         try:
             email_delivery.send_suite_report(
-                report, env=os.environ, recipient=email_recipient
+                report, env=relay_env, recipient=email_recipient
             )
         except Exception as error:  # pragma: no cover
             print(

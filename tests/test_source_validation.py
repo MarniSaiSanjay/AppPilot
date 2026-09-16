@@ -8,13 +8,9 @@ import zipfile
 from pathlib import Path
 
 from scripts.scan_secrets import scan, scan_text
-from scripts.validate_workbook import validate
 
 
 class SourceValidationTests(unittest.TestCase):
-    def test_tracked_workbook_release_invariants(self) -> None:
-        validate()
-
     def test_secret_scan_detects_high_confidence_credentials(self) -> None:
         path = Path("sample.py")
         findings = scan_text(

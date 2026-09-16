@@ -26,6 +26,7 @@ from .models import (
     UIObservation,
 )
 from .safety import SafetyValidator
+from .work_defaults import load_work_defaults
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_ACTIONS = 30
@@ -885,7 +886,7 @@ def _load_dotenv(path: Path | None = None) -> None:
     try:
         raw = env_path.read_text(encoding="utf-8")
     except (OSError, ValueError):
-        return
+        raw = ""
     for line in raw.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -899,3 +900,4 @@ def _load_dotenv(path: Path | None = None) -> None:
             value = value[1:-1]
         if key and key not in os.environ:
             os.environ[key] = value
+    load_work_defaults()

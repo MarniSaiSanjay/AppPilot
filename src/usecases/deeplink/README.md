@@ -25,8 +25,9 @@ Installed is optional. Headerless positional A-D compatibility remains.
 Duplicate Test IDs, missing required values, non-HTTPS links, and links outside
 the supported App Link domains are rejected with row/column context.
 `Installed` accepts only the documented true/false tokens listed in the root
-README. The License selects profile-specific credentials from local environment
-variables; credentials are never stored in the workbook.
+README. The License selects profile-specific test credentials; interactive runs
+prompt for any missing profile, while non-interactive runs read the profile
+from local environment variables. Credentials are never stored in the workbook.
 
 ## Installed vs uninstalled
 

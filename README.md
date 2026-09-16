@@ -66,12 +66,12 @@ Full Android execution requires:
 - Java 17+
 - Maestro CLI 2.x
 - one Android emulator/AVD or physical USB-debugging device
-- trusted APK, model settings, and account settings
+- approved local APK and Deeplink test-account credentials
 
 On Windows, run AppPilot from WSL with Maestro installed in Linux.
 
-The target package and trusted signing certificate are required configuration.
-AppPilot validates the application ID from the APK.
+AppPilot validates the application ID and signature of the local APK you
+provide.
 
 ## Setup
 
@@ -81,7 +81,7 @@ Run the `/init` setup flow from the project root:
 ./init
 ```
 
-The `./init` wrapper auto-selects a Python 3.11+ interpreter. Equivalently:
+The `./init` wrapper auto-selects a Python 3.11-3.13 interpreter. Equivalently:
 
 ```bash
 python3.11 src/apppilot_init.py
@@ -139,30 +139,14 @@ delivery, or telemetry delivery.
 
 ## Configuration
 
-AppPilot reads configuration from environment variables. A local, **git-ignored**
-`.env` file at the repository root is loaded automatically at startup (real
-environment variables always take precedence). The decision model is the
-work-owned Azure OpenAI deployment and authenticates through Microsoft Entra.
+For interactive Deeplink runs, AppPilot prompts for any required workbook
+test-account credentials. For non-interactive/CI runs, provide those
+credentials in local `.env`.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `APPPILOT_MODEL` | yes* | Decision-model deployment/name (e.g. `gpt-4.1-mini`). |
-| `APPPILOT_MODEL_BASE_URL` | yes | Work Azure OpenAI endpoint ending in `/openai/v1`. |
-| `APPPILOT_EXPECTED_PACKAGE_ID` | yes for APK runs | Expected Android application/package ID. |
-| `APPPILOT_TRUSTED_CERT_SHA256` | yes for APK runs | Trusted signing-certificate SHA-256 fingerprint. |
-| `APPPILOT_USERNAME` | for standalone login | Default sign-in username/email for standalone login. |
-| `APPPILOT_PASSWORD` | for standalone login | Default sign-in password. |
-| `APPPILOT_USERNAME_<LICENSE>` | for Deeplink login | Username for an Excel License profile. |
-| `APPPILOT_PASSWORD_<LICENSE>` | for Deeplink login | Password for an Excel License profile. |
-| `APPPILOT_MAX_ACTIONS` | no | Absolute upper bound on actions per run (default `30`). |
-| `APPPILOT_MAX_STUCK_ACTIONS` | no | Consecutive unchanged actions before controlled FAIL (default `5`). |
-| `APPPILOT_EMAIL_API_URL` | for email | HTTPS relay endpoint used to send the suite report. |
-| `APPPILOT_EMAIL_API_KEY` | for email | Scoped API key for the email relay. |
-| `APPPILOT_TELEMETRY_URL` | for telemetry | HTTPS relay `/telemetry` endpoint. Unset disables telemetry. |
-| `APPPILOT_TELEMETRY_API_KEY` | for telemetry | Telemetry-only API key. |
-
-\* If no model is configured, the agent does **not** guess — it reports that it
-cannot proceed and how to configure one.
+| `APPPILOT_USERNAME_<LICENSE>` | for non-interactive Deeplink runs | Username for an Excel License profile. |
+| `APPPILOT_PASSWORD_<LICENSE>` | for non-interactive Deeplink runs | Password for an Excel License profile. |
 
 Security:
 
@@ -170,25 +154,20 @@ Security:
   prompts, UI observations, logs, or source code.
 - Before credential injection, AppPilot revalidates APK trust, foreground app,
   and the target field.
-- Keep `.env` local and never commit real credentials or work relay keys.
+- Keep `.env` local and never commit test credentials.
 
-Create the local work configuration from the tracked template:
+Interactive Deeplink runs prompt for missing test-profile credentials and keep
+them only for that run. For non-interactive/CI runs, create a local
+configuration file from the tracked template:
 
 ```bash
 cp .env.example .env
 ```
 
-`.env.example` documents the configuration required for the current Deeplink
-workbook, plus optional reporting and runtime controls. Replace every
-applicable placeholder locally; never commit `.env`.
+`.env.example` contains only the current workbook profile placeholders; never
+commit `.env`.
 
-AppPilot uses `DefaultAzureCredential` and requests the
-`https://ai.azure.com/.default` scope. The signed-in identity must have the
-`Cognitive Services OpenAI User` role on the Azure OpenAI resource.
-
-`/init` and `./run` check Azure AI token availability before model use.
-Interactive runs can launch `az login`.
-Users normally choose their work account in the Azure CLI sign-in flow.
+`/init` and `./run` prompt for work Azure CLI sign-in when required.
 
 Deeplink suites resolve every workbook `License` before APK or device work.
 License values are converted to profile-specific environment suffixes such as
@@ -197,7 +176,7 @@ License values are converted to profile-specific environment suffixes such as
 
 ## Running AppPilot
 
-With a device connected and `.env` in place, run a **test suite**:
+With a device connected, run a **test suite**:
 
 ```bash
 ./run
@@ -207,8 +186,8 @@ With a device connected and `.env` in place, run a **test suite**:
 otherwise a numbered prompt), then that use case's **test suite** (auto when only
 one workbook exists, otherwise a numbered prompt), then executes all of its test
 cases. Skip use-case selection with `--usecase NAME`; any remaining options are
-passed through to that use case's runner. The wrapper auto-selects a Python 3.11+
-interpreter.
+passed through to that use case's runner. The wrapper auto-selects a Python
+3.11-3.13 interpreter.
 
 To invoke the Deeplink compatibility entry point directly, bypassing top-level
 use-case selection:
@@ -257,7 +236,6 @@ AppPilot installs only a user-provided local `.apk`. Configure it through
 Emailing the suite report is **optional**. `/init` can save a default recipient
 in `.apppilot_recipient` (gitignored). Suite runs prompt before sending.
 
-Email delivery needs `APPPILOT_EMAIL_API_URL` and `APPPILOT_EMAIL_API_KEY`.
 `/init` or a suite run prompts for the recipient and saves it locally. Reports
 include the AppPilot contact address. Delivery only happens after a suite
 finishes and never affects the run verdict. See
@@ -265,8 +243,7 @@ finishes and never affects the run verdict. See
 
 ## Telemetry
 
-Telemetry is **optional** and off unless `APPPILOT_TELEMETRY_URL` is set. It
-uses `APPPILOT_TELEMETRY_API_KEY` and never affects the suite verdict. See
+Telemetry is **optional** and never affects the suite verdict. See
 [`email_service/README.md`](email_service/README.md).
 
 ## Documentation

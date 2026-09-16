@@ -11,6 +11,11 @@ if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ] \
     exec "$VIRTUAL_ENV/bin/python" "$DIR/src/apppilot_run.py" "$@"
 fi
 
+if [ -x "$DIR/.venv/bin/python" ] \
+    && is_supported_python "$DIR/.venv/bin/python"; then
+    exec "$DIR/.venv/bin/python" "$DIR/src/apppilot_run.py" "$@"
+fi
+
 for PY in python3 python3.13 python3.12 python3.11; do
     if command -v "$PY" >/dev/null 2>&1 \
         && is_supported_python "$PY"; then

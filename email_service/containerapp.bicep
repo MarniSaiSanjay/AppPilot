@@ -7,18 +7,6 @@ param senderAddress string
 @description('Default recipient.')
 param defaultRecipient string = ''
 
-@secure()
-@description('Azure Communication Services connection string.')
-param acsConnectionString string
-
-@secure()
-@description('Email API key.')
-param emailApiKey string
-
-@secure()
-@description('Telemetry API key.')
-param telemetryApiKey string
-
 resource environment 'Microsoft.App/managedEnvironments@2024-03-01' existing = {
   name: 'cae-apppilot'
 }
@@ -35,6 +23,14 @@ resource telemetryStorage 'Microsoft.Storage/storageAccounts@2023-05-01' existin
   name: 'stapppilot'
 }
 
+resource relayKeyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: 'kvapppilotplg9b1'
+}
+
+resource communicationService 'Microsoft.Communication/communicationServices@2023-04-01' existing = {
+  name: 'acs-apppilot'
+}
+
 resource telemetryTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
   name: 'stapppilot/default/SuiteRuns'
 }
@@ -48,6 +44,36 @@ resource telemetryTableRole 'Microsoft.Authorization/roleAssignments@2022-04-01'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+    )
+  }
+}
+
+resource relayKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(
+    relayKeyVault.id,
+    relayIdentity.id,
+    '4633458b-17de-408a-b874-0445c86b69e6'
+  )
+  scope: relayKeyVault
+  properties: {
+    principalId: relayIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '4633458b-17de-408a-b874-0445c86b69e6'
+    )
+  }
+}
+
+resource relayRegistryPullRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '76fe6fb8-8f1f-4046-9b8b-6dc3bd4b2422'
+  scope: registry
+  properties: {
+    principalId: relayIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      '7f951dda-4ed3-4680-a7ca-43fe172d538d'
     )
   }
 }
@@ -86,15 +112,17 @@ resource relay 'Microsoft.App/containerApps@2024-03-01' = {
       secrets: [
         {
           name: 'acs-conn'
-          value: acsConnectionString
+          value: communicationService.listKeys().primaryConnectionString
         }
         {
           name: 'api-key'
-          value: emailApiKey
+          keyVaultUrl: '${relayKeyVault.properties.vaultUri}secrets/apppilot-email-relay-key'
+          identity: relayIdentity.id
         }
         {
           name: 'telemetry-api-key'
-          value: telemetryApiKey
+          keyVaultUrl: '${relayKeyVault.properties.vaultUri}secrets/apppilot-telemetry-relay-key'
+          identity: relayIdentity.id
         }
       ]
     }
@@ -183,6 +211,8 @@ resource relay 'Microsoft.App/containerApps@2024-03-01' = {
   }
   dependsOn: [
     telemetryTableRole
+    relayKeyVaultRole
+    relayRegistryPullRole
   ]
 }
 

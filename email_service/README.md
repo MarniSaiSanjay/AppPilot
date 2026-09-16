@@ -28,6 +28,7 @@ Required resources:
 | Container App | HTTPS relay |
 | Storage Account | Table Storage for telemetry |
 | Table | One row per suite run |
+| Key Vault | Relay API-key storage and AppPilot runtime retrieval |
 
 ## Security model
 
@@ -56,9 +57,9 @@ docker build --tag apppilot-email-relay:local ./email_service
 Tests cover email/telemetry keys, fixed sender, recipient handling, telemetry
 schema, and sanitized provider failures.
 
-`containerapp.bicep` owns the `SuiteRuns` table and its table-scoped role
-assignment. Deploy it before enabling telemetry. The relay cannot create tables
-at runtime.
+`containerapp.bicep` owns the `SuiteRuns` table and the relay identity's
+table-scoped, Key Vault, and registry-pull role assignments. Deploy it before
+enabling telemetry. The relay cannot create tables at runtime.
 
 ## Server-side environment (set on the Container App, not the CLI)
 
@@ -67,20 +68,16 @@ at runtime.
 | `ACS_SENDER_ADDRESS` | fixed managed-domain sender |
 | `APPPILOT_EMAIL_TO` | default recipient(s) when request omits `to`, comma/semicolon separated |
 | `ACS_CONNECTION_STRING` | `secretref:acs-conn` |
-| `APPPILOT_API_KEY` | `secretref:api-key` |
-| `APPPILOT_TELEMETRY_API_KEY` | `secretref:telemetry-api-key` |
+| `APPPILOT_API_KEY` | `secretref:api-key`, sourced from Key Vault |
+| `APPPILOT_TELEMETRY_API_KEY` | `secretref:telemetry-api-key`, sourced from Key Vault |
 | `TELEMETRY_TABLE_ENDPOINT` | Table service endpoint |
 | `AZURE_CLIENT_ID` | relay managed-identity client ID |
 
 ## AppPilot CLI integration
 
-The relay is the send transport in `src/apppilot/email_delivery.py`. The CLI holds
-no `AZURE_*` credentials. It needs two settings:
-
-| Variable | Value |
-| --- | --- |
-| `APPPILOT_EMAIL_API_URL` | `https://<app-fqdn>/send-report` |
-| `APPPILOT_EMAIL_API_KEY` | the `api-key` secret value |
+The relay is the send transport in `src/apppilot/email_delivery.py`. The CLI
+uses its work Entra identity to retrieve AppPilot-owned relay configuration and
+the scoped relay keys from Key Vault; users do not configure relay settings.
 
 The client posts `{subject, body[, html][, to]}` with an `X-API-Key` header over
 HTTPS only and treats any 2xx as success.
@@ -98,5 +95,7 @@ az acr build -r acrapppilot -t apppilot-relay:<version> ./email_service
 ```
 
 Build and deploy an immutable image with `containerapp.bicep`. Required
-parameters: `image`, `senderAddress`, `acsConnectionString`, `emailApiKey`, and
-`telemetryApiKey`. `defaultRecipient` is optional.
+parameters: `image` and `senderAddress`. `defaultRecipient` is optional. The
+template derives its ACS connection string from the existing `acs-apppilot`
+Communication Service in the same resource group and references the existing
+AppPilot Key Vault for the email and telemetry relay secrets.

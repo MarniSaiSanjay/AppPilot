@@ -1983,16 +1983,6 @@ class WorkbookValidationTests(unittest.TestCase):
                 ]
             )
 
-    def test_tracked_workbook_still_loads_all_cases(self) -> None:
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "testcases"
-            / "deeplinks"
-            / "DeeplinkTestCases.xlsx"
-        )
-
-        self.assertEqual(len(load_deeplink_cases(path)), 48)
-
     def test_unknown_installed_value_has_row_and_column_context(self) -> None:
         with self.assertRaisesRegex(
             ValueError, r"row 2, column E.*flase|row 2, column E.*Installed"

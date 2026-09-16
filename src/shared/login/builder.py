@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import os
 import subprocess
 import sys
@@ -30,7 +31,7 @@ try:
         ModelDecisionProvider,
         UnconfiguredModelDecisionProvider,
     )
-    from ...apppilot.models import RuntimeContext
+    from ...apppilot.models import CredentialKind, RuntimeContext
     from ...apppilot.safety import SafetyValidator
     from ...apppilot import device_config, logtags
     from ..entra_auth import ensure_entra_model_readiness
@@ -57,7 +58,7 @@ except ImportError:
         ModelDecisionProvider,
         UnconfiguredModelDecisionProvider,
     )
-    from apppilot.models import RuntimeContext
+    from apppilot.models import CredentialKind, RuntimeContext
     from apppilot.safety import SafetyValidator
     from apppilot import device_config, logtags
     from shared.entra_auth import ensure_entra_model_readiness
@@ -88,10 +89,40 @@ def resolve_decision_provider(
     provider = LLMModelDecisionProvider.from_env()
     if provider is None:
         provider = UnconfiguredModelDecisionProvider(
-            "Set APPPILOT_MODEL and APPPILOT_MODEL_BASE_URL to connect the "
-            "work Azure OpenAI decision model."
+            "AppPilot model configuration is unavailable. Update AppPilot and retry."
         )
     return provider
+
+
+def _resolve_runtime_context(
+    *,
+    interactive: bool,
+    env: dict[str, str] | None = None,
+    input_fn: Callable[[str], str] = input,
+    password_fn: Callable[[str], str] = getpass.getpass,
+    output: Callable[[str], None] = print,
+) -> RuntimeContext:
+    """Resolve standalone-login credentials without persisting prompted values."""
+    source = dict(os.environ if env is None else env)
+    username = source.get("APPPILOT_USERNAME", "").strip()
+    password = source.get("APPPILOT_PASSWORD", "")
+    if (username and password) or not interactive:
+        return RuntimeContext.from_env(source)
+
+    output("Test account credentials required for standalone login.")
+    try:
+        if not username:
+            username = input_fn("Test account username: ").strip()
+        if not password:
+            password = password_fn("Test account password: ")
+    except (EOFError, KeyboardInterrupt) as error:
+        raise ValueError("standalone credential entry cancelled") from error
+    if not username or not password:
+        raise ValueError("standalone login requires a username and password")
+    return RuntimeContext({
+        CredentialKind.USERNAME: username,
+        CredentialKind.PASSWORD: password,
+    })
 
 
 def build_login_agent(
@@ -245,6 +276,12 @@ def main() -> int:
         return 2
 
     try:
+        runtime_context = _resolve_runtime_context(interactive=interactive)
+    except ValueError as error:
+        print(f"ERROR: invalid credential configuration: {error}", file=sys.stderr)
+        return 2
+
+    try:
         trust_config = ApkTrustConfig.from_env()
     except ApkTrustConfigurationError as error:
         print(f"ERROR: invalid APK trust configuration: {error}", file=sys.stderr)
@@ -275,6 +312,7 @@ def main() -> int:
                 executor=executor,
                 observer=observer,
                 foreground_check=executor.is_foreground,
+                runtime_context=runtime_context,
                 max_actions=args.max_actions,
                 max_stuck_actions=args.max_stuck_actions,
             )

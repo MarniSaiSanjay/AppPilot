@@ -21,6 +21,7 @@ from . import (
     email_delivery,
     environment,
 )
+from .work_defaults import RelayConfigurationError, load_relay_secrets
 
 from .agent import _load_dotenv
 try:
@@ -262,15 +263,14 @@ def check_model(env: Optional[Mapping[str, str]] = None) -> CheckResult:
         return CheckResult(
             "model", _MODEL, Importance.REQUIRED, Status.NOT_CONFIGURED,
             "Model not configured",
-            "Configure APPPILOT_MODEL and APPPILOT_MODEL_BASE_URL for work Azure OpenAI.",
+            "AppPilot model configuration is unavailable. Update AppPilot and retry.",
         )
     problem = _model_config_problem(config)
     if problem is not None:
         return CheckResult(
             "model", _MODEL, Importance.REQUIRED, Status.FAIL,
             f"Model misconfigured ({problem})",
-            "Fix the model configuration: set APPPILOT_MODEL and a valid "
-            "Azure OpenAI APPPILOT_MODEL_BASE_URL ending in /openai/v1.",
+            "AppPilot model configuration is invalid. Update AppPilot and retry.",
         )
     return CheckResult(
         "model", _MODEL, Importance.REQUIRED, Status.PASS,
@@ -661,8 +661,7 @@ def check_apk(
             Importance.REQUIRED,
             Status.FAIL,
             f"APK trust validation failed ({error})",
-            "Configure APPPILOT_EXPECTED_PACKAGE_ID and "
-            "APPPILOT_TRUSTED_CERT_SHA256, and provide a matching signed APK.",
+            "Provide the approved signed APK and retry.",
         )
     return CheckResult(
         "apk", _APK, Importance.REQUIRED, Status.PASS,
@@ -877,7 +876,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             interactive=_is_interactive(),
         )
         apk_result = check_apk(interactive=_is_interactive(), env=os.environ)
-        email_result = check_email(interactive=_is_interactive())
+        try:
+            relay_env = {**os.environ, **load_relay_secrets()}
+        except RelayConfigurationError as error:
+            email_result = CheckResult(
+                "email",
+                _EMAIL,
+                Importance.OPTIONAL,
+                Status.WARNING,
+                "AppPilot email relay configuration unavailable",
+                str(error),
+            )
+        else:
+            email_result = check_email(
+                interactive=_is_interactive(),
+                env=relay_env,
+            )
         results = _compose_results(core, device_results, apk_result, email_result)
         text, exit_code = render(results)
         print(text)
