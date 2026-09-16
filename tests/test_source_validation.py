@@ -28,10 +28,10 @@ class SourceValidationTests(unittest.TestCase):
             "embedded credential",
         })
 
-    def test_secret_scan_allows_documented_placeholders(self) -> None:
+    def test_secret_scan_allows_relay_key_placeholders(self) -> None:
         findings = scan_text(
             Path("README.md"),
-            'APPPILOT_MODEL_API_KEY = "your-key-here"\n',
+            'APPPILOT_EMAIL_API_KEY = "your-key-here"\n',
         )
 
         self.assertEqual(findings, [])

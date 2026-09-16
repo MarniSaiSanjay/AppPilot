@@ -88,9 +88,8 @@ def resolve_decision_provider(
     provider = LLMModelDecisionProvider.from_env()
     if provider is None:
         provider = UnconfiguredModelDecisionProvider(
-            "Set APPPILOT_MODEL and configure APPPILOT_MODEL_AUTH as api_key "
-            "or entra (plus APPPILOT_MODEL_API_KEY for api_key mode) to connect "
-            "a real decision model."
+            "Set APPPILOT_MODEL and APPPILOT_MODEL_BASE_URL to connect the "
+            "work Azure OpenAI decision model."
         )
     return provider
 

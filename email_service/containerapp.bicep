@@ -126,7 +126,7 @@ resource relay 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'APPPILOT_TELEMETRY_API_KEY'
-              secretRef: 'telemetry-api-key'
+              secretRef: 'telemetry-api-key' // # allow-secret
             }
             {
               name: 'TELEMETRY_TABLE_ENDPOINT'

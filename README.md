@@ -141,15 +141,13 @@ delivery, or telemetry delivery.
 
 AppPilot reads configuration from environment variables. A local, **git-ignored**
 `.env` file at the repository root is loaded automatically at startup (real
-environment variables always take precedence).
+environment variables always take precedence). The decision model is the
+work-owned Azure OpenAI deployment and authenticates through Microsoft Entra.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `APPPILOT_MODEL` | yes* | Decision-model deployment/name (e.g. `gpt-4.1-mini`). |
-| `APPPILOT_MODEL_AUTH` | no | Model authentication mode: `api_key` (default) or `entra`. |
-| `APPPILOT_MODEL_API_KEY` | for API-key auth | API key for the model endpoint; blank for Entra auth. |
-| `APPPILOT_MODEL_BASE_URL` | no for API-key auth; yes for Entra auth | Model endpoint. Entra mode requires Azure OpenAI `/openai/v1`. |
-| `APPPILOT_ENTRA_TENANT_ID` | no | Azure tenant ID for interactive Azure CLI sign-in. |
+| `APPPILOT_MODEL_BASE_URL` | yes | Work Azure OpenAI endpoint ending in `/openai/v1`. |
 | `APPPILOT_EXPECTED_PACKAGE_ID` | yes for APK runs | Expected Android application/package ID. |
 | `APPPILOT_TRUSTED_CERT_SHA256` | yes for APK runs | Trusted signing-certificate SHA-256 fingerprint. |
 | `APPPILOT_USERNAME` | for standalone login | Default sign-in username/email for standalone login. |
@@ -160,7 +158,6 @@ environment variables always take precedence).
 | `APPPILOT_MAX_STUCK_ACTIONS` | no | Consecutive unchanged actions before controlled FAIL (default `5`). |
 | `APPPILOT_EMAIL_API_URL` | for email | HTTPS relay endpoint used to send the suite report. |
 | `APPPILOT_EMAIL_API_KEY` | for email | Scoped API key for the email relay. |
-| `APPPILOT_CONTACT_EMAIL` | no | Optional contact address shown in the report footer (omitted if unset). |
 | `APPPILOT_TELEMETRY_URL` | for telemetry | HTTPS relay `/telemetry` endpoint. Unset disables telemetry. |
 | `APPPILOT_TELEMETRY_API_KEY` | for telemetry | Telemetry-only API key. |
 
@@ -173,42 +170,25 @@ Security:
   prompts, UI observations, logs, or source code.
 - Before credential injection, AppPilot revalidates APK trust, foreground app,
   and the target field.
-- Keep `.env` local and never commit real credentials or API keys.
+- Keep `.env` local and never commit real credentials or work relay keys.
 
-Example `.env`:
+Create the local work configuration from the tracked template:
 
-```dotenv
-APPPILOT_MODEL=gpt-4.1-mini
-APPPILOT_MODEL_AUTH=api_key
-APPPILOT_MODEL_API_KEY=your-key-here
-APPPILOT_MODEL_BASE_URL=https://your-endpoint.openai.azure.com/openai/v1
-APPPILOT_EXPECTED_PACKAGE_ID=com.example.apppilot
-APPPILOT_TRUSTED_CERT_SHA256=replace-with-the-trusted-64-hex-sha256-fingerprint
-APPPILOT_USERNAME=you@example.com
-APPPILOT_PASSWORD=your-password
-APPPILOT_USERNAME_PREMIUM=premium-user@example.com
-APPPILOT_PASSWORD_PREMIUM=your-premium-password
-APPPILOT_USERNAME_ENTRA_STARTER=starter-user@example.com
-APPPILOT_PASSWORD_ENTRA_STARTER=your-starter-password
+```bash
+cp .env.example .env
 ```
 
-For keyless Azure OpenAI access, sign in with Azure CLI and use:
+`.env.example` documents the configuration required for the current Deeplink
+workbook, plus optional reporting and runtime controls. Replace every
+applicable placeholder locally; never commit `.env`.
 
-```dotenv
-APPPILOT_MODEL=gpt-4.1-mini
-APPPILOT_MODEL_AUTH=entra
-APPPILOT_MODEL_API_KEY=
-APPPILOT_MODEL_BASE_URL=https://your-endpoint.openai.azure.com/openai/v1
-APPPILOT_ENTRA_TENANT_ID=your-work-tenant-id
-```
-
-Entra mode uses `DefaultAzureCredential` and requests the
+AppPilot uses `DefaultAzureCredential` and requests the
 `https://ai.azure.com/.default` scope. The signed-in identity must have the
 `Cognitive Services OpenAI User` role on the Azure OpenAI resource.
 
-When Entra mode is selected, `/init` and `./run` check Azure AI token
-availability before model use. Interactive runs can launch `az login`.
-`APPPILOT_ENTRA_TENANT_ID` constrains Azure CLI sign-in to a tenant.
+`/init` and `./run` check Azure AI token availability before model use.
+Interactive runs can launch `az login`.
+Users normally choose their work account in the Azure CLI sign-in flow.
 
 Deeplink suites resolve every workbook `License` before APK or device work.
 License values are converted to profile-specific environment suffixes such as
@@ -277,9 +257,10 @@ AppPilot installs only a user-provided local `.apk`. Configure it through
 Emailing the suite report is **optional**. `/init` can save a default recipient
 in `.apppilot_recipient` (gitignored). Suite runs prompt before sending.
 
-Email delivery needs `APPPILOT_EMAIL_API_URL` and `APPPILOT_EMAIL_API_KEY`; an
-optional `APPPILOT_CONTACT_EMAIL` appears in the report footer. Delivery only
-happens after a suite finishes and never affects the run verdict. See
+Email delivery needs `APPPILOT_EMAIL_API_URL` and `APPPILOT_EMAIL_API_KEY`.
+`/init` or a suite run prompts for the recipient and saves it locally. Reports
+include the AppPilot contact address. Delivery only happens after a suite
+finishes and never affects the run verdict. See
 [`email_service/README.md`](email_service/README.md).
 
 ## Telemetry

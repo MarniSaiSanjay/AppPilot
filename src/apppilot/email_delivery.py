@@ -18,6 +18,7 @@ _REQUIRED_ENV = (
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
 
 _RECIPIENT_STORE = Path(__file__).resolve().parents[2] / ".apppilot_recipient"
+_REPORT_CONTACT_EMAIL = "marnisanjay@microsoft.com"
 
 _MAX_BODY_CHARS = 190_000
 
@@ -109,7 +110,7 @@ def send_suite_report(
         return False
     destination = recipient or "the configured default recipient"
     _log(f"sending report to {destination} - this can take up to a minute...")
-    contact = (env.get("APPPILOT_CONTACT_EMAIL") or "").strip() or None
+    contact = _REPORT_CONTACT_EMAIL
     try:
         view = report.to_email_report()
         _post_report(

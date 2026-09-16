@@ -13,12 +13,12 @@ try:
     from ...apppilot import logtags
     from ...apppilot.models import UIElement, UIObservation
     from ...apppilot.safety import infer_credential_kind
-    from ..model_client import ChatModelClient, ModelTransportError, DEFAULT_BASE_URL
+    from ..model_client import ChatModelClient, ModelTransportError
 except ImportError:
     from apppilot import logtags
     from apppilot.models import UIElement, UIObservation
     from apppilot.safety import infer_credential_kind
-    from shared.model_client import ChatModelClient, ModelTransportError, DEFAULT_BASE_URL
+    from shared.model_client import ChatModelClient, ModelTransportError
 
 
 _LOGIN_GOAL_CACHE_VERSION = 2
@@ -414,22 +414,18 @@ class LLMLoginGoalEvaluator:
     def __init__(
         self,
         model: str,
-        api_key: str = "",
-        base_url: str = "https://api.openai.com/v1",
+        base_url: str,
         *,
         foreground_check: "Callable[[], bool] | None" = None,
         transport: "Callable[[dict], dict] | None" = None,
         timeout: float = 60.0,
         cache_path: "Path | None" = None,
         max_cache_entries: int = _DEFAULT_MAX_LOGIN_GOAL_CACHE_ENTRIES,
-        auth_mode: str = "api_key",
     ) -> None:
         self._client = ChatModelClient(
             model=model,
-            api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            auth_mode=auth_mode,
         )
         self._model = model
         self._foreground_check = foreground_check
@@ -469,9 +465,7 @@ class LLMLoginGoalEvaluator:
             return None
         return cls(
             model=config["model"],
-            api_key=config["api_key"],
             base_url=config["base_url"],
-            auth_mode=config["auth_mode"],
             foreground_check=foreground_check,
             transport=transport,
         )
@@ -737,19 +731,15 @@ class SemanticStateEvaluator:
     def __init__(
         self,
         model: str,
-        api_key: str = "",
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str,
         *,
         transport: "Callable[[dict], dict] | None" = None,
         timeout: float = 60.0,
-        auth_mode: str = "api_key",
     ) -> None:
         self._client = ChatModelClient(
             model=model,
-            api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            auth_mode=auth_mode,
         )
         self._model = model
         self._transport = transport or self._http_transport
@@ -772,9 +762,7 @@ class SemanticStateEvaluator:
             return None
         return cls(
             model=config["model"],
-            api_key=config["api_key"],
             base_url=config["base_url"],
-            auth_mode=config["auth_mode"],
             transport=transport,
         )
 

@@ -306,8 +306,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if judge is None:
         print(
             "ERROR: no evaluation model configured. Set APPPILOT_MODEL and "
-            "configure APPPILOT_MODEL_AUTH as api_key or entra "
-            "(plus APPPILOT_MODEL_API_KEY for api_key mode).",
+            "APPPILOT_MODEL_BASE_URL for work Azure OpenAI.",
             file=sys.stderr,
         )
         return 2

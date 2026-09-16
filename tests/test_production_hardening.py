@@ -6,7 +6,6 @@ import io
 import os
 import subprocess
 import sys
-import threading
 import unittest
 import urllib.error
 import math
@@ -14,7 +13,6 @@ import json
 import tempfile
 import zipfile
 from html import escape
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -61,7 +59,6 @@ from shared.login.goal import LLMLoginGoalEvaluator, SemanticStateEvaluator
 from shared.model_client import (
     ChatModelClient,
     ModelConfigurationError,
-    ModelTransportError,
 )
 from usecases.deeplink.deeplink_testcase_loader import (
     DeeplinkTestCase,
@@ -82,6 +79,7 @@ from usecases.deeplink.verification import (
 
 PACKAGE = "com.example.apppilot"
 CERT = "AB" * 32
+MODEL_BASE_URL = "https://model.openai.azure.com/openai/v1"
 
 
 def completed(stdout: str = "", stderr: str = "", returncode: int = 0):
@@ -909,7 +907,7 @@ class ModelResponseShapeTests(unittest.TestCase):
             with self.subTest(content=content):
                 provider = LLMModelDecisionProvider(
                     model="test-model",
-                    api_key="test-key",
+                    base_url=MODEL_BASE_URL,
                     transport=lambda _payload, value=content: self.response(value),
                 )
 
@@ -924,7 +922,7 @@ class ModelResponseShapeTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     evaluator = LLMLoginGoalEvaluator(
                         model="test-model",
-                        api_key="test-key",
+                        base_url=MODEL_BASE_URL,
                         transport=lambda _payload, value=content: self.response(value),
                         cache_path=Path(directory) / "goal-cache.json",
                     )
@@ -938,7 +936,7 @@ class ModelResponseShapeTests(unittest.TestCase):
             with self.subTest(content=content):
                 evaluator = SemanticStateEvaluator(
                     model="test-model",
-                    api_key="test-key",
+                    base_url=MODEL_BASE_URL,
                     transport=lambda _payload, value=content: self.response(value),
                 )
 
@@ -952,7 +950,7 @@ class ExpectationJudgeFailureTests(unittest.TestCase):
     def judge(transport) -> LLMExpectationJudge:
         return LLMExpectationJudge(
             model="test-model",
-            api_key="test-key",
+            base_url=MODEL_BASE_URL,
             transport=transport,
         )
 
@@ -1013,97 +1011,29 @@ class NetworkSecurityTests(unittest.TestCase):
         response.read.return_value = b'{"choices": []}'
         open_request.return_value = response
 
-        result = ChatModelClient("model", "key").send({"messages": []})
+        result = ChatModelClient(
+            "model",
+            MODEL_BASE_URL,
+            token_provider=lambda: "entra-token",
+        ).send({"messages": []})
 
         self.assertEqual(result, {"choices": []})
         open_request.assert_called_once()
-
-    def test_model_redirects_are_rejected_without_followup_request(
-        self,
-    ) -> None:
-        origin_requests = []
-        destination_requests = []
-
-        class DestinationHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                destination_requests.append(dict(self.headers))
-                self.send_response(200)
-                self.end_headers()
-
-            do_POST = do_GET
-
-            def log_message(self, _format, *_args):
-                pass
-
-        destination = ThreadingHTTPServer(
-            ("127.0.0.1", 0), DestinationHandler
-        )
-        destination_thread = threading.Thread(
-            target=destination.serve_forever, daemon=True
-        )
-        destination_thread.start()
-
-        class RedirectHandler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                origin_requests.append(dict(self.headers))
-                self.send_response(302)
-                self.send_header(
-                    "Location",
-                    "http://127.0.0.1:"
-                    f"{destination.server_port}/redirected",
-                )
-                self.end_headers()
-
-            def log_message(self, _format, *_args):
-                pass
-
-        origin = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
-        origin_thread = threading.Thread(
-            target=origin.serve_forever, daemon=True
-        )
-        origin_thread.start()
-        try:
-            client = ChatModelClient(
-                "model",
-                "key",
-                f"http://127.0.0.1:{origin.server_port}",
-            )
-
-            with self.assertRaises(ModelTransportError):
-                client.send({"messages": []})
-
-            self.assertEqual(len(origin_requests), 1)
-            self.assertIn("Authorization", origin_requests[0])
-            self.assertEqual(destination_requests, [])
-        finally:
-            origin.shutdown()
-            destination.shutdown()
-            origin.server_close()
-            destination.server_close()
-            origin_thread.join(timeout=2)
-            destination_thread.join(timeout=2)
 
     def test_malformed_model_url_is_controlled_configuration_error(
         self,
     ) -> None:
         with self.assertRaises(ModelConfigurationError):
-            ChatModelClient("model", "key", "https://[invalid")
+            ChatModelClient("model", "https://[invalid")
 
-    def test_remote_http_model_endpoint_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ModelConfigurationError, "must use https"):
-            ChatModelClient("model", "key", "http://model.example.test/v1")
+    def test_non_azure_model_endpoint_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ModelConfigurationError, "openai.azure.com"):
+            ChatModelClient("model", "https://model.example.test/openai/v1")
 
-    def test_https_model_endpoint_is_accepted(self) -> None:
-        client = ChatModelClient(
-            "model", "key", "https://model.example.test/v1/"
-        )
+    def test_azure_openai_model_endpoint_is_accepted(self) -> None:
+        client = ChatModelClient("model", MODEL_BASE_URL + "/")
 
-        self.assertEqual(client._base_url, "https://model.example.test/v1")
-
-    def test_loopback_http_model_endpoint_is_accepted(self) -> None:
-        client = ChatModelClient("model", "key", "http://127.0.0.1:8000/v1")
-
-        self.assertEqual(client._base_url, "http://127.0.0.1:8000/v1")
+        self.assertEqual(client._base_url, MODEL_BASE_URL)
 
     @patch("apppilot.telemetry._host_os", return_value="macOS")
     def test_telemetry_https_uses_separate_credential(self, _host_os) -> None:
@@ -1271,7 +1201,7 @@ class ConfigurationValidationTests(unittest.TestCase):
 
     def test_model_rejects_invalid_timeout(self) -> None:
         with self.assertRaisesRegex(ModelConfigurationError, "timeout"):
-            ChatModelClient("model", "key", timeout=0)
+            ChatModelClient("model", MODEL_BASE_URL, timeout=0)
 
     def test_explicit_device_must_be_authorized_and_booted(self) -> None:
         messages = []
@@ -1573,8 +1503,8 @@ class ClipboardAndMaestroEnvironmentTests(unittest.TestCase):
                 "HOME": "/home/test",
                 "JAVA_HOME": "/java",
                 "TMPDIR": "/tmp",
-                "APPPILOT_MODEL_API_KEY": "model-secret",
                 "APPPILOT_EMAIL_API_KEY": "email-secret",
+                "APPPILOT_TELEMETRY_API_KEY": "fake-credential-for-test-fixture",
                 "APPPILOT_USERNAME_PREMIUM": "person@example.test",
             }
         )
@@ -1583,8 +1513,8 @@ class ClipboardAndMaestroEnvironmentTests(unittest.TestCase):
         self.assertEqual(environment["HOME"], "/home/test")
         self.assertEqual(environment["JAVA_HOME"], "/java")
         self.assertEqual(environment["TMPDIR"], "/tmp")
-        self.assertNotIn("APPPILOT_MODEL_API_KEY", environment)
         self.assertNotIn("APPPILOT_EMAIL_API_KEY", environment)
+        self.assertNotIn("APPPILOT_TELEMETRY_API_KEY", environment)
         self.assertNotIn("APPPILOT_USERNAME_PREMIUM", environment)
         self.assertNotIn("MAESTRO_APPPILOT_INPUT_SECRET", environment)
 
@@ -1608,7 +1538,6 @@ class ClipboardAndMaestroEnvironmentTests(unittest.TestCase):
 
         environment = run.call_args.kwargs["env"]
         self.assertIn("PATH", environment)
-        self.assertNotIn("APPPILOT_MODEL_API_KEY", environment)
         flow_path = Path(run.call_args.args[0][-1])
         self.assertFalse(flow_path.exists())
 
@@ -2357,8 +2286,9 @@ class TimeoutBudgetTests(unittest.TestCase):
         urlopen.return_value = Response()
         client = ChatModelClient(
             model="test-model",
-            api_key="test-key",
+            base_url=MODEL_BASE_URL,
             timeout=7,
+            token_provider=lambda: "entra-token",
         )
 
         client.send({"messages": []})
@@ -2518,7 +2448,7 @@ class FailureArtifactTests(unittest.TestCase):
     ) -> None:
         secret = "artifact-secret-value"
         writer = self.writer(
-            environment={"APPPILOT_MODEL_API_KEY": secret}
+            environment={"APPPILOT_EMAIL_API_KEY": secret}
         )
 
         path = writer.write(
@@ -3316,7 +3246,7 @@ class FinalBlockerRegressionTests(unittest.TestCase):
         )
         judge = LLMExpectationJudge(
             model="test-model",
-            api_key="test-key",
+            base_url=MODEL_BASE_URL,
             transport=transport,
         )
         malicious = (

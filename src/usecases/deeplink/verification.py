@@ -89,19 +89,15 @@ class LLMExpectationJudge:
     def __init__(
         self,
         model: str,
-        api_key: str = "",
-        base_url: str = "https://api.openai.com/v1",
+        base_url: str,
         transport: Callable[[dict], dict] | None = None,
         timeout: float = 60.0,
-        auth_mode: str = "api_key",
     ) -> None:
         self._model = model
         self._client = ChatModelClient(
             model=model,
-            api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            auth_mode=auth_mode,
         )
         self._transport = transport or self._http_transport
         self._cache_key: tuple | None = None

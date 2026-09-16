@@ -185,7 +185,7 @@
         <li><strong>Maestro CLI</strong> — the tool that actually taps/types on the device.</li>
         <li><strong>Android SDK platform-tools and build tools</strong> — <code>adb</code>, <code>apksigner</code>, and either <code>apkanalyzer</code> or <code>aapt</code> — plus an Android emulator or physical device.</li>
         <li>For the standalone login CLI, the target app installed on the device. The deeplink suite manages its local APK installation.</li>
-        <li>An <strong>OpenAI-compatible LLM endpoint</strong> — a model name/deployment and an API key.</li>
+        <li>A <strong>work Azure OpenAI deployment</strong> and Microsoft Entra access to it.</li>
       </ul>
       <div class="note">
         <strong>Quick version checks</strong>
@@ -228,7 +228,7 @@ python -m pip install -r requirements-dev.txt</code></pre>
         </li>
         <li>
           <h3>Create your <code>.env</code> file</h3>
-          <p>See <a class="inline" href="#config">Configuration</a> below — this holds your model settings and (optionally) sign-in credentials. It is git-ignored, so nothing secret is ever committed.</p>
+          <p>Run <code>cp .env.example .env</code>, then see <a class="inline" href="#config">Configuration</a> to replace the work-only placeholders. The local <code>.env</code> is git-ignored, so nothing secret is ever committed.</p>
         </li>
       </ol>
     </section>
@@ -246,9 +246,8 @@ python -m pip install -r requirements-dev.txt</code></pre>
         </thead>
         <tbody>
           <tr><td><code>APPPILOT_MODEL</code></td><td class="req-yes">Yes</td><td>Decision-model deployment/name (e.g. <code>gpt-4.1-mini</code>).</td></tr>
-          <tr><td><code>APPPILOT_MODEL_API_KEY</code></td><td class="req-yes">Yes</td><td>API key for the model endpoint.</td></tr>
-          <tr><td><code>APPPILOT_MODEL_BASE_URL</code></td><td class="req-no">No</td><td>OpenAI-compatible base URL (defaults to the OpenAI v1 endpoint).</td></tr>
-          <tr><td><code>APPPILOT_USERNAME</code></td><td class="req-cond">For login</td><td><strong>Sign-in username/email for the app under test</strong> (e.g. the Microsoft account used to log into the Office hub app) — resolved locally and injected straight into Maestro, never sent to the model. <em>Not</em> the model API key.</td></tr>
+          <tr><td><code>APPPILOT_MODEL_BASE_URL</code></td><td class="req-yes">Yes</td><td>Work Azure OpenAI base URL ending in <code>/openai/v1</code>.</td></tr>
+          <tr><td><code>APPPILOT_USERNAME</code></td><td class="req-cond">For login</td><td><strong>Sign-in username/email for the app under test</strong> (e.g. the Microsoft account used to log into the Office hub app) — resolved locally and injected straight into Maestro, never sent to the model.</td></tr>
           <tr><td><code>APPPILOT_PASSWORD</code></td><td class="req-cond">For login</td><td><strong>Sign-in password for the app under test</strong> — handled the same secure way.</td></tr>
           <tr><td><code>APPPILOT_EXPECTED_PACKAGE_ID</code></td><td class="req-yes">APK runs</td><td>Expected Android package ID for both the local and installed APK.</td></tr>
           <tr><td><code>APPPILOT_TRUSTED_CERT_SHA256</code></td><td class="req-yes">APK runs</td><td>Trusted APK signing-certificate SHA-256 fingerprint (64 hexadecimal characters; colons optional).</td></tr>
@@ -256,12 +255,8 @@ python -m pip install -r requirements-dev.txt</code></pre>
           <tr><td><code>APPPILOT_MAX_STUCK_ACTIONS</code></td><td class="req-no">No</td><td>Consecutive no-change actions before a controlled early FAIL (default <code>5</code>).</td></tr>
         </tbody>
       </table>
-      <h3>Example <code>.env</code></h3>
-      <pre><code>APPPILOT_MODEL=gpt-4.1-mini
-APPPILOT_MODEL_API_KEY=your-key-here
-APPPILOT_MODEL_BASE_URL=https://your-endpoint.openai.azure.com/openai/v1
-APPPILOT_USERNAME=you@example.com
-APPPILOT_PASSWORD=your-password</code></pre>
+      <h3>Work <code>.env</code> template</h3>
+      <p>Start with <code>cp .env.example .env</code>. The tracked template documents the current Deeplink workbook configuration plus optional reporting and runtime controls. Replace its placeholders only in the local, git-ignored <code>.env</code> file.</p>
       <div class="warn">
         <strong>Credentials stay secret</strong>
         Credentials are never placed in prompts, observations, logs, exceptions, Maestro arguments, or source.
@@ -274,8 +269,8 @@ APPPILOT_PASSWORD=your-password</code></pre>
         <strong>These are the app's login credentials</strong>
         <code>APPPILOT_USERNAME</code> / <code>APPPILOT_PASSWORD</code> are the sign-in credentials for the
         <em>app being tested</em> (the account AppPilot signs in with when a scenario reaches a login screen).
-        They are only needed for login scenarios, and are unrelated to the model API key
-        (<code>APPPILOT_MODEL_API_KEY</code>) or any GitHub credentials.
+        They are only needed for login scenarios and are unrelated to Azure
+        authentication or any GitHub credentials.
       </div>
     </section>
 
@@ -388,7 +383,7 @@ RESULT</code></pre>
       </div>
       <div class="card">
         <h3 style="margin-top:0">"cannot proceed — no model configured"</h3>
-        <p>AppPilot never guesses. Set <code>APPPILOT_MODEL</code> and <code>APPPILOT_MODEL_API_KEY</code> in your <code>.env</code> (see <a class="inline" href="#config">Configuration</a>).</p>
+        <p>AppPilot never guesses. Set <code>APPPILOT_MODEL</code> and <code>APPPILOT_MODEL_BASE_URL</code> in your <code>.env</code>, then sign in with Azure CLI (see <a class="inline" href="#config">Configuration</a>).</p>
       </div>
       <div class="card">
         <h3 style="margin-top:0">Login goals fail</h3>

@@ -55,6 +55,9 @@ from usecases.deeplink.supported_links import SUPPORTED_LINK_DOMAINS
 from usecases.deeplink.verification import LLMExpectationJudge
 
 
+MODEL_BASE_URL = "https://model.openai.azure.com/openai/v1"
+
+
 class MaestroExecutorReliabilityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.credential_observer = Mock()
@@ -1060,7 +1063,7 @@ class LoginCompletionTests(unittest.TestCase):
             cache_path = Path(directory) / "goal-verdicts.json"
             first = LLMLoginGoalEvaluator(
                 "model",
-                "secret",
+                MODEL_BASE_URL,
                 transport=first_transport,
                 cache_path=cache_path,
             )
@@ -1073,7 +1076,7 @@ class LoginCompletionTests(unittest.TestCase):
 
             second = LLMLoginGoalEvaluator(
                 "model",
-                "secret",
+                MODEL_BASE_URL,
                 transport=second_transport,
                 cache_path=cache_path,
             )
@@ -1099,7 +1102,7 @@ class LoginCompletionTests(unittest.TestCase):
             cache_path = Path(directory) / "goal-verdicts.json"
             first = LLMLoginGoalEvaluator(
                 "model",
-                "secret",
+                MODEL_BASE_URL,
                 transport=Mock(return_value=response),
                 cache_path=cache_path,
             )
@@ -1112,7 +1115,7 @@ class LoginCompletionTests(unittest.TestCase):
             second_transport = Mock(return_value=response)
             second = LLMLoginGoalEvaluator(
                 "model",
-                "secret",
+                MODEL_BASE_URL,
                 transport=second_transport,
                 cache_path=cache_path,
             )
@@ -1136,7 +1139,7 @@ class LoginCompletionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             evaluator = LLMLoginGoalEvaluator(
                 "model",
-                "secret",
+                MODEL_BASE_URL,
                 transport=transport,
                 cache_path=Path(directory) / "goal-verdicts.json",
             )
@@ -1164,7 +1167,7 @@ class LoginCompletionTests(unittest.TestCase):
             cache_path = Path(directory) / "goal-verdicts.json"
             first = LLMLoginGoalEvaluator(
                 "model",
-                "secret",
+                MODEL_BASE_URL,
                 transport=Mock(return_value=response),
                 cache_path=cache_path,
             )
@@ -1174,7 +1177,7 @@ class LoginCompletionTests(unittest.TestCase):
             second_transport = Mock(return_value=response)
             second = LLMLoginGoalEvaluator(
                 "model",
-                "secret",
+                MODEL_BASE_URL,
                 transport=second_transport,
                 cache_path=cache_path,
             )
@@ -2718,7 +2721,7 @@ class DeeplinkAttemptRecoveryTests(unittest.TestCase):
         )
         judge = LLMExpectationJudge(
             model="test-model",
-            api_key="test-key",
+            base_url=MODEL_BASE_URL,
             transport=transport,
         )
         observation = self._input_observation()
@@ -3249,7 +3252,11 @@ class ModelClientReliabilityTests(unittest.TestCase):
             self._response(b'{"choices": []}'),
         ]
 
-        response = ChatModelClient("model", "secret").send({"messages": []})
+        response = ChatModelClient(
+            "model",
+            MODEL_BASE_URL,
+            token_provider=lambda: "entra-token",
+        ).send({"messages": []})
 
         self.assertEqual(response, {"choices": []})
         self.assertEqual(urlopen.call_count, 3)
@@ -3261,7 +3268,11 @@ class ModelClientReliabilityTests(unittest.TestCase):
         urlopen.return_value = self._response(b"not-json")
 
         with self.assertRaises(ModelTransportError):
-            ChatModelClient("model", "secret").send({"messages": []})
+            ChatModelClient(
+                "model",
+                MODEL_BASE_URL,
+                token_provider=lambda: "entra-token",
+            ).send({"messages": []})
 
         urlopen.assert_called_once()
         sleep.assert_not_called()

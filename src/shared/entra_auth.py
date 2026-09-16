@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from .model_client import (
-    AUTH_ENTRA,
     ChatModelClient,
     ModelTransportError,
     verify_entra_model_authentication,
@@ -100,7 +98,7 @@ def ensure_entra_model_readiness(
 ) -> EntraReadiness:
     """Check Entra model access and optionally perform a user-approved login."""
     config = ChatModelClient.config_from_env(env)
-    if not config or config["auth_mode"] != AUTH_ENTRA:
+    if not config:
         return EntraReadiness(required=False, ready=True)
 
     try:
@@ -126,20 +124,9 @@ def ensure_entra_model_readiness(
 
     previous_subscription = _current_subscription(runner)
     output("Opening the Azure CLI sign-in flow in your browser...")
-    tenant_id = env.get("APPPILOT_ENTRA_TENANT_ID", "").strip()
     login_command = ["az", "login"]
-    login_environment: dict[str, str] | None = None
-    if tenant_id:
-        login_command.extend(["--tenant", tenant_id, "--output", "none"])
-        login_environment = {
-            **os.environ,
-            "AZURE_CORE_LOGIN_EXPERIENCE_V2": "off",
-        }
     try:
-        if login_environment is None:
-            result = runner(login_command, check=False)
-        else:
-            result = runner(login_command, check=False, env=login_environment)
+        result = runner(login_command, check=False)
     except OSError:
         return EntraReadiness(
             required=True,

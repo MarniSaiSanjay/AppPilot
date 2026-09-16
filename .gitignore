@@ -8,6 +8,7 @@ venv/
 .idea/
 .vscode/
 .env.*
+!.env.example
 *.key
 
 ~$*

@@ -93,7 +93,7 @@ usecases  ->  shared  ->  apppilot
   model boundary, safety, data contracts, reporting). It knows nothing about
   any use case.
 - **`shared/`** holds reusable nodes that use cases compose:
-  `model_client` (OpenAI-compatible transport), `installer`, `warmup`, and the
+  `model_client` (Azure OpenAI transport), `installer`, `warmup`, and the
   generic `login/` node.
 - **`usecases/`** holds business/test-specific behavior; each use case gets its
   own folder. `usecases/deeplink/` is the authoritative Deeplink

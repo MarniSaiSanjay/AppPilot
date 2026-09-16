@@ -19,7 +19,6 @@ from shared.model_client import ModelTransportError
 
 _ENTRA_ENV = {
     "APPPILOT_MODEL": "gpt-4.1-mini",
-    "APPPILOT_MODEL_AUTH": "entra",
     "APPPILOT_MODEL_BASE_URL": "https://model.openai.azure.com/openai/v1",
 }
 
@@ -97,53 +96,6 @@ class EntraReadinessTests(unittest.TestCase):
         self.assertIn(
             "Opening the Azure CLI sign-in flow in your browser...",
             output,
-        )
-
-    def test_work_tenant_login_skips_subscription_selector(self) -> None:
-        verifier = Mock(
-            side_effect=[
-                ModelTransportError("not signed in"),
-                None,
-            ]
-        )
-        runner = Mock(
-            side_effect=[
-                subprocess.CompletedProcess(
-                    [], 0, stdout="previous-subscription\n", stderr=""
-                ),
-                subprocess.CompletedProcess([], 0),
-                subprocess.CompletedProcess([], 0),
-            ]
-        )
-
-        result = ensure_entra_model_readiness(
-            env={
-                **_ENTRA_ENV,
-                "APPPILOT_ENTRA_TENANT_ID": "work-tenant-id",
-            },
-            interactive=True,
-            input_fn=lambda _prompt: "y",
-            which=lambda name: "/usr/local/bin/az" if name == "az" else None,
-            runner=runner,
-            verifier=verifier,
-        )
-
-        self.assertTrue(result.ready)
-        login_call = runner.call_args_list[1]
-        self.assertEqual(
-            login_call.args[0],
-            [
-                "az",
-                "login",
-                "--tenant",
-                "work-tenant-id",
-                "--output",
-                "none",
-            ],
-        )
-        self.assertEqual(
-            login_call.kwargs["env"]["AZURE_CORE_LOGIN_EXPERIENCE_V2"],
-            "off",
         )
 
     def test_noninteractive_failure_does_not_launch_login(self) -> None:

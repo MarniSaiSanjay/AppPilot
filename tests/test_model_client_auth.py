@@ -13,7 +13,6 @@ from azure.core.exceptions import AzureError
 from apppilot.init import Status, check_model
 from usecases.deeplink import cli as deeplink_cli
 from shared.model_client import (
-    AUTH_ENTRA,
     AZURE_OPENAI_SCOPE,
     ChatModelClient,
     ModelConfigurationError,
@@ -23,78 +22,50 @@ from shared.model_client import (
 
 
 class ModelAuthenticationTests(unittest.TestCase):
-    def test_api_key_configuration_remains_the_default(self) -> None:
+    def test_work_azure_openai_configuration_requires_model_and_endpoint(self) -> None:
         config = ChatModelClient.config_from_env(
             {
                 "APPPILOT_MODEL": "deployment",
-                "APPPILOT_MODEL_API_KEY": "secret",
-                "APPPILOT_MODEL_BASE_URL": "https://model.example.test/v1",
-            }
-        )
-
-        self.assertEqual(config["auth_mode"], "api_key")
-        self.assertEqual(config["api_key"], "secret")
-
-    def test_entra_configuration_does_not_require_an_api_key(self) -> None:
-        config = ChatModelClient.config_from_env(
-            {
-                "APPPILOT_MODEL": "deployment",
-                "APPPILOT_MODEL_AUTH": "entra",
                 "APPPILOT_MODEL_BASE_URL": "https://model.openai.azure.com/openai/v1",
             }
         )
 
-        self.assertEqual(config["auth_mode"], AUTH_ENTRA)
-        self.assertEqual(config["api_key"], "")
+        self.assertEqual(config["model"], "deployment")
+        self.assertEqual(
+            config["base_url"], "https://model.openai.azure.com/openai/v1"
+        )
+        self.assertIsNone(
+            ChatModelClient.config_from_env({"APPPILOT_MODEL": "deployment"})
+        )
 
-    def test_entra_configuration_rejects_missing_or_non_azure_base_url(self) -> None:
+    def test_work_configuration_rejects_non_azure_base_url(self) -> None:
         with self.assertRaisesRegex(ModelConfigurationError, "openai.azure.com"):
             ChatModelClient.config_from_env(
                 {
                     "APPPILOT_MODEL": "deployment",
-                    "APPPILOT_MODEL_AUTH": "entra",
-                }
-            )
-        with self.assertRaisesRegex(ModelConfigurationError, "openai.azure.com"):
-            ChatModelClient.config_from_env(
-                {
-                    "APPPILOT_MODEL": "deployment",
-                    "APPPILOT_MODEL_AUTH": "entra",
                     "APPPILOT_MODEL_BASE_URL": "https://model.example.test/openai/v1",
                 }
             )
 
-    def test_entra_configuration_rejects_non_v1_azure_openai_path(self) -> None:
+    def test_work_configuration_rejects_non_v1_azure_openai_path(self) -> None:
         with self.assertRaisesRegex(ModelConfigurationError, "/openai/v1"):
             ChatModelClient.config_from_env(
                 {
                     "APPPILOT_MODEL": "deployment",
-                    "APPPILOT_MODEL_AUTH": "entra",
                     "APPPILOT_MODEL_BASE_URL": "https://model.openai.azure.com/v1",
                 }
             )
 
-    def test_direct_entra_client_rejects_non_azure_endpoint(self) -> None:
+    def test_direct_client_rejects_non_azure_endpoint(self) -> None:
         with self.assertRaisesRegex(ModelConfigurationError, "openai.azure.com"):
             ChatModelClient(
                 "deployment",
-                auth_mode="entra",
                 token_provider=Mock(return_value="entra-token"),
                 base_url="https://model.example.test/openai/v1",
             )
 
-    def test_entra_configuration_rejects_a_stale_api_key(self) -> None:
-        with self.assertRaisesRegex(ModelConfigurationError, "must be blank"):
-            ChatModelClient.config_from_env(
-                {
-                    "APPPILOT_MODEL": "deployment",
-                    "APPPILOT_MODEL_AUTH": "entra",
-                    "APPPILOT_MODEL_API_KEY": "stale-secret",
-                }
-            )
-
     @patch("shared.model_client._NO_REDIRECT_OPENER.open")
-    def test_entra_token_is_sent_as_bearer_auth(self, open_request) -> None:
+    def test_work_entra_token_is_sent_as_bearer_auth(self, open_request) -> None:
         response = Mock()
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
@@ -103,7 +74,6 @@ class ModelAuthenticationTests(unittest.TestCase):
         token_provider = Mock(return_value="entra-token")
         client = ChatModelClient(
             "deployment",
-            auth_mode="entra",
             token_provider=token_provider,
             base_url="https://model.openai.azure.com/openai/v1",
         )
@@ -147,17 +117,16 @@ class ModelAuthenticationTests(unittest.TestCase):
 
         self.assertEqual(handler_stream.getvalue(), "")
 
-    def test_init_accepts_entra_configuration(self) -> None:
+    def test_init_accepts_work_azure_openai_configuration(self) -> None:
         result = check_model(
             {
                 "APPPILOT_MODEL": "deployment",
-                "APPPILOT_MODEL_AUTH": "entra",
                 "APPPILOT_MODEL_BASE_URL": "https://model.openai.azure.com/openai/v1",
             }
         )
 
         self.assertEqual(result.status, Status.PASS)
-        self.assertIn("auth=entra", result.detail)
+        self.assertIn("Work Azure OpenAI", result.detail)
 
     def test_deeplink_cli_reports_login_model_configuration_error(self) -> None:
         stderr = io.StringIO()
@@ -201,7 +170,7 @@ class ModelAuthenticationTests(unittest.TestCase):
             patch.object(
                 deeplink_cli,
                 "resolve_decision_provider",
-                side_effect=ModelConfigurationError("stale API key"),
+                side_effect=ModelConfigurationError("invalid Azure OpenAI endpoint"),
             ),
             patch("sys.stderr", stderr),
         ):
@@ -211,7 +180,7 @@ class ModelAuthenticationTests(unittest.TestCase):
 
         self.assertEqual(result, 2)
         self.assertIn(
-            "ERROR: invalid model configuration: stale API key",
+            "ERROR: invalid model configuration: invalid Azure OpenAI endpoint",
             stderr.getvalue(),
         )
         self.assertNotIn("Traceback", stderr.getvalue())

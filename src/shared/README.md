@@ -21,7 +21,7 @@ Prepares one resolved credential profile as the active app account.
 implementation, and `account/safety.py` the scoped action policy.
 
 ### `model_client.py` — `ChatModelClient`
-OpenAI-compatible chat transport. It owns endpoint configuration, API-key auth,
+Work Azure OpenAI chat transport. It owns endpoint configuration, Microsoft
 Entra token acquisition, JSON parsing, and `ModelTransportError` failures.
 Callers build prompts and interpret responses.
 

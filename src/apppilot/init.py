@@ -239,8 +239,6 @@ def _model_config_problem(config: Mapping[str, str]) -> Optional[str]:
     """Return a human-readable reason the model config is unusable."""
     if not config["model"].strip():
         return "APPPILOT_MODEL is blank"
-    if config["auth_mode"] == "api_key" and not config["api_key"].strip():
-        return "APPPILOT_MODEL_API_KEY is blank"
     try:
         validate_base_url(config["base_url"])
     except ModelConfigurationError as error:
@@ -264,22 +262,19 @@ def check_model(env: Optional[Mapping[str, str]] = None) -> CheckResult:
         return CheckResult(
             "model", _MODEL, Importance.REQUIRED, Status.NOT_CONFIGURED,
             "Model not configured",
-            "Configure APPPILOT_MODEL plus either API-key or Entra authentication.",
+            "Configure APPPILOT_MODEL and APPPILOT_MODEL_BASE_URL for work Azure OpenAI.",
         )
     problem = _model_config_problem(config)
     if problem is not None:
         return CheckResult(
             "model", _MODEL, Importance.REQUIRED, Status.FAIL,
             f"Model misconfigured ({problem})",
-            "Fix the model configuration: set APPPILOT_MODEL, select "
-            "APPPILOT_MODEL_AUTH=api_key or entra, and use a valid http(s) "
-            "APPPILOT_MODEL_BASE_URL. API-key mode also requires "
-            "APPPILOT_MODEL_API_KEY.",
+            "Fix the model configuration: set APPPILOT_MODEL and a valid "
+            "Azure OpenAI APPPILOT_MODEL_BASE_URL ending in /openai/v1.",
         )
     return CheckResult(
         "model", _MODEL, Importance.REQUIRED, Status.PASS,
-        "Model configured "
-        f"(APPPILOT_MODEL={config['model']}, auth={config['auth_mode']})",
+        f"Work Azure OpenAI model configured (APPPILOT_MODEL={config['model']})",
     )
 
 
