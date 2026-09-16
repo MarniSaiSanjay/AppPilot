@@ -1,26 +1,9 @@
 #!/bin/sh
-set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-is_supported_python() {
-    "$1" -c 'import sys; raise SystemExit(0 if (3, 11) <= sys.version_info[:2] < (3, 14) else 1)'
-}
-
-if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ] \
-    && is_supported_python "$VIRTUAL_ENV/bin/python"; then
-    exec "$VIRTUAL_ENV/bin/python" "$DIR/src/apppilot_init.py" "$@"
-fi
-
-if [ -x "$DIR/.venv/bin/python" ] \
-    && is_supported_python "$DIR/.venv/bin/python"; then
+if [ -x "$DIR/.venv/bin/python" ]; then
     exec "$DIR/.venv/bin/python" "$DIR/src/apppilot_init.py" "$@"
 fi
 
-for PY in python3 python3.13 python3.12 python3.11; do
-    if command -v "$PY" >/dev/null 2>&1 \
-        && is_supported_python "$PY"; then
-        exec "$PY" "$DIR/src/apppilot_init.py" "$@"
-    fi
-done
-echo "AppPilot: Python 3.11-3.13 required but none found (tried the active virtual environment and python3/python3.13/python3.12/python3.11)." >&2
+echo "AppPilot setup is incomplete. Run ./setup first." >&2
 exit 1

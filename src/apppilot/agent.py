@@ -27,6 +27,7 @@ from .models import (
 )
 from .safety import SafetyValidator
 from .work_defaults import load_work_defaults
+from . import environment
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MAX_ACTIONS = 30
@@ -900,4 +901,6 @@ def _load_dotenv(path: Path | None = None) -> None:
             value = value[1:-1]
         if key and key not in os.environ:
             os.environ[key] = value
+    environment.add_java_path()
+    environment.add_android_sdk_paths()
     load_work_defaults()

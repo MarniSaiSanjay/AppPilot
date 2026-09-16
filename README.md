@@ -3,6 +3,13 @@
 AppPilot is a **goal-driven AI agent for Android regression testing**. Given a
 test goal and a connected Android device, it drives a real app toward that goal.
 
+## Quick start
+
+From the AppPilot folder:
+
+- macOS, Linux, or Git Bash: `./setup` once, then `./init` and `./run`
+- Windows PowerShell: `.\setup.cmd` once, then `.\init.cmd` and `.\run.cmd`
+
 ## Runtime behavior
 
 - **`AppPilotAgent` is the orchestrator:** observe → evaluate expected output →
@@ -20,7 +27,8 @@ See [`docs/AGENT_ARCHITECTURE.md`](docs/AGENT_ARCHITECTURE.md).
 
 ## Project structure
 
-- `src/apppilot/` — core framework and `/init` setup.
+- `src/apppilot/` — core framework and `/init` configuration flow.
+- `src/apppilot_setup.py` — one-time local `/setup` entry point.
 - `src/shared/` — reusable, use-case-agnostic nodes.
 - `src/usecases/` — use-case-specific functionality.
 - `src/flows/` — compatibility shims.
@@ -68,44 +76,35 @@ Full Android execution requires:
 - one Android emulator/AVD or physical USB-debugging device
 - approved local APK and Deeplink test-account credentials
 
-On Windows, run AppPilot from WSL with Maestro installed in Linux.
+On Windows, run local setup with `.\setup.cmd`.
 
 AppPilot validates the application ID and signature of the local APK you
 provide.
 
 ## Setup
 
-Run the `/init` setup flow from the project root:
+Run `/setup` once from the project root to install and verify local prerequisites:
+
+```bash
+./setup
+```
+
+The `./setup` wrapper auto-selects a Python 3.11-3.13 interpreter. Equivalently:
+
+```bash
+python3.11 src/apppilot_bootstrap.py
+```
+
+`/setup` installs or checks **Python**, **ADB**, **Maestro**, **Java**, and
+Android APK tools after confirmation. It does not create emulators/AVDs.
+
+Then run `/init` when you need to configure AppPilot's **Model**, **Android
+Device**, **APK**, or optional **Email** recipient. It saves your selected
+device, APK path, and email recipient for later runs.
 
 ```bash
 ./init
 ```
-
-The `./init` wrapper auto-selects a Python 3.11-3.13 interpreter. Equivalently:
-
-```bash
-python3.11 src/apppilot_init.py
-```
-
-`/init` walks through **Environment** (Python, ADB, Maestro, Java) → **Model** →
-**Android Device** → **APK** → **Email**, then prints a readiness summary. It
-supports physical devices and emulators/AVDs (including multiple devices and
-starting an emulator when required), and saves your selected device, APK path,
-and email recipient for later runs.
-
-```text
-/init
-  ✓ Environment
-  ✓ Model
-  ✓ Android Device
-  ✓ APK
-  ○ Email skipped
-
-Ready
-```
-
-`/init` checks and saves local AppPilot configuration. It does not install
-prerequisites, build APKs, or send email.
 
 ## Source validation
 
@@ -173,6 +172,34 @@ Deeplink suites resolve every workbook `License` before APK or device work.
 License values are converted to profile-specific environment suffixes such as
 `ENTRA_PREMIUM`; Deeplink does not fall back to global credentials. See
 [`src/usecases/deeplink/README.md`](src/usecases/deeplink/README.md).
+
+## Use cases
+
+Each use case documents its own test data and user-provided inputs. Shared
+machine setup is handled once by `/setup`, and shared AppPilot configuration is
+saved by `/init`.
+
+### Deeplink
+
+Before running the Deeplink use case, provide:
+
+- An approved local Android `.apk`, selected during `/init` or passed with
+  `--apk PATH`.
+- A connected Android device or an existing emulator/AVD, selected during
+  `/init` or passed with `--device SERIAL`.
+- A Deeplink Excel workbook with `Test ID`, `Deep Link`, `License`, and
+  `Expected Result` columns. Put it in `testcases/deeplinks/`, or pass it with
+  `--excel PATH`.
+- A test account for every `License` profile used in the workbook. Interactive
+  runs prompt for missing credentials; non-interactive runs read the matching
+  `APPPILOT_USERNAME_<LICENSE>` and `APPPILOT_PASSWORD_<LICENSE>` values from
+  local `.env`.
+
+Run the use case with:
+
+```bash
+./run --usecase deeplink
+```
 
 ## Running AppPilot
 

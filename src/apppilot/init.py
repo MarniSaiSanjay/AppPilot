@@ -5,17 +5,20 @@ from __future__ import annotations
 import argparse
 import enum
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List, Mapping, Optional, Sequence, Tuple
 
 from . import (
     apk_config,
     apk_trust,
+    bootstrap,
     device,
     device_config,
     email_delivery,
@@ -323,9 +326,7 @@ _RUN_TARGET_PROMPT = (
 )
 
 _NO_AVD_MESSAGE = (
-    "✗ No Android Emulator is configured.\n\n"
-    "Please create an Android Virtual Device using Android Studio.\n\n"
-    "After creating one, run /init again."
+    "✗ No Android emulator is configured. Add one and try again."
 )
 
 
@@ -510,8 +511,8 @@ def _setup_emulator(
         output(_NO_AVD_MESSAGE)
         return [_device_result(
             Status.FAIL, "No Android Emulator configured",
-            "Create an Android Virtual Device using Android Studio, "
-            "then re-run /init.", name="avd")]
+            "Add an Android emulator or select a physical device, "
+            "then try /init again.", name="avd")]
 
     selected = avds[0]
     if len(avds) > 1 and interactive:
@@ -774,7 +775,11 @@ def _ordered_groups(results: Sequence[CheckResult]) -> List[str]:
     return groups
 
 
-def render(results: Sequence[CheckResult]) -> Tuple[str, int]:
+def render(
+    results: Sequence[CheckResult],
+    *,
+    retry_command: str = "/init",
+) -> Tuple[str, int]:
     """Render the readiness summary and return ``(text, exit_code)``."""
     lines: List[str] = ["AppPilot Setup", ""]
 
@@ -800,13 +805,12 @@ def render(results: Sequence[CheckResult]) -> Tuple[str, int]:
         action = result.remediation or f"Resolve: {result.detail}"
         lines.append(f"{index}. {action}")
     lines.append("")
-    lines.append("Run /init again after completing them.")
+    lines.append(f"Run {retry_command} again after completing them.")
     return "\n".join(lines), 1
 
 
 _DESCRIPTION = (
-    "Check whether this machine is ready to run AppPilot and print a "
-    "readiness summary."
+    "Configure AppPilot's model, device, APK, and optional email report settings."
 )
 
 
@@ -818,14 +822,13 @@ def run_all_checks(
     version_info: Optional[Sequence[int]] = None,
 ) -> List[CheckResult]:
     """Run readiness checks in display order."""
-    which = which or shutil.which
-    runner = runner or subprocess.run
     return [
-        check_python(version_info),
-        check_adb(which=which, runner=runner),
-        check_maestro(which=which, runner=runner),
-        check_java(which=which, runner=runner),
-        check_apk_tools(which=which),
+        *run_environment_checks(
+            which=which,
+            runner=runner,
+            env=env,
+            version_info=version_info,
+        ),
         check_model(env),
     ]
 
@@ -833,6 +836,25 @@ def run_all_checks(
 def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="apppilot init", description=_DESCRIPTION)
     return parser.parse_args(argv)
+
+
+def run_environment_checks(
+    *,
+    which=None,
+    runner=None,
+    env: Optional[Mapping[str, str]] = None,
+    version_info: Optional[Sequence[int]] = None,
+) -> List[CheckResult]:
+    """Run the local-machine prerequisite checks used by ``/setup``."""
+    which = which or shutil.which
+    runner = runner or subprocess.run
+    return [
+        check_python(version_info),
+        check_adb(which=which, runner=runner),
+        check_maestro(which=which, runner=runner),
+        check_java(which=which, runner=runner),
+        check_apk_tools(which=which, env=env),
+    ]
 
 
 def _is_interactive() -> bool:
@@ -843,6 +865,59 @@ def _adb_available(core: Sequence[CheckResult]) -> bool:
     """Return whether adb is usable."""
     adb = next((r for r in core if r.name == "adb"), None)
     return adb is not None and adb.status in (Status.PASS, Status.WARNING)
+
+
+def _bootstrap_missing(core: Sequence[CheckResult]) -> list[str]:
+    """Return readiness check names that the local bootstrap can address."""
+    missing = [
+        result.name
+        for result in core
+        if result.status == Status.FAIL
+        and result.name in {"adb", "apk-tools", "java", "maestro"}
+    ]
+    repository = Path(__file__).resolve().parents[2]
+    if not bootstrap._venv_python(repository, platform.system()).is_file():
+        missing.append("virtual-environment")
+    return missing
+
+
+def _offer_bootstrap(
+    core: Sequence[CheckResult],
+    *,
+    requested: bool,
+    interactive: bool,
+    input_fn: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+    repository: Optional[Path] = None,
+) -> bool:
+    """Show the machine-change plan and run it only after explicit approval."""
+    missing = _bootstrap_missing(core)
+    repo = repository or Path(__file__).resolve().parents[2]
+    plan = bootstrap.create_plan(
+        missing=missing,
+        repository=repo,
+        env=dict(os.environ),
+    )
+    if not plan.actions:
+        return False
+    if not requested and not interactive:
+        return False
+    output(bootstrap.render_plan(plan))
+    if not interactive or not _prompt_yes_no(
+        "Apply this setup plan?",
+        default=False,
+        input_fn=input_fn,
+        output=output,
+    ):
+        return False
+    outcomes = bootstrap.apply_plan(plan, output=output)
+    environment.add_java_path()
+    failed = next((outcome for outcome in outcomes if not outcome.succeeded), None)
+    if failed is not None:
+        output(f"Setup stopped while installing: {failed.action.description}")
+    else:
+        output("Setup actions completed. Re-checking readiness...")
+    return True
 
 
 def _compose_results(
@@ -860,22 +935,44 @@ def _compose_results(
     ]
 
 
+def setup_main() -> int:
+    """Install and verify AppPilot's local machine prerequisites."""
+    try:
+        _load_dotenv()
+        core = run_environment_checks()
+        interactive = _is_interactive()
+        if _offer_bootstrap(
+            core,
+            requested=True,
+            interactive=interactive,
+        ):
+            core = run_environment_checks()
+        text, exit_code = render(core, retry_command="/setup")
+        print(text)
+        return exit_code
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        return 130
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Run ``/init`` and return the process exit code."""
+    """Configure AppPilot's model, device, APK, and optional email settings."""
     _parse_args(argv)
     try:
         _load_dotenv()
-        core = run_all_checks()
+        adb_result = check_adb()
+        core = [check_model()]
+        interactive = _is_interactive()
         entra_result = check_entra_model_authentication(
-            interactive=_is_interactive()
+            interactive=interactive
         )
         if entra_result is not None:
             core.append(entra_result)
         device_results = setup_device(
-            adb_available=_adb_available(core),
-            interactive=_is_interactive(),
+            adb_available=adb_result.status in (Status.PASS, Status.WARNING),
+            interactive=interactive,
         )
-        apk_result = check_apk(interactive=_is_interactive(), env=os.environ)
+        apk_result = check_apk(interactive=interactive, env=os.environ)
         try:
             relay_env = {**os.environ, **load_relay_secrets()}
         except RelayConfigurationError as error:
@@ -889,7 +986,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         else:
             email_result = check_email(
-                interactive=_is_interactive(),
+                interactive=interactive,
                 env=relay_env,
             )
         results = _compose_results(core, device_results, apk_result, email_result)
