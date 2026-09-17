@@ -15,10 +15,6 @@ WORK_DEFAULTS = {
     "APPPILOT_MODEL_BASE_URL": (
         "https://aoai-apppilot.openai.azure.com/openai/v1"
     ),
-    "APPPILOT_EXPECTED_PACKAGE_ID": "com.microsoft.office.officehubrow",
-    "APPPILOT_TRUSTED_CERT_SHA256": (
-        "3c4049cdcbf198a6dd4c5b956963e36c48c807b3c29e2e2c61d44513f4c1e840"
-    ),
     "APPPILOT_EMAIL_API_URL": (
         "https://ca-apppilot-relay.ambitioussmoke-8a5df56b."
         "southindia.azurecontainerapps.io/send-report"

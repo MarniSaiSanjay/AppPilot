@@ -5,7 +5,7 @@ import logging
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -130,7 +130,6 @@ class ModelAuthenticationTests(unittest.TestCase):
 
     def test_deeplink_cli_reports_login_model_configuration_error(self) -> None:
         stderr = io.StringIO()
-        trust_config = Mock(package_id="com.example.apppilot")
         with (
             patch.object(deeplink_cli, "_load_dotenv"),
             patch.object(
@@ -139,11 +138,6 @@ class ModelAuthenticationTests(unittest.TestCase):
             patch.object(deeplink_cli, "load_deeplink_cases", return_value=[]),
             patch.object(
                 deeplink_cli, "_resolve_credential_profiles", return_value={}
-            ),
-            patch.object(
-                deeplink_cli.apk_trust.ApkTrustConfig,
-                "from_env",
-                return_value=trust_config,
             ),
             patch.object(deeplink_cli, "_default_max_actions", return_value=1),
             patch.object(
@@ -154,7 +148,6 @@ class ModelAuthenticationTests(unittest.TestCase):
                 "resolve_apk_path",
                 return_value=Path("app.apk"),
             ),
-            patch.object(deeplink_cli.apk_trust, "ApkTrustGuard"),
             patch.object(
                 deeplink_cli.LLMExpectationJudge,
                 "from_env",
@@ -184,6 +177,70 @@ class ModelAuthenticationTests(unittest.TestCase):
             stderr.getvalue(),
         )
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_deeplink_cli_fails_when_report_cannot_be_saved(self) -> None:
+        report = Mock(suite_name="Deeplink", total=1, failed=0)
+        lock = MagicMock()
+        stderr = io.StringIO()
+        with (
+            patch.object(deeplink_cli, "_load_dotenv"),
+            patch.object(
+                deeplink_cli,
+                "ensure_entra_model_readiness",
+                return_value=Mock(required=False, ready=True),
+            ),
+            patch.object(
+                deeplink_cli, "_select_workbook", return_value=Path("suite.xlsx")
+            ),
+            patch.object(deeplink_cli, "load_deeplink_cases", return_value=[]),
+            patch.object(
+                deeplink_cli, "_resolve_credential_profiles", return_value={}
+            ),
+            patch.object(deeplink_cli, "_default_max_actions", return_value=1),
+            patch.object(
+                deeplink_cli, "_default_max_stuck_actions", return_value=1
+            ),
+            patch.object(
+                deeplink_cli.apk_config,
+                "resolve_apk_path",
+                return_value=Path("app.apk"),
+            ),
+            patch.object(
+                deeplink_cli.LLMExpectationJudge,
+                "from_env",
+                return_value=Mock(),
+            ),
+            patch.object(
+                deeplink_cli.device_config,
+                "resolve_device",
+                return_value="device-1",
+            ),
+            patch.object(deeplink_cli, "MaestroHierarchyObserver"),
+            patch.object(deeplink_cli, "MaestroExecutor"),
+            patch.object(deeplink_cli, "resolve_decision_provider", return_value=Mock()),
+            patch.object(deeplink_cli, "load_relay_secrets", return_value={}),
+            patch.object(
+                deeplink_cli.email_delivery,
+                "prompt_email_recipient",
+                return_value=None,
+            ),
+            patch.object(deeplink_cli.device_lock, "DeviceProcessLock", return_value=lock),
+            patch.object(deeplink_cli, "DeeplinkSuiteOrchestrator") as orchestrator,
+            patch.object(
+                deeplink_cli.report_storage,
+                "save_markdown_report",
+                side_effect=OSError("disk full"),
+            ),
+            patch.object(deeplink_cli.telemetry, "record_suite_run"),
+            patch("sys.stderr", stderr),
+        ):
+            orchestrator.return_value.run.return_value = report
+            result = deeplink_cli.main(
+                ["--excel", "suite.xlsx", "--apk", "app.apk", "--no-warm-up"]
+            )
+
+        self.assertEqual(result, 1)
+        self.assertIn("ERROR: report could not be saved: disk full", stderr.getvalue())
 
 
 if __name__ == "__main__":

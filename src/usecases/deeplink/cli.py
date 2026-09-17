@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import math
 import os
 import sys
@@ -16,6 +15,7 @@ from typing import Sequence
 
 try:
     from ...apppilot.android import (
+        APP_ID,
         MaestroExecutor,
         MaestroHierarchyObserver,
     )
@@ -26,11 +26,12 @@ try:
     )
     from ...apppilot import (
         apk_config,
-        apk_trust,
         device_config,
         device_lock,
         email_delivery,
+        environment,
         logtags,
+        report_storage,
     )
     from ...apppilot import telemetry
     from ...apppilot.work_defaults import (
@@ -55,6 +56,7 @@ try:
     from ...shared.model_client import ModelConfigurationError
 except ImportError:
     from apppilot.android import (
+        APP_ID,
         MaestroExecutor,
         MaestroHierarchyObserver,
     )
@@ -65,11 +67,12 @@ except ImportError:
     )
     from apppilot import (
         apk_config,
-        apk_trust,
         device_config,
         device_lock,
         email_delivery,
+        environment,
         logtags,
+        report_storage,
     )
     from apppilot import telemetry
     from apppilot.work_defaults import RelayConfigurationError, load_relay_secrets
@@ -170,12 +173,9 @@ def _resolve_credential_profiles(
     cases: Sequence[DeeplinkTestCase],
     env: "Mapping[str, str] | None" = None,
     *,
-    interactive: bool = False,
-    input_fn=input,
-    password_fn=getpass.getpass,
     output=print,
 ) -> dict[str, CredentialProfile]:
-    """Resolve workbook profiles, prompting only for missing local credentials."""
+    """Resolve workbook profiles from locally configured environment variables."""
     source = dict(os.environ if env is None else env)
     profiles: dict[str, str] = {}
     for case in cases:
@@ -183,37 +183,23 @@ def _resolve_credential_profiles(
         key = normalize_profile_key(label)
         profiles.setdefault(key, label)
 
+    missing_credentials = False
+    resolved: dict[str, CredentialProfile] = {}
+    resolver = CredentialProfileResolver(source)
     for key, label in profiles.items():
         username_key = f"APPPILOT_USERNAME_{key}"
         password_key = f"APPPILOT_PASSWORD_{key}"
-        missing = [
-            name
-            for name in (username_key, password_key)
-            if not source.get(name)
-        ]
-        if not missing:
+        if source.get(username_key) and source.get(password_key):
+            resolved[key] = resolver.resolve(label)
             continue
-        if not interactive:
-            raise CredentialConfigurationError(
-                f"Credential profile {label!r} is missing required environment "
-                f"variable(s): {', '.join(missing)}"
-            )
-        output(f"Credentials required for workbook profile: {label}")
-        try:
-            if username_key in missing:
-                source[username_key] = input_fn(
-                    f"Test account username for {label}: "
-                ).strip()
-            if password_key in missing:
-                source[password_key] = password_fn(
-                    f"Test account password for {label}: "
-                ).strip()
-        except (EOFError, KeyboardInterrupt) as error:
-            raise CredentialConfigurationError(
-                f"Credential entry cancelled for profile {label!r}"
-            ) from error
+        missing_credentials = True
 
-    return CredentialProfileResolver(source).resolve_all(case.license for case in cases)
+    if missing_credentials:
+        output(
+            "Required Deeplink test credentials are missing. Make sure to add "
+            "the required credentials to your local .env before running."
+        )
+    return resolved
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -264,6 +250,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Skip the one-time first-install warm-up before the suite.",
     )
     parser.add_argument(
+        "--log", action="store_true",
+        help="Show detailed execution logs for login, deeplinks, waits, and verification.",
+    )
+    parser.add_argument(
         "--apk", default=None,
         help=(
             "Path to the local .apk to install. If omitted, a previously saved "
@@ -276,6 +266,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     _load_dotenv()
     args = _parse_args(argv)
+    logtags.set_trace_enabled(args.log)
     if args.max_attempts < 1:
         print("ERROR: --max-attempts must be at least 1", file=sys.stderr)
         return 2
@@ -321,16 +312,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         credential_profiles = _resolve_credential_profiles(
             cases,
-            interactive=interactive,
             output=lambda message: print(message, file=sys.stderr),
         )
     except CredentialConfigurationError as error:
         print(f"ERROR: invalid credential configuration: {error}", file=sys.stderr)
-        return 2
-    try:
-        trust_config = apk_trust.ApkTrustConfig.from_env()
-    except apk_trust.ApkTrustConfigurationError as error:
-        print(f"ERROR: invalid APK trust configuration: {error}", file=sys.stderr)
         return 2
     try:
         login_max_actions = _default_max_actions()
@@ -343,13 +328,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if apk_path is None:
         print("ERROR: no valid APK path provided", file=sys.stderr)
         return 2
-    trust_guard = apk_trust.ApkTrustGuard(trust_config)
-    try:
-        trust_guard.validate_apk(apk_path)
-    except apk_trust.ApkTrustError as error:
-        print(f"ERROR: APK trust validation failed: {error}", file=sys.stderr)
-        return 2
-
     try:
         judge = LLMExpectationJudge.from_env()
     except ModelConfigurationError as error:
@@ -368,16 +346,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if device_id is None:
         return 2
+    if environment.maestro_executable() is None:
+        print(
+            "ERROR: Maestro CLI is unavailable. Run /setup, then re-run this command.",
+            file=sys.stderr,
+        )
+        return 2
     try:
         observer = MaestroHierarchyObserver(device_id)
         executor = MaestroExecutor(
-            trust_config.package_id,
+            APP_ID,
             device_id,
-            credential_release_check=lambda timeout: (
-                trust_guard.assert_credential_release(
-                    device_id, timeout=timeout
-                )
-            ),
             credential_observer=observer,
         )
     except ValueError as error:
@@ -439,8 +418,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     installer = LocalApkInstaller(
         executor,
         str(apk_path),
-        pre_install_check=trust_guard.before_install,
-        post_install_check=lambda: trust_guard.verify_installed(device_id),
     )
     run_id = uuid.uuid4().hex
     artifact_writer = FailureArtifactWriter(
@@ -448,8 +425,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         device_id,
         {
             "path": str(apk_path),
-            "package_id": trust_config.package_id,
-            "certificate_sha256": trust_config.certificate_sha256,
+            "package_id": APP_ID,
         },
     )
     runner = DeeplinkTestRunner(
@@ -464,7 +440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile_for_license=login_flows.profile_for_license,
         installer=installer,
         deterministic_probe=executor,
-        expected_package_id=trust_config.package_id,
+        expected_package_id=APP_ID,
         artifact_writer=artifact_writer,
     )
     lock = device_lock.DeviceProcessLock(device_id, run_id=run_id)
@@ -475,14 +451,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     env=relay_env, interactive=interactive
                 )
             except Exception as error:  # pragma: no cover
-                print(
-                    logtags.prefix(
-                        logtags.EMAIL,
-                        f"email prompt failed - continuing without email: {error}",
-                    )
+                logtags.trace(
+                    f"email prompt failed - continuing without email: {error}",
+                    logtags.EMAIL,
                 )
                 email_recipient = None
 
+            print(f"Running {len(cases)} Deeplink test(s) on {device_id}...")
             report = DeeplinkSuiteOrchestrator(runner).run(cases)
     except device_lock.DeviceLockError as error:
         print(f"ERROR: {error}", file=sys.stderr)
@@ -493,24 +468,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Android",
         env=relay_env,
     )
-    print(logtags.prefix(logtags.REPORT, "generating report..."))
-    report_text = report.format()
-    print(report_text)
-    print(logtags.prefix(logtags.REPORT, "report generated"))
-    if email_recipient is not None:
-        print(logtags.prefix(logtags.EMAIL, "triggering email delivery..."))
+    try:
+        report_path = report_storage.save_markdown_report(
+            report,
+            test_name=excel_path.stem,
+            env=relay_env,
+        )
+    except OSError as error:
+        print(f"ERROR: report could not be saved: {error}", file=sys.stderr)
+        report_saved = False
+    else:
+        print(f"Report saved: {report_path}")
+        report_saved = True
+    if email_recipient is not None and report_saved:
+        print("Sending suite report email...")
         try:
-            email_delivery.send_suite_report(
+            sent = email_delivery.send_suite_report(
                 report, env=relay_env, recipient=email_recipient
             )
         except Exception as error:  # pragma: no cover
-            print(
-                logtags.prefix(
-                    logtags.EMAIL,
-                    f"report not sent - unexpected error: {error}",
-                )
+            logtags.trace(
+                f"report not sent - unexpected error: {error}",
+                logtags.EMAIL,
             )
-    return 0 if report.failed == 0 else 1
+            sent = False
+        print(
+            "Suite report email sent."
+            if sent
+            else "Suite report email could not be sent."
+        )
+    elif email_recipient is not None:
+        print("Suite report email could not be sent.")
+    return 0 if report.failed == 0 and report_saved else 1
 
 
 if __name__ == "__main__":

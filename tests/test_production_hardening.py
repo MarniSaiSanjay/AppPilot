@@ -19,13 +19,15 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from apppilot.android import (
+    APP_ID,
     AndroidOperationalError,
+    ForegroundComponent,
     MaestroExecutor,
     SupportedLinkState,
     _maestro_environment,
 )
 from apppilot.android import MaestroHierarchyObserver
-from apppilot import device_config, telemetry
+from apppilot import device, device_config, telemetry
 from apppilot.agent import (
     DEFAULT_MAX_ACTIONS,
     DEFAULT_MAX_STUCK_ACTIONS,
@@ -33,13 +35,6 @@ from apppilot.agent import (
     _default_max_stuck_actions,
 )
 from apppilot.brain import DecisionRequest, LLMModelDecisionProvider
-from apppilot.apk_trust import (
-    ApkTrustConfig,
-    ApkTrustConfigurationError,
-    ApkTrustError,
-    ApkTrustGuard,
-    ForegroundComponent,
-)
 from apppilot.models import (
     Action,
     ActionKind,
@@ -52,7 +47,7 @@ from apppilot.models import (
 from apppilot.device import AdbDevice
 from apppilot.device_config import resolve_device
 from apppilot.device_lock import DeviceLockError, DeviceProcessLock
-from apppilot.init import Importance, Status, check_apk_tools, check_java
+from apppilot.init import Importance, Status, check_apk, check_java
 from shared.installer import LocalApkInstaller
 from shared.login import builder as login_builder
 from shared.login.goal import LLMLoginGoalEvaluator, SemanticStateEvaluator
@@ -78,301 +73,11 @@ from usecases.deeplink.verification import (
 
 
 PACKAGE = "com.example.apppilot"
-CERT = "AB" * 32
 MODEL_BASE_URL = "https://model.openai.azure.com/openai/v1"
 
 
 def completed(stdout: str = "", stderr: str = "", returncode: int = 0):
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
-
-
-class FakeApkTools:
-    def __init__(
-        self,
-        *,
-        package: str = PACKAGE,
-        certificate: str | None = CERT,
-        malformed: bool = False,
-        installed: bool = True,
-        foreground_package: str = PACKAGE,
-    ) -> None:
-        self.package = package
-        self.certificate = certificate
-        self.malformed = malformed
-        self.installed = installed
-        self.foreground_package = foreground_package
-        self.commands: list[list[str]] = []
-
-    @staticmethod
-    def which(name: str) -> str | None:
-        return f"/tools/{name}" if name in {"apkanalyzer", "apksigner"} else None
-
-    def run(self, command, **_kwargs):
-        command = list(command)
-        self.commands.append(command)
-        if "application-id" in command:
-            return completed(
-                stderr="invalid archive" if self.malformed else "",
-                returncode=1 if self.malformed else 0,
-                stdout="" if self.malformed else self.package + "\n",
-            )
-        if "--print-certs" in command:
-            output = (
-                ""
-                if self.certificate is None
-                else f"Signer #1 certificate SHA-256 digest: {self.certificate}\n"
-            )
-            return completed(stdout=output)
-        if "pm" in command and "path" in command:
-            return completed(
-                stdout=(
-                    "package:/data/app/example/base.apk\n"
-                    if self.installed
-                    else ""
-                )
-            )
-        if "pull" in command:
-            return completed(stdout="1 file pulled")
-        if "dumpsys" in command:
-            return completed(
-                stdout=(
-                    "mResumedActivity: ActivityRecord{1 u0 "
-                    f"{self.foreground_package}/.MainActivity t1}}\n"
-                )
-            )
-        raise AssertionError(f"unexpected command: {command}")
-
-
-def guard(tools: FakeApkTools) -> ApkTrustGuard:
-    return ApkTrustGuard(
-        ApkTrustConfig(PACKAGE, CERT),
-        runner=tools.run,
-        which=tools.which,
-    )
-
-
-class ApkTrustTests(unittest.TestCase):
-    def test_valid_apk_is_accepted(self) -> None:
-        metadata = guard(FakeApkTools()).validate_apk("/tmp/app.apk")
-
-        self.assertEqual(metadata.package_id, PACKAGE)
-        self.assertEqual(metadata.certificate_sha256, (CERT,))
-
-    def test_wrong_package_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ApkTrustError, "package ID mismatch"):
-            guard(FakeApkTools(package="com.example.wrong")).validate_apk(
-                "/tmp/app.apk"
-            )
-
-    def test_wrong_certificate_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ApkTrustError, "not trusted"):
-            guard(FakeApkTools(certificate="CD" * 32)).validate_apk(
-                "/tmp/app.apk"
-            )
-
-    def test_missing_certificate_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ApkTrustError, "could not be determined"):
-            guard(FakeApkTools(certificate=None)).validate_apk("/tmp/app.apk")
-
-    def test_malformed_apk_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ApkTrustError, "inspect APK package ID failed"):
-            guard(FakeApkTools(malformed=True)).validate_apk("/tmp/app.apk")
-
-    def test_apksigner_is_discovered_in_latest_sdk_build_tools(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sdk = Path(directory)
-            older = sdk / "build-tools" / "35.0.0" / "apksigner"
-            newer = sdk / "build-tools" / "36.1.0" / "apksigner"
-            for executable in (older, newer):
-                executable.parent.mkdir(parents=True)
-                executable.write_text("", encoding="utf-8")
-                executable.chmod(0o755)
-            tools = FakeApkTools()
-            trust = ApkTrustGuard(
-                ApkTrustConfig(PACKAGE, CERT),
-                runner=tools.run,
-                which=lambda name: (
-                    "/tools/apkanalyzer" if name == "apkanalyzer" else None
-                ),
-                env={"ANDROID_SDK_ROOT": str(sdk)},
-                home=sdk / "home",
-            )
-
-            trust.validate_apk("/tmp/app.apk")
-
-        certificate_command = next(
-            command for command in tools.commands if "--print-certs" in command
-        )
-        self.assertEqual(certificate_command[0], str(newer))
-
-    def test_missing_trust_configuration_is_rejected(self) -> None:
-        with self.assertRaisesRegex(
-            ApkTrustConfigurationError, "missing required APK trust"
-        ):
-            ApkTrustConfig.from_env({})
-
-    def test_installed_package_mismatch_is_rejected(self) -> None:
-        trust = guard(FakeApkTools(installed=False))
-
-        with self.assertRaisesRegex(ApkTrustError, "is not installed"):
-            trust.verify_installed("device-1")
-
-    def test_foreground_package_mismatch_is_rejected(self) -> None:
-        tools = FakeApkTools(foreground_package="com.example.wrong")
-        trust = guard(tools)
-        trust.verify_installed("device-1")
-
-        with self.assertRaisesRegex(ApkTrustError, "not foreground"):
-            trust.assert_credential_release("device-1")
-
-    def test_installer_validates_before_and_after_install(self) -> None:
-        executor = Mock()
-        pre = Mock()
-        post = Mock()
-        lifecycle = Mock()
-        lifecycle.attach_mock(pre, "pre")
-        lifecycle.attach_mock(executor, "executor")
-        lifecycle.attach_mock(post, "post")
-        installer = LocalApkInstaller(
-            executor,
-            "/tmp/app.apk",
-            pre_install_check=pre,
-            post_install_check=post,
-        )
-
-        installer.install_fresh()
-
-        self.assertEqual(
-            lifecycle.method_calls,
-            [
-                unittest.mock.call.pre("/tmp/app.apk"),
-                unittest.mock.call.executor.install_apk("/tmp/app.apk"),
-                unittest.mock.call.post(),
-            ],
-        )
-
-    @patch.object(MaestroExecutor, "_input_username_via_adb")
-    @patch.object(MaestroExecutor, "_input_credential_via_clipboard")
-    def test_unguarded_credential_action_is_rejected(
-        self, clipboard_input, adb_input
-    ) -> None:
-        executor = MaestroExecutor(PACKAGE, "device-1")
-        target = UIElement(
-            element_id="username",
-            parent_id=None,
-            text="",
-            accessibility_text="Email",
-            hint_text="",
-            resource_id="email",
-            class_name="android.widget.EditText",
-            clickable=True,
-            enabled=True,
-            is_input=True,
-            label="Email",
-            bounds=(0, 0, 100, 100),
-        )
-
-        with self.assertRaisesRegex(
-            AndroidOperationalError, "no APK trust guard"
-        ):
-            executor.execute_fast(
-                Action(
-                    ActionKind.INPUT_TEXT,
-                    target_id=target.element_id,
-                    credential_kind=CredentialKind.USERNAME,
-                ),
-                UIObservation((target,)),
-                secret="not-logged",
-            )
-
-        adb_input.assert_not_called()
-        clipboard_input.assert_not_called()
-
-    @patch.object(MaestroExecutor, "_input_username_via_adb")
-    @patch.object(MaestroExecutor, "_input_credential_via_clipboard")
-    def test_credentials_are_not_entered_after_trust_failure(
-        self, clipboard_input, adb_input
-    ) -> None:
-        release_check = Mock(side_effect=ApkTrustError("trust failed"))
-        executor = MaestroExecutor(
-            PACKAGE,
-            "device-1",
-            credential_release_check=release_check,
-        )
-        target = UIElement(
-            element_id="username",
-            parent_id=None,
-            text="",
-            accessibility_text="Email",
-            hint_text="",
-            resource_id="email",
-            class_name="android.widget.EditText",
-            clickable=True,
-            enabled=True,
-            is_input=True,
-            label="Email",
-            bounds=(0, 0, 100, 100),
-        )
-
-        with self.assertRaisesRegex(ApkTrustError, "trust failed"):
-            executor.execute_fast(
-                Action(
-                    ActionKind.INPUT_TEXT,
-                    target_id=target.element_id,
-                    credential_kind=CredentialKind.USERNAME,
-                ),
-                UIObservation((target,)),
-                secret="not-logged",
-            )
-
-        release_check.assert_called_once_with(15)
-        adb_input.assert_not_called()
-        clipboard_input.assert_not_called()
-
-    @patch.object(MaestroExecutor, "_input_username_via_adb")
-    @patch.object(MaestroExecutor, "_input_credential_via_clipboard")
-    def test_wrong_foreground_blocks_credential_action(
-        self, clipboard_input, adb_input
-    ) -> None:
-        trust = guard(
-            FakeApkTools(foreground_package="com.example.untrusted")
-        )
-        trust.verify_installed("device-1")
-        executor = MaestroExecutor(
-            PACKAGE,
-            "device-1",
-            credential_release_check=lambda timeout: trust.assert_credential_release(
-                "device-1", timeout=timeout
-            ),
-        )
-        target = UIElement(
-            element_id="username",
-            parent_id=None,
-            text="",
-            accessibility_text="Email",
-            hint_text="",
-            resource_id="email",
-            class_name="android.widget.EditText",
-            clickable=True,
-            enabled=True,
-            is_input=True,
-            label="Email",
-            bounds=(0, 0, 100, 100),
-        )
-
-        with self.assertRaisesRegex(ApkTrustError, "not foreground"):
-            executor.execute_fast(
-                Action(
-                    ActionKind.INPUT_TEXT,
-                    target_id=target.element_id,
-                    credential_kind=CredentialKind.USERNAME,
-                ),
-                UIObservation((target,)),
-                secret="not-logged",
-            )
-
-        adb_input.assert_not_called()
-        clipboard_input.assert_not_called()
 
 
 class StandaloneLoginHardeningTests(unittest.TestCase):
@@ -390,23 +95,11 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         *,
         agent_result=True,
         agent_error=None,
-        trust_error=None,
         clipboard_result=True,
         args=None,
         device_resolver=None,
     ):
         events = []
-        config = ApkTrustConfig(PACKAGE, CERT)
-        trust = Mock(unsafe=True)
-        def verify(_device):
-            events.append("verify")
-            if trust_error is not None:
-                raise trust_error
-
-        trust.verify_installed.side_effect = verify
-        trust.assert_credential_release.side_effect = (
-            lambda _device, timeout: events.append("credential-check")
-        )
         executor = Mock()
         executor.clear_clipboard.return_value = clipboard_result
         agent = Mock()
@@ -441,16 +134,6 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
                 side_effect=device_resolver,
             ) as resolve_runtime_device,
             patch.object(
-                login_builder.ApkTrustConfig,
-                "from_env",
-                return_value=config,
-            ),
-            patch.object(
-                login_builder,
-                "ApkTrustGuard",
-                return_value=trust,
-            ),
-            patch.object(
                 login_builder,
                 "DeviceProcessLock",
                 return_value=Lock(),
@@ -472,7 +155,6 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         return (
             result,
             events,
-            trust,
             executor_type,
             build_agent,
             resolve_runtime_device,
@@ -485,11 +167,10 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
 
         self.assertIsNone(args.device)
 
-    def test_valid_trusted_standalone_login_runs_under_device_lock(self) -> None:
+    def test_standalone_login_runs_under_device_lock(self) -> None:
         (
             result,
             events,
-            trust,
             executor_type,
             build_agent,
             resolve_runtime_device,
@@ -499,18 +180,11 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             events,
-            ["lock-acquired", "verify", "run", "lock-released"],
+            ["lock-acquired", "run", "lock-released"],
         )
         resolve_runtime_device.assert_called_once_with("device-1")
         lock_type.assert_called_once_with("device-1")
-        self.assertEqual(executor_type.call_args.args[:2], (PACKAGE, "device-1"))
-        release_check = executor_type.call_args.kwargs[
-            "credential_release_check"
-        ]
-        release_check(15)
-        trust.assert_credential_release.assert_called_once_with(
-            "device-1", timeout=15
-        )
+        self.assertEqual(executor_type.call_args.args[:2], (APP_ID, "device-1"))
         self.assertIs(
             build_agent.call_args.kwargs["executor"],
             executor_type.return_value,
@@ -519,7 +193,7 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
 
     def test_omitted_device_reuses_valid_saved_device(self) -> None:
         messages = []
-        result, events, trust, executor_type, build_agent, resolver, lock_type = (
+        result, events, executor_type, build_agent, resolver, lock_type = (
             self._run_main(
                 args=self._args(None),
                 device_resolver=lambda cli_device: resolve_device(
@@ -540,16 +214,15 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         self.assertEqual(result, 0)
         resolver.assert_called_once_with(None)
         lock_type.assert_called_once_with("saved-device")
-        trust.verify_installed.assert_called_once_with("saved-device")
         self.assertEqual(
-            executor_type.call_args.args[:2], (PACKAGE, "saved-device")
+            executor_type.call_args.args[:2], (APP_ID, "saved-device")
         )
         self.assertEqual(build_agent.call_args.args, ("saved-device",))
         self.assertEqual(events[-1], "lock-released")
         self.assertEqual(messages, [])
 
     def test_omitted_device_uses_unique_usable_device(self) -> None:
-        result, _events, trust, executor_type, build_agent, resolver, lock_type = (
+        result, _events, executor_type, build_agent, resolver, lock_type = (
             self._run_main(
                 args=self._args(None),
                 device_resolver=lambda cli_device: resolve_device(
@@ -566,15 +239,14 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         self.assertEqual(result, 0)
         resolver.assert_called_once_with(None)
         lock_type.assert_called_once_with("unique-device")
-        trust.verify_installed.assert_called_once_with("unique-device")
         self.assertEqual(
-            executor_type.call_args.args[:2], (PACKAGE, "unique-device")
+            executor_type.call_args.args[:2], (APP_ID, "unique-device")
         )
         self.assertEqual(build_agent.call_args.args, ("unique-device",))
 
     def test_omitted_device_fails_cleanly_when_none_are_usable(self) -> None:
         messages = []
-        result, events, trust, executor_type, build_agent, resolver, lock_type = (
+        result, events, executor_type, build_agent, resolver, lock_type = (
             self._run_main(
                 args=self._args(None),
                 device_resolver=lambda cli_device: resolve_device(
@@ -591,7 +263,6 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         resolver.assert_called_once_with(None)
         self.assertEqual(events, [])
         self.assertIn("No authorized", messages[0])
-        trust.verify_installed.assert_not_called()
         executor_type.assert_not_called()
         build_agent.assert_not_called()
         lock_type.assert_not_called()
@@ -600,7 +271,7 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         self,
     ) -> None:
         messages = []
-        result, events, trust, executor_type, build_agent, resolver, lock_type = (
+        result, events, executor_type, build_agent, resolver, lock_type = (
             self._run_main(
                 args=self._args(None),
                 device_resolver=lambda cli_device: resolve_device(
@@ -620,7 +291,6 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
         resolver.assert_called_once_with(None)
         self.assertEqual(events, [])
         self.assertIn("Multiple usable", messages[0])
-        trust.verify_installed.assert_not_called()
         executor_type.assert_not_called()
         build_agent.assert_not_called()
         lock_type.assert_not_called()
@@ -639,18 +309,6 @@ class StandaloneLoginHardeningTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertEqual(events[-1], "lock-released")
-
-    def test_invalid_installed_apk_stops_before_login_mutation(self) -> None:
-        result, events, _trust, _executor_type, build_agent, *_unused = (
-            self._run_main(trust_error=ApkTrustError("untrusted"))
-        )
-
-        self.assertEqual(result, 1)
-        self.assertEqual(
-            events, ["lock-acquired", "verify", "lock-released"]
-        )
-        build_agent.assert_not_called()
-
 
 class FakeJudge:
     def __init__(self, first: bool, events=None):
@@ -777,7 +435,7 @@ class DeterministicDeeplinkTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(judge.evaluate_calls, 0)
 
-    def test_fresh_install_store_handoff_accepts_final_trusted_app(self) -> None:
+    def test_fresh_install_store_handoff_accepts_play_store_return(self) -> None:
         observation = self.chat_observation()
         observer = Mock()
         observer.observe.return_value = observation
@@ -805,7 +463,7 @@ class DeterministicDeeplinkTests(unittest.TestCase):
 
         self.assertTrue(result.passed)
 
-    def test_fresh_install_untrusted_handler_is_rejected(self) -> None:
+    def test_fresh_install_unexpected_handler_is_rejected(self) -> None:
         judge = FakeJudge(True)
         probe = FakeProbe(
             ForegroundComponent(PACKAGE, f"{PACKAGE}/.Main"),
@@ -1272,21 +930,6 @@ class ConfigurationValidationTests(unittest.TestCase):
         self.assertIsNone(selected)
         self.assertIn("could not be verified", messages[0])
 
-    def test_legacy_saved_serial_requires_identity_verification(self) -> None:
-        messages = []
-        selected = resolve_device(
-            None,
-            output=messages.append,
-            saved_loader=lambda: "emulator-5554",
-            saved_identity_loader=lambda: None,
-            list_devices=lambda: [AdbDevice("emulator-5554", "device")],
-            is_booted=lambda _serial: True,
-            identity_resolver=lambda _serial: "avd:Primary",
-        )
-
-        self.assertIsNone(selected)
-        self.assertIn("Run /init again", messages[0])
-
     def test_saved_device_record_persists_emulator_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory) / ".apppilot_device"
@@ -1328,34 +971,20 @@ class ConfigurationValidationTests(unittest.TestCase):
         self.assertIsNone(selected)
         self.assertIn("No authorized", messages[0])
 
-    def test_apk_inspection_tools_are_required(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            result = check_apk_tools(
-                which=lambda _name: None,
-                env={},
-                home=Path(directory),
-            )
+    def test_running_emulator_is_not_guessed_when_avd_name_is_unavailable(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                device,
+                "list_adb_devices",
+                return_value=[AdbDevice("emulator-5554", "device")],
+            ),
+            patch.object(device, "running_emulator_avd_name", return_value=None),
+        ):
+            resolved = device.find_running_avd("Pixel_9_Pro")
 
-        self.assertEqual(result.status, Status.FAIL)
-        self.assertEqual(result.importance, Importance.REQUIRED)
-
-    def test_apk_inspection_tools_are_discovered_from_android_sdk(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            sdk = Path(directory)
-            for name in ("apksigner", "aapt"):
-                executable = sdk / "build-tools" / "36.1.0" / name
-                executable.parent.mkdir(parents=True, exist_ok=True)
-                executable.write_text("", encoding="utf-8")
-                executable.chmod(0o755)
-
-            result = check_apk_tools(
-                which=lambda _name: None,
-                env={"ANDROID_SDK_ROOT": str(sdk)},
-                home=sdk / "home",
-            )
-
-        self.assertEqual(result.status, Status.PASS)
-        self.assertEqual(result.importance, Importance.REQUIRED)
+        self.assertIsNone(resolved)
 
     def test_java_is_required(self) -> None:
         result = check_java(
@@ -1365,6 +994,14 @@ class ConfigurationValidationTests(unittest.TestCase):
 
         self.assertEqual(result.status, Status.FAIL)
         self.assertEqual(result.importance, Importance.REQUIRED)
+
+    def test_local_apk_is_accepted_without_certificate_validation(self) -> None:
+        result = check_apk(
+            interactive=False,
+            resolve=lambda *_args, **_kwargs: Path("/tmp/local-debug.apk"),
+        )
+
+        self.assertEqual(result.status, Status.PASS)
 
 
 class DeviceProcessLockTests(unittest.TestCase):
@@ -1726,7 +1363,7 @@ class CredentialTargetOwnershipTests(unittest.TestCase):
     @patch.object(MaestroExecutor, "_run_flow")
     @patch.object(MaestroExecutor, "_clear_focused_credential_field")
     @patch.object(MaestroExecutor, "_focus_credential_target")
-    def test_trusted_password_field_is_revalidated_and_entered(
+    def test_password_field_is_revalidated_and_entered(
         self, _focus, _clear, run_flow
     ) -> None:
         target = self.target(CredentialKind.PASSWORD)
@@ -1759,7 +1396,7 @@ class CredentialTargetOwnershipTests(unittest.TestCase):
         executor = self.executor([UIObservation((foreign,))])
         with patch("apppilot.android.subprocess.run") as run:
             with self.assertRaisesRegex(
-                AndroidOperationalError, "trusted target field changed"
+                AndroidOperationalError, "credential target field changed"
             ):
                 executor.execute_fast(
                     Action(
@@ -1792,7 +1429,7 @@ class CredentialTargetOwnershipTests(unittest.TestCase):
             patch.object(executor, "_run_flow") as run_flow,
         ):
             with self.assertRaisesRegex(
-                AndroidOperationalError, "trusted target field changed"
+                AndroidOperationalError, "credential target field changed"
             ):
                 executor.execute_fast(
                     Action(
@@ -1814,7 +1451,7 @@ class CredentialTargetOwnershipTests(unittest.TestCase):
         executor = self.executor([UIObservation((foreign,))])
         with patch.object(executor, "_run_flow") as run_flow:
             with self.assertRaisesRegex(
-                AndroidOperationalError, "trusted target field changed"
+                AndroidOperationalError, "credential target field changed"
             ):
                 executor.execute_fast(
                     Action(
@@ -1840,7 +1477,7 @@ class CredentialTargetOwnershipTests(unittest.TestCase):
             patch("apppilot.android.subprocess.run") as run,
         ):
             with self.assertRaisesRegex(
-                AndroidOperationalError, "trusted target field changed"
+                AndroidOperationalError, "credential target field changed"
             ):
                 executor.execute_fast(
                     Action(
@@ -2427,7 +2064,6 @@ class FailureArtifactTests(unittest.TestCase):
             "device-1",
             {
                 "package_id": PACKAGE,
-                "certificate_sha256": CERT,
             },
             root=self.root,
             **kwargs,
@@ -3106,14 +2742,8 @@ class SupportedLinkVerificationTests(unittest.TestCase):
 
 
 class FinalBlockerRegressionTests(unittest.TestCase):
-    @patch.object(ApkTrustGuard, "verify_installed")
-    @patch.object(
-        ApkTrustConfig,
-        "from_env",
-        return_value=ApkTrustConfig(PACKAGE, CERT),
-    )
     def test_exported_no_argument_builder_resolves_device_before_android_setup(
-        self, _config, verify_installed
+        self,
     ) -> None:
         from flows import login as login_flow
 
@@ -3129,7 +2759,6 @@ class FinalBlockerRegressionTests(unittest.TestCase):
             )
 
         resolve_runtime_device.assert_called_once_with(None)
-        verify_installed.assert_called_once_with("resolved-device")
         self.assertEqual(agent._executor._device_id, "resolved-device")
 
     def test_exported_injected_login_builder_does_not_resolve_a_device(
@@ -3163,15 +2792,8 @@ class FinalBlockerRegressionTests(unittest.TestCase):
         self.assertIs(agent._observer, observer)
         self.assertIs(agent._executor, executor)
 
-    @patch.object(ApkTrustGuard, "assert_credential_release")
-    @patch.object(ApkTrustGuard, "verify_installed")
-    @patch.object(
-        ApkTrustConfig,
-        "from_env",
-        return_value=ApkTrustConfig(PACKAGE, CERT),
-    )
-    def test_default_login_builder_installs_trust_guard(
-        self, _config, verify_installed, assert_release
+    def test_default_login_builder_does_not_require_certificate_validation(
+        self,
     ) -> None:
         observer = Mock()
         agent = login_builder.build_login_agent(
@@ -3181,21 +2803,11 @@ class FinalBlockerRegressionTests(unittest.TestCase):
             max_actions=1,
         )
 
-        verify_installed.assert_called_once_with("device-1")
-        agent._executor._credential_release_check(0.25)
-        assert_release.assert_called_once_with(
-            "device-1", timeout=0.25
-        )
+        self.assertIsNone(agent._executor._credential_release_check)
 
     @patch.object(MaestroExecutor, "is_foreground", return_value=False)
-    @patch.object(ApkTrustGuard, "verify_installed")
-    @patch.object(
-        ApkTrustConfig,
-        "from_env",
-        return_value=ApkTrustConfig(PACKAGE, CERT),
-    )
     def test_default_login_builder_rejects_unrelated_foreground_ui(
-        self, _config, _verify_installed, is_foreground
+        self, is_foreground
     ) -> None:
         agent = login_builder.build_login_agent(
             "device-1",

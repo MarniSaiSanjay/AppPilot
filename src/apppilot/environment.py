@@ -164,6 +164,42 @@ def add_java_path(
     return tuple(new_entries)
 
 
+def add_maestro_path(
+    *,
+    env: MutableMapping[str, str] | None = None,
+    home: Path | None = None,
+) -> tuple[str, ...]:
+    """Add the Maestro installer directory to PATH for this process."""
+    source = os.environ if env is None else env
+    maestro_bin = (Path.home() if home is None else home) / ".maestro" / "bin"
+    if not maestro_bin.is_dir():
+        return ()
+    current = [item for item in source.get("PATH", "").split(os.pathsep) if item]
+    entry = str(maestro_bin)
+    if entry in current:
+        return ()
+    source["PATH"] = os.pathsep.join([entry, *current])
+    return (entry,)
+
+
+def maestro_executable(
+    *,
+    env: MutableMapping[str, str] | None = None,
+    home: Path | None = None,
+) -> str | None:
+    """Return Maestro from PATH or its standard installer directory."""
+    source = os.environ if env is None else env
+    resolved = shutil.which("maestro", path=source.get("PATH"))
+    if resolved:
+        return resolved
+    maestro_bin = (Path.home() if home is None else home) / ".maestro" / "bin"
+    for name in ("maestro.exe", "maestro.cmd", "maestro.bat", "maestro"):
+        candidate = maestro_bin / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def git_bash_path(
     *,
     env: MutableMapping[str, str] | None = None,

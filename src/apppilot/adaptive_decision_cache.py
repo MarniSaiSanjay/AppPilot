@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from pathlib import Path
 
@@ -192,17 +191,8 @@ class AdaptiveDecisionCache:
 
     @staticmethod
     def _default_cache_path(cache_namespace: str) -> Path:
-        root = Path(
-            os.environ.get(
-                "XDG_CACHE_HOME",
-                Path.home() / ".cache",
-            )
-        )
-        return (
-            root
-            / "apppilot"
-            / f"{cache_namespace}-decisions-v{_CACHE_VERSION}.json"
-        )
+        root = Path(__file__).resolve().parents[2] / ".apppilot_cache"
+        return root / f"{cache_namespace}-decisions-v{_CACHE_VERSION}.json"
 
     def _load_cache(self) -> dict[str, str]:
         if not self._cache_path.exists():

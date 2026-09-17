@@ -17,12 +17,7 @@ from xml.etree import ElementTree
 from pathlib import Path
 from typing import Callable, Sequence
 
-from . import logtags
-from .apk_trust import (
-    ForegroundComponent,
-    parse_activity_component,
-    parse_foreground_component,
-)
+from . import environment, logtags
 from .models import (
     Action,
     ActionKind,
@@ -133,6 +128,40 @@ class AndroidOperationalError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ForegroundComponent:
+    """The package and activity currently reported by Android."""
+
+    package_id: str
+    activity: str
+
+
+def parse_foreground_component(output: str) -> ForegroundComponent | None:
+    """Extract the resumed Android activity from ``dumpsys`` output."""
+    for raw in output.splitlines():
+        line = raw.strip()
+        if "ResumedActivity" not in line:
+            continue
+        match = re.search(r"\s([A-Za-z0-9_.]+)/(\S+)", line)
+        if match:
+            return ForegroundComponent(
+                package_id=match.group(1),
+                activity=f"{match.group(1)}/{match.group(2)}",
+            )
+    return None
+
+
+def parse_activity_component(value: str) -> ForegroundComponent | None:
+    """Parse an Android package/activity component."""
+    match = re.fullmatch(r"\s*([A-Za-z0-9_.]+)/(\S+)\s*", value or "")
+    if not match:
+        return None
+    return ForegroundComponent(
+        package_id=match.group(1),
+        activity=f"{match.group(1)}/{match.group(2)}",
+    )
+
+
+@dataclass(frozen=True)
 class SupportedLinkState:
     user_id: str
     domains: tuple[str, ...]
@@ -225,11 +254,9 @@ class MaestroHierarchyObserver:
                     time.sleep(0.25)
                     continue
                 break
-        print(
-            logtags.prefix(
-                logtags.MAESTRO,
-                f"direct hierarchy unavailable; using Maestro fallback: {error}",
-            )
+        logtags.trace(
+            f"direct hierarchy unavailable; using Maestro fallback: {error}",
+            logtags.MAESTRO,
         )
         try:
             return self._capture_maestro()
@@ -308,7 +335,7 @@ class MaestroHierarchyObserver:
 
     def _capture_maestro(self, timeout: float = 30) -> UIObservation:
         command = [
-            "maestro",
+            environment.maestro_executable() or "maestro",
             "--no-ansi",
             "--udid",
             self._device_id,
@@ -1334,7 +1361,7 @@ class MaestroExecutor:
                 try:
                     result = subprocess.run(
                         [
-                            "maestro",
+                            environment.maestro_executable() or "maestro",
                             "--no-ansi",
                             "--udid",
                             self._device_id,
@@ -1364,13 +1391,11 @@ class MaestroExecutor:
                         )
                         and attempt < _DRIVER_STARTUP_MAX_ATTEMPTS
                     ):
-                        print(
-                            logtags.prefix(
-                                logtags.MAESTRO,
-                                f"driver transport failure "
-                                f"(attempt {attempt}/{_DRIVER_STARTUP_MAX_ATTEMPTS}); "
-                                "resetting adb and retrying",
-                            )
+                        logtags.trace(
+                            f"driver transport failure "
+                            f"(attempt {attempt}/{_DRIVER_STARTUP_MAX_ATTEMPTS}); "
+                            "resetting adb and retrying",
+                            logtags.MAESTRO,
                         )
                         self._reset_adb_connection(deadline)
                         remaining = self._remaining_deadline(
@@ -1419,11 +1444,9 @@ class MaestroExecutor:
             if target.bounds is None:
                 raise
             safe_point = self._safe_tap_point(target, observation)
-            print(
-                logtags.prefix(
-                    logtags.MAESTRO,
-                    "selector tap failed; retrying via coordinate tap",
-                )
+            logtags.trace(
+                "selector tap failed; retrying via coordinate tap",
+                logtags.MAESTRO,
             )
             self._tap_point(*safe_point)
 
@@ -1569,11 +1592,8 @@ class MaestroExecutor:
         return CredentialInputMethod.CLIPBOARD
 
     def _assert_credential_release(self, timeout: float) -> None:
-        if self._credential_release_check is None:
-            raise AndroidOperationalError(
-                "credential entry blocked because no APK trust guard is configured"
-            )
-        self._credential_release_check(timeout)
+        if self._credential_release_check is not None:
+            self._credential_release_check(timeout)
 
     def _revalidate_credential_target(
         self,
@@ -1601,7 +1621,7 @@ class MaestroExecutor:
         ]
         if len(matches) != 1:
             raise AndroidOperationalError(
-                "credential entry blocked because the trusted target field changed"
+                "credential entry blocked because the credential target field changed"
             )
         return matches[0]
 

@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 from apppilot import email_delivery
 
 
-def test_report_uses_fixed_footer_contact() -> None:
+def test_report_omits_footer_contact_when_not_configured() -> None:
     report = Mock()
     view = Mock()
     report.to_email_report.return_value = view
@@ -26,5 +26,5 @@ def test_report_uses_fixed_footer_contact() -> None:
             recipient="tester@example.test",
         )
 
-    text.assert_called_once_with(view, "marnisanjay@microsoft.com")
-    html.assert_called_once_with(view, "marnisanjay@microsoft.com")
+    text.assert_called_once_with(view, None)
+    html.assert_called_once_with(view, None)

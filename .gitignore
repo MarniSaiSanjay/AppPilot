@@ -22,3 +22,5 @@ testcases/regressions/*.xlsx
 .apppilot_device
 
 .apppilot_artifacts/
+.apppilot_reports/
+.apppilot_cache/

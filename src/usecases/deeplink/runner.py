@@ -12,12 +12,12 @@ from urllib.parse import urlsplit
 try:
     from ...apppilot.android import (
         AndroidOperationalError,
+        ForegroundComponent,
         MaestroExecutor,
         MaestroHierarchyObserver,
     )
     from ...apppilot import logtags
     from ...apppilot.models import Action, ActionKind, UIElement, UIObservation
-    from ...apppilot.apk_trust import ForegroundComponent
     from ...shared.account import (
         AccountPreparationKind,
         AccountPreparationResult,
@@ -31,12 +31,12 @@ try:
 except ImportError:
     from apppilot.android import (
         AndroidOperationalError,
+        ForegroundComponent,
         MaestroExecutor,
         MaestroHierarchyObserver,
     )
     from apppilot import logtags
     from apppilot.models import Action, ActionKind, UIElement, UIObservation
-    from apppilot.apk_trust import ForegroundComponent
     from shared.account import (
         AccountPreparationKind,
         AccountPreparationResult,
@@ -60,7 +60,7 @@ DEFAULT_SETTLE_SECONDS = 3.0
 DEFAULT_VERIFY_TIMEOUT_SECONDS = 30.0
 DEFAULT_VERIFY_POLL_INTERVAL_SECONDS = 2.0
 _RESEARCHER_ADD_VERBS = {"add", "get", "install"}
-_TRUSTED_STORE_PACKAGES = {"com.android.vending"}
+_PLAY_STORE_PACKAGES = {"com.android.vending"}
 
 
 class _ReplayRecoveryError(RuntimeError):
@@ -456,7 +456,7 @@ class DeeplinkTestRunner:
             and (
                 case.installed
                 or self._can_restart_and_replay(case)
-                or launch_component.package_id not in _TRUSTED_STORE_PACKAGES
+                or launch_component.package_id not in _PLAY_STORE_PACKAGES
             )
         ):
             return _DeterministicVerdict(

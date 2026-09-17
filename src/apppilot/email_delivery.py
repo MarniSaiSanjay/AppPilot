@@ -18,8 +18,6 @@ _REQUIRED_ENV = (
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
 
 _RECIPIENT_STORE = Path(__file__).resolve().parents[2] / ".apppilot_recipient"
-_REPORT_CONTACT_EMAIL = "marnisanjay@microsoft.com"
-
 _MAX_BODY_CHARS = 190_000
 
 _HTTP_TIMEOUT_SECONDS = 120
@@ -28,7 +26,7 @@ Transport = Callable[[urllib.request.Request], "tuple[int, str]"]
 
 
 def _log(message: str) -> None:
-    print(logtags.prefix(logtags.EMAIL, message))
+    logtags.trace(message, logtags.EMAIL)
 
 
 def _missing_config(env: Mapping[str, str]) -> "list[str]":
@@ -110,7 +108,7 @@ def send_suite_report(
         return False
     destination = recipient or "the configured default recipient"
     _log(f"sending report to {destination} - this can take up to a minute...")
-    contact = _REPORT_CONTACT_EMAIL
+    contact = env.get("APPPILOT_CONTACT_EMAIL")
     try:
         view = report.to_email_report()
         _post_report(

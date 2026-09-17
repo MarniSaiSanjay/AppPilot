@@ -118,6 +118,32 @@ def create_plan(
     actions: list[BootstrapAction] = []
     notes: list[str] = []
     package_manager = which("brew" if operating_system == "Darwin" else "winget")
+    if "az" in missing_names:
+        if operating_system == "Darwin" and package_manager:
+            actions.append(BootstrapAction(
+                "azure-cli",
+                "Install Azure CLI for work-account sign-in.",
+                (package_manager, "install", "azure-cli"),
+            ))
+        elif operating_system == "Windows" and package_manager:
+            actions.append(BootstrapAction(
+                "azure-cli",
+                "Install Azure CLI for work-account sign-in.",
+                (
+                    package_manager, "install", "--id", "Microsoft.AzureCLI",
+                    "--exact", "--accept-source-agreements",
+                    "--accept-package-agreements",
+                ),
+            ))
+            notes.append(
+                "After Azure CLI installs, open a new terminal and re-run /setup."
+            )
+        else:
+            manager = "Homebrew" if operating_system == "Darwin" else "WinGet"
+            notes.append(
+                f"Azure CLI is missing. Install {manager} first, then re-run /setup."
+            )
+
     if "java" in missing_names:
         if operating_system == "Darwin" and package_manager:
             actions.append(BootstrapAction(
@@ -170,7 +196,7 @@ def create_plan(
                 "official Maestro installer."
             )
 
-    android_missing = {"adb", "apk-tools"} & missing_names
+    android_missing = {"adb"} & missing_names
     if android_missing:
         root = _sdk_root(env)
         sdkmanager = _sdkmanager_path(root)
@@ -180,13 +206,12 @@ def create_plan(
         if sdkmanager and root:
             actions.append(BootstrapAction(
                 "android-sdk",
-                "Install Android platform, emulator, and APK-inspection tools.",
+                "Install Android platform and emulator tools.",
                 (
                     sdkmanager,
                     f"--sdk_root={root}",
                     "platform-tools",
                     "emulator",
-                    "build-tools;36.1.0",
                 ),
             ))
             actions.append(BootstrapAction(
@@ -349,9 +374,4 @@ def _report_install_failure(
 
 def _add_maestro_to_path() -> None:
     """Make an installer-created Maestro binary available for this process."""
-    maestro_bin = Path.home() / ".maestro" / "bin"
-    if not maestro_bin.is_dir():
-        return
-    current = [item for item in os.environ.get("PATH", "").split(os.pathsep) if item]
-    if str(maestro_bin) not in current:
-        os.environ["PATH"] = os.pathsep.join([str(maestro_bin), *current])
+    environment.add_maestro_path()

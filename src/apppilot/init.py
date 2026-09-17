@@ -17,7 +17,6 @@ from typing import Callable, List, Mapping, Optional, Sequence, Tuple
 
 from . import (
     apk_config,
-    apk_trust,
     bootstrap,
     device,
     device_config,
@@ -201,41 +200,16 @@ def check_java(*, which=None, runner=None) -> CheckResult:
     )
 
 
-def check_apk_tools(
-    *,
-    which=None,
-    env: Mapping[str, str] | None = None,
-    home=None,
-) -> CheckResult:
-    """Verify the external tools required for APK trust inspection."""
-    which = which or shutil.which
-    missing = []
-    if not apk_trust.resolve_android_tool(
-        "apksigner", which=which, env=env, home=home
-    ):
-        missing.append("apksigner")
-    if not apk_trust.resolve_android_tool(
-        "apkanalyzer", which=which, env=env, home=home
-    ) and not apk_trust.resolve_android_tool(
-        "aapt", which=which, env=env, home=home
-    ):
-        missing.append("apkanalyzer or aapt")
-    if missing:
-        return CheckResult(
-            "apk-tools",
-            _ENVIRONMENT,
-            Importance.REQUIRED,
-            Status.FAIL,
-            "APK inspection tools missing: " + ", ".join(missing),
-            "Install Android SDK build-tools and command-line tools, and set "
-            "ANDROID_SDK_ROOT or ANDROID_HOME if the SDK is in a custom location.",
-        )
-    return CheckResult(
-        "apk-tools",
-        _ENVIRONMENT,
-        Importance.REQUIRED,
-        Status.PASS,
-        "APK inspection tools available",
+def check_azure_cli(*, which=None, runner=None) -> CheckResult:
+    """Verify Azure CLI is available for work-account sign-in."""
+    return _check_required_tool(
+        name="az",
+        version_args=["version"],
+        label="Azure CLI",
+        version_prefix="",
+        remediation="Install Azure CLI, then re-run /setup.",
+        which=which or shutil.which,
+        runner=runner or subprocess.run,
     )
 
 
@@ -636,10 +610,8 @@ def check_apk(
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
     resolve: Callable = apk_config.resolve_apk_path,
-    env: Optional[Mapping[str, str]] = None,
-    guard_factory: Callable = apk_trust.ApkTrustGuard,
 ) -> CheckResult:
-    """Resolve/validate the local APK and map it to a readiness check."""
+    """Resolve the local APK and map it to a readiness check."""
     sink = output if interactive else (lambda _message: None)
     try:
         path = resolve(None, interactive=interactive, input_fn=input_fn, output=sink)
@@ -651,18 +623,6 @@ def check_apk(
             "No valid APK configured",
             "Configure a valid APK (run /init and enter the path, or pass "
             "--apk to the run command).",
-        )
-    try:
-        config = apk_trust.ApkTrustConfig.from_env(env)
-        guard_factory(config).validate_apk(path)
-    except apk_trust.ApkTrustError as error:
-        return CheckResult(
-            "apk",
-            _APK,
-            Importance.REQUIRED,
-            Status.FAIL,
-            f"APK trust validation failed ({error})",
-            "Provide the approved signed APK and retry.",
         )
     return CheckResult(
         "apk", _APK, Importance.REQUIRED, Status.PASS,
@@ -853,7 +813,7 @@ def run_environment_checks(
         check_adb(which=which, runner=runner),
         check_maestro(which=which, runner=runner),
         check_java(which=which, runner=runner),
-        check_apk_tools(which=which, env=env),
+        check_azure_cli(which=which, runner=runner),
     ]
 
 
@@ -873,7 +833,7 @@ def _bootstrap_missing(core: Sequence[CheckResult]) -> list[str]:
         result.name
         for result in core
         if result.status == Status.FAIL
-        and result.name in {"adb", "apk-tools", "java", "maestro"}
+        and result.name in {"adb", "az", "java", "maestro"}
     ]
     repository = Path(__file__).resolve().parents[2]
     if not bootstrap._venv_python(repository, platform.system()).is_file():
@@ -972,7 +932,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             adb_available=adb_result.status in (Status.PASS, Status.WARNING),
             interactive=interactive,
         )
-        apk_result = check_apk(interactive=interactive, env=os.environ)
+        apk_result = check_apk(interactive=interactive)
         try:
             relay_env = {**os.environ, **load_relay_secrets()}
         except RelayConfigurationError as error:

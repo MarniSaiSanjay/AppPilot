@@ -89,8 +89,8 @@ class AppPilotAgent:
         return self._last_failure_reason
 
     def _emit(self, text: str) -> None:
-        """Print one log entry, prefixed with the subsystem tag when set."""
-        print(logtags.prefix(self._log_tag, text))
+        """Emit one detailed agent log entry when tracing is enabled."""
+        logtags.trace(text, self._log_tag)
 
     def _log_goal_reached(self, reached: bool) -> None:
         self._emit(f"GOAL REACHED:\n{str(reached).lower()}\n")
@@ -903,4 +903,5 @@ def _load_dotenv(path: Path | None = None) -> None:
             os.environ[key] = value
     environment.add_java_path()
     environment.add_android_sdk_paths()
+    environment.add_maestro_path()
     load_work_defaults()

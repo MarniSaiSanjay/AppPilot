@@ -18,13 +18,7 @@ try:
         _default_max_stuck_actions,
         _load_dotenv,
     )
-    from ...apppilot.android import MaestroExecutor, MaestroHierarchyObserver
-    from ...apppilot.apk_trust import (
-        ApkTrustConfig,
-        ApkTrustConfigurationError,
-        ApkTrustError,
-        ApkTrustGuard,
-    )
+    from ...apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from ...apppilot.device_lock import DeviceLockError, DeviceProcessLock
     from ...apppilot.brain import (
         LLMModelDecisionProvider,
@@ -45,13 +39,7 @@ except ImportError:
         _default_max_stuck_actions,
         _load_dotenv,
     )
-    from apppilot.android import MaestroExecutor, MaestroHierarchyObserver
-    from apppilot.apk_trust import (
-        ApkTrustConfig,
-        ApkTrustConfigurationError,
-        ApkTrustError,
-        ApkTrustGuard,
-    )
+    from apppilot.android import APP_ID, MaestroExecutor, MaestroHierarchyObserver
     from apppilot.device_lock import DeviceLockError, DeviceProcessLock
     from apppilot.brain import (
         LLMModelDecisionProvider,
@@ -146,16 +134,9 @@ def build_login_agent(
     policy = policy or LoginPolicy.default()
     observer = observer or MaestroHierarchyObserver(device)
     if executor is None:
-        trust_guard = ApkTrustGuard(ApkTrustConfig.from_env())
-        trust_guard.verify_installed(device)
         executor = MaestroExecutor(
-            trust_guard.config.package_id,
+            APP_ID,
             device,
-            credential_release_check=lambda timeout: (
-                trust_guard.assert_credential_release(
-                    device, timeout=timeout
-                )
-            ),
             credential_observer=observer,
         )
     if isinstance(executor, MaestroExecutor):
@@ -281,30 +262,17 @@ def main() -> int:
         print(f"ERROR: invalid credential configuration: {error}", file=sys.stderr)
         return 2
 
-    try:
-        trust_config = ApkTrustConfig.from_env()
-    except ApkTrustConfigurationError as error:
-        print(f"ERROR: invalid APK trust configuration: {error}", file=sys.stderr)
-        return 2
-
     device = device_config.resolve_device(args.device)
     if device is None:
         return 2
 
-    trust_guard = ApkTrustGuard(trust_config)
     lock = DeviceProcessLock(device)
     try:
         with lock:
-            trust_guard.verify_installed(device)
             observer = MaestroHierarchyObserver(device)
             executor = MaestroExecutor(
-                trust_config.package_id,
+                APP_ID,
                 device,
-                credential_release_check=lambda timeout: (
-                    trust_guard.assert_credential_release(
-                        device, timeout=timeout
-                    )
-                ),
                 credential_observer=observer,
             )
             agent = build_login_agent(
@@ -325,20 +293,21 @@ def main() -> int:
                 except (OSError, RuntimeError):
                     clipboard_cleared = False
                 if not clipboard_cleared:
-                    print(
-                        f"{logtags.tag(logtags.LOGIN)} RESULT:\n"
-                        "FAIL - clipboard cleanup could not be confirmed"
-                    )
                     succeeded = False
+            if succeeded:
+                print(f"{logtags.tag(logtags.LOGIN)} RESULT:\nPASS")
+            else:
+                detail = agent.last_failure_reason
+                suffix = f" - {detail}" if detail else ""
+                print(f"{logtags.tag(logtags.LOGIN)} RESULT:\nFAIL{suffix}")
             return 0 if succeeded else 1
-    except (ValueError, ApkTrustConfigurationError) as error:
+    except ValueError as error:
         print(f"ERROR: invalid configuration: {error}", file=sys.stderr)
         return 2
     except DeviceLockError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2
     except (
-        ApkTrustError,
         OSError,
         RuntimeError,
         subprocess.TimeoutExpired,

@@ -17,6 +17,7 @@ from apppilot import init
 
 
 class BootstrapPlanTests(unittest.TestCase):
+
     def test_java_path_detects_installed_windows_temurin_jdk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             program_files = Path(temporary) / "Program Files"
@@ -78,7 +79,7 @@ class BootstrapPlanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
             plan = bootstrap.create_plan(
-                missing={"java", "maestro", "adb", "apk-tools"},
+                missing={"java", "maestro", "adb"},
                 repository=repository,
                 env={"ANDROID_SDK_ROOT": str(repository / "empty-sdk")},
                 which=lambda name: {
@@ -103,6 +104,20 @@ class BootstrapPlanTests(unittest.TestCase):
         )
         self.assertFalse(any("avd" in name or "image" in name for name in names))
 
+    def test_macos_plan_installs_azure_cli(self) -> None:
+        plan = bootstrap.create_plan(
+            missing={"az"},
+            repository=Path("."),
+            which=lambda name: "/opt/homebrew/bin/brew" if name == "brew" else None,
+            system="Darwin",
+        )
+
+        self.assertEqual(plan.actions[0].name, "azure-cli")
+        self.assertEqual(
+            plan.actions[0].command,
+            ("/opt/homebrew/bin/brew", "install", "azure-cli"),
+        )
+
     def test_non_macos_plan_explains_that_installation_is_unsupported(self) -> None:
         plan = bootstrap.create_plan(
             missing={"maestro"},
@@ -116,7 +131,7 @@ class BootstrapPlanTests(unittest.TestCase):
     def test_windows_plan_uses_winget_and_never_provisions_an_avd(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             plan = bootstrap.create_plan(
-                missing={"java", "maestro", "adb", "apk-tools"},
+                missing={"java", "maestro", "adb"},
                 repository=Path(temporary),
                 env={"LOCALAPPDATA": str(Path(temporary) / "local")},
                 which=lambda name: (
@@ -138,6 +153,24 @@ class BootstrapPlanTests(unittest.TestCase):
         self.assertFalse(any("avd" in name or "image" in name for name in names))
         self.assertTrue(
             any(note.startswith("Re-run /setup after Java installs") for note in plan.notes)
+        )
+
+    def test_windows_plan_installs_azure_cli(self) -> None:
+        plan = bootstrap.create_plan(
+            missing={"az"},
+            repository=Path("."),
+            which=lambda name: (
+                "C:\\Windows\\System32\\winget.exe" if name == "winget" else None
+            ),
+            system="Windows",
+        )
+
+        command = plan.actions[0].command
+        self.assertEqual(plan.actions[0].name, "azure-cli")
+        self.assertIn("Microsoft.AzureCLI", command)
+        self.assertIn(
+            "After Azure CLI installs, open a new terminal and re-run /setup.",
+            plan.notes,
         )
 
     def test_windows_plan_offers_git_bash_before_maestro(self) -> None:
@@ -215,7 +248,7 @@ class BootstrapPlanTests(unittest.TestCase):
             manager.parent.mkdir(parents=True)
             manager.touch(mode=0o755)
             plan = bootstrap.create_plan(
-                missing={"adb", "apk-tools"},
+                missing={"adb"},
                 repository=root / "repo",
                 env={"ANDROID_SDK_ROOT": str(root)},
                 system="Darwin",
@@ -228,7 +261,6 @@ class BootstrapPlanTests(unittest.TestCase):
                 f"--sdk_root={root}",
                 "platform-tools",
                 "emulator",
-                "build-tools;36.1.0",
             ),
             commands,
         )
@@ -253,7 +285,6 @@ class BootstrapPlanTests(unittest.TestCase):
                 f"--sdk_root={root}",
                 "platform-tools",
                 "emulator",
-                "build-tools;36.1.0",
             ),
             [action.command for action in plan.actions],
         )
@@ -281,7 +312,6 @@ class BootstrapPlanTests(unittest.TestCase):
                 f"--sdk_root={root.resolve()}",
                 "platform-tools",
                 "emulator",
-                "build-tools;36.1.0",
             ),
             [action.command for action in plan.actions],
         )
@@ -345,6 +375,35 @@ class BootstrapExecutionTests(unittest.TestCase):
             bootstrap._install_maestro(runner, "/bin/sh")
 
             self.assertIn(str(maestro_bin), os.environ["PATH"])
+
+    def test_maestro_path_is_added_for_later_runtime_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            maestro_bin = home / ".maestro" / "bin"
+            maestro_bin.mkdir(parents=True)
+            env = {"PATH": "/existing"}
+
+            additions = bootstrap.environment.add_maestro_path(
+                env=env,
+                home=home,
+            )
+
+        self.assertEqual(additions, (str(maestro_bin),))
+        self.assertEqual(env["PATH"], f"{maestro_bin}{os.pathsep}/existing")
+
+    def test_maestro_executable_finds_installer_binary_without_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            executable = home / ".maestro" / "bin" / "maestro.exe"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+
+            resolved = bootstrap.environment.maestro_executable(
+                env={"PATH": ""},
+                home=home,
+            )
+
+        self.assertEqual(resolved, str(executable))
 
 
 class InitBootstrapTests(unittest.TestCase):

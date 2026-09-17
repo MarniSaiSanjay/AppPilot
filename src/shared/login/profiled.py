@@ -53,7 +53,7 @@ class ProfiledLoginFlowFactory:
         profile = self._profiles.get(key)
         if profile is None:
             raise CredentialConfigurationError(
-                f"No resolved credential profile is available for License "
-                f"{license_name!r} (profile key {key!r})"
+                "Required Deeplink test credentials are missing. Make sure to "
+                "add the required credentials to your local .env before running."
             )
         return profile

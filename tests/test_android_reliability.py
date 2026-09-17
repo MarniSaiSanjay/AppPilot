@@ -64,7 +64,6 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         self.executor = MaestroExecutor(
             "com.example.app",
             "emulator-5554",
-            credential_release_check=lambda _timeout: None,
             credential_observer=self.credential_observer,
         )
 
