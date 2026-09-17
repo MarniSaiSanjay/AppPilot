@@ -930,6 +930,22 @@ class ConfigurationValidationTests(unittest.TestCase):
         self.assertIsNone(selected)
         self.assertIn("could not be verified", messages[0])
 
+    def test_saved_device_is_accepted_when_init_captured_no_identity(
+        self,
+    ) -> None:
+        identity_resolver = Mock()
+        selected = resolve_device(
+            None,
+            saved_loader=lambda: "emulator-5554",
+            saved_identity_loader=lambda: None,
+            list_devices=lambda: [AdbDevice("emulator-5554", "device")],
+            is_booted=lambda _serial: True,
+            identity_resolver=identity_resolver,
+        )
+
+        self.assertEqual(selected, "emulator-5554")
+        identity_resolver.assert_not_called()
+
     def test_saved_device_record_persists_emulator_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory) / ".apppilot_device"
@@ -983,6 +999,44 @@ class ConfigurationValidationTests(unittest.TestCase):
             patch.object(device, "running_emulator_avd_name", return_value=None),
         ):
             resolved = device.find_running_avd("Pixel_9_Pro")
+
+        self.assertIsNone(resolved)
+
+    def test_unique_running_emulator_is_used_when_identity_unavailable(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                device,
+                "list_adb_devices",
+                return_value=[AdbDevice("emulator-5554", "device")],
+            ),
+            patch.object(device, "running_emulator_avd_name", return_value=None),
+        ):
+            resolved = device.find_running_avd(
+                "Pixel_9_Pro", allow_unique_fallback=True
+            )
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.serial, "emulator-5554")
+
+    def test_unique_fallback_ignored_when_multiple_emulators_running(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                device,
+                "list_adb_devices",
+                return_value=[
+                    AdbDevice("emulator-5554", "device"),
+                    AdbDevice("emulator-5556", "device"),
+                ],
+            ),
+            patch.object(device, "running_emulator_avd_name", return_value=None),
+        ):
+            resolved = device.find_running_avd(
+                "Pixel_9_Pro", allow_unique_fallback=True
+            )
 
         self.assertIsNone(resolved)
 
@@ -1972,6 +2026,7 @@ class TimeoutBudgetTests(unittest.TestCase):
         ]
         monotonic.side_effect = self.StepClock(step=0.25)
         executor = MaestroExecutor(PACKAGE, "device-1")
+        executor._maestro_driver_warmed = True
 
         executor._run_flow("- tapOn: Open\n", timeout=5)
 
@@ -1999,6 +2054,7 @@ class TimeoutBudgetTests(unittest.TestCase):
         )
         monotonic.side_effect = iter((0.0, 0.5, 1.0))
         executor = MaestroExecutor(PACKAGE, "device-1")
+        executor._maestro_driver_warmed = True
 
         with self.assertRaisesRegex(
             AndroidOperationalError, "timeout budget exhausted"

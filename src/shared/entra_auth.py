@@ -1,4 +1,4 @@
-"""Interactive readiness support for Entra-authenticated model access."""
+"""Interactive readiness for Entra-authenticated Azure access (one az login)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,32 @@ from .model_client import (
     verify_entra_model_authentication,
 )
 
+try:  # pragma: no cover - import shim for package vs. flat execution
+    from ..apppilot.work_defaults import (
+        RelayConfigurationError,
+        load_relay_secrets,
+    )
+except ImportError:  # pragma: no cover - flat execution fallback
+    from apppilot.work_defaults import (  # type: ignore[no-redef]
+        RelayConfigurationError,
+        load_relay_secrets,
+    )
+
+
+_MODEL_REMEDIATION = (
+    "Sign in to the work Azure account with `az login`, then retry. "
+    "That account also needs Azure OpenAI access."
+)
+
+# Set once an approved sign-in succeeds so later callers reuse it.
+_azure_login_completed = False
+
+
+def reset_azure_login_state() -> None:
+    """Reset the process-level sign-in memo (tests)."""
+    global _azure_login_completed
+    _azure_login_completed = False
+
 
 @dataclass(frozen=True)
 class EntraReadiness:
@@ -23,16 +49,26 @@ class EntraReadiness:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class AzureLoginOutcome:
+    """Shared Azure sign-in result; ``detail`` set only for blocking errors."""
+
+    ok: bool
+    detail: str | None = None
+
+
 def _confirm_login(
+    purpose: str,
     input_fn: Callable[[str], str],
     output: Callable[[str], None],
 ) -> bool:
+    prompt = (
+        f"Microsoft Entra sign-in is required for {purpose}. "
+        "Sign in to Azure now [Y/n]: "
+    )
     for _ in range(3):
         try:
-            answer = input_fn(
-                "Microsoft Entra sign-in is required for the model. "
-                "Sign in to Azure now [Y/n]: "
-            )
+            answer = input_fn(prompt)
         except EOFError:
             return False
         answer = answer.strip().lower()
@@ -42,6 +78,51 @@ def _confirm_login(
             return False
         output("Please answer y or n.")
     return False
+
+
+def perform_interactive_azure_login(
+    purpose: str,
+    *,
+    interactive: bool,
+    input_fn: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+    which: Callable[[str], str | None] = shutil.which,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+) -> AzureLoginOutcome:
+    """Run a single user-approved ``az login`` shared across AppPilot."""
+    global _azure_login_completed
+    if _azure_login_completed:
+        return AzureLoginOutcome(ok=True)
+    if not interactive:
+        return AzureLoginOutcome(ok=False)
+    if not _confirm_login(purpose, input_fn, output):
+        return AzureLoginOutcome(ok=False)
+    if which("az") is None:
+        return AzureLoginOutcome(
+            ok=False,
+            detail="Azure CLI (`az`) is not installed. Install it, sign in, then retry.",
+        )
+
+    previous_subscription = _current_subscription(runner)
+    output("Opening the Azure CLI sign-in flow in your browser...")
+    try:
+        result = runner(["az", "login"], check=False)
+    except OSError:
+        return AzureLoginOutcome(
+            ok=False,
+            detail="Azure CLI sign-in could not be started. Run `az login` manually, then retry.",
+        )
+    if result.returncode != 0:
+        return AzureLoginOutcome(
+            ok=False,
+            detail="Azure CLI sign-in was not completed. Run `az login`, then retry.",
+        )
+    restoration_error = _restore_subscription(previous_subscription, runner)
+    if restoration_error is not None:
+        return AzureLoginOutcome(ok=False, detail=restoration_error)
+
+    _azure_login_completed = True
+    return AzureLoginOutcome(ok=True)
 
 
 def _current_subscription(
@@ -107,48 +188,58 @@ def ensure_entra_model_readiness(
     except ModelTransportError:
         pass
 
-    remediation = (
-        "Sign in to the work Azure account with `az login`, then retry. "
-        "That account also needs Azure OpenAI access."
+    outcome = perform_interactive_azure_login(
+        "the model",
+        interactive=interactive,
+        input_fn=input_fn,
+        output=output,
+        which=which,
+        runner=runner,
     )
-    if not interactive:
-        return EntraReadiness(required=True, ready=False, detail=remediation)
-    if not _confirm_login(input_fn, output):
-        return EntraReadiness(required=True, ready=False, detail=remediation)
-    if which("az") is None:
+    if not outcome.ok:
         return EntraReadiness(
             required=True,
             ready=False,
-            detail="Azure CLI (`az`) is not installed. Install it, sign in, then retry.",
-        )
-
-    previous_subscription = _current_subscription(runner)
-    output("Opening the Azure CLI sign-in flow in your browser...")
-    login_command = ["az", "login"]
-    try:
-        result = runner(login_command, check=False)
-    except OSError:
-        return EntraReadiness(
-            required=True,
-            ready=False,
-            detail="Azure CLI sign-in could not be started. Run `az login` manually, then retry.",
-        )
-    if result.returncode != 0:
-        return EntraReadiness(
-            required=True,
-            ready=False,
-            detail="Azure CLI sign-in was not completed. Run `az login`, then retry.",
-        )
-    restoration_error = _restore_subscription(previous_subscription, runner)
-    if restoration_error is not None:
-        return EntraReadiness(
-            required=True,
-            ready=False,
-            detail=restoration_error,
+            detail=outcome.detail or _MODEL_REMEDIATION,
         )
 
     try:
         verifier()
     except ModelTransportError:
-        return EntraReadiness(required=True, ready=False, detail=remediation)
+        return EntraReadiness(
+            required=True, ready=False, detail=_MODEL_REMEDIATION
+        )
     return EntraReadiness(required=True, ready=True)
+
+
+def ensure_relay_environment(
+    base_env: Mapping[str, str],
+    *,
+    interactive: bool,
+    input_fn: Callable[[str], str] = input,
+    output: Callable[[str], None] = print,
+    which: Callable[[str], str | None] = shutil.which,
+    runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+    loader: Callable[[], Mapping[str, str]] = load_relay_secrets,
+) -> tuple[dict[str, str], str | None]:
+    """Load relay secrets, offering the shared sign-in when needed."""
+    try:
+        return {**base_env, **loader()}, None
+    except RelayConfigurationError as error:
+        detail = str(error)
+
+    outcome = perform_interactive_azure_login(
+        "AppPilot email and telemetry reporting",
+        interactive=interactive,
+        input_fn=input_fn,
+        output=output,
+        which=which,
+        runner=runner,
+    )
+    if not outcome.ok:
+        return dict(base_env), outcome.detail or detail
+
+    try:
+        return {**base_env, **loader()}, None
+    except RelayConfigurationError as error:
+        return dict(base_env), str(error)

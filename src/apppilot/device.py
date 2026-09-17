@@ -100,14 +100,25 @@ def running_emulator_avd_name(
 def find_running_avd(
     avd_name: str,
     *, runner: Runner = subprocess.run, timeout: float = DEFAULT_ADB_TIMEOUT,
+    allow_unique_fallback: bool = False,
 ) -> Optional[AdbDevice]:
-    """Return the authorized emulator currently running ``avd_name``, or None."""
-    for device in list_adb_devices(runner=runner, timeout=timeout):
-        if not device.is_emulator or not device.is_authorized:
-            continue
-        if running_emulator_avd_name(device.serial, runner=runner, timeout=timeout) \
-                == avd_name:
+    """Return the authorized emulator running ``avd_name``, or None."""
+    emulators = [
+        device for device in list_adb_devices(runner=runner, timeout=timeout)
+        if device.is_emulator and device.is_authorized
+    ]
+    identity_unavailable = False
+    for device in emulators:
+        running_name = running_emulator_avd_name(
+            device.serial, runner=runner, timeout=timeout
+        )
+        if running_name == avd_name:
             return device
+        if running_name is None:
+            identity_unavailable = True
+    if allow_unique_fallback and len(emulators) == 1 and identity_unavailable:
+        # `adb emu avd name` is empty on Windows; trust a lone emulator.
+        return emulators[0]
     return None
 
 

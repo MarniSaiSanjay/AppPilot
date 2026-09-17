@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -218,7 +219,11 @@ class ModelAuthenticationTests(unittest.TestCase):
             patch.object(deeplink_cli, "MaestroHierarchyObserver"),
             patch.object(deeplink_cli, "MaestroExecutor"),
             patch.object(deeplink_cli, "resolve_decision_provider", return_value=Mock()),
-            patch.object(deeplink_cli, "load_relay_secrets", return_value={}),
+            patch.object(
+                deeplink_cli,
+                "ensure_relay_environment",
+                return_value=(dict(os.environ), None),
+            ),
             patch.object(
                 deeplink_cli.email_delivery,
                 "prompt_email_recipient",

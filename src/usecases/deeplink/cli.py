@@ -34,10 +34,6 @@ try:
         report_storage,
     )
     from ...apppilot import telemetry
-    from ...apppilot.work_defaults import (
-        RelayConfigurationError,
-        load_relay_secrets,
-    )
     from ...shared.installer import LocalApkInstaller
     from ...shared.account.session import AndroidAccountSession
     from ...shared.credentials import (
@@ -52,7 +48,10 @@ try:
         build_login_agent,
         resolve_decision_provider,
     )
-    from ...shared.entra_auth import ensure_entra_model_readiness
+    from ...shared.entra_auth import (
+        ensure_entra_model_readiness,
+        ensure_relay_environment,
+    )
     from ...shared.model_client import ModelConfigurationError
 except ImportError:
     from apppilot.android import (
@@ -75,7 +74,6 @@ except ImportError:
         report_storage,
     )
     from apppilot import telemetry
-    from apppilot.work_defaults import RelayConfigurationError, load_relay_secrets
     from shared.installer import LocalApkInstaller
     from shared.account.session import AndroidAccountSession
     from shared.credentials import (
@@ -90,7 +88,10 @@ except ImportError:
         build_login_agent,
         resolve_decision_provider,
     )
-    from shared.entra_auth import ensure_entra_model_readiness
+    from shared.entra_auth import (
+        ensure_entra_model_readiness,
+        ensure_relay_environment,
+    )
     from shared.model_client import ModelConfigurationError
 
 from .artifacts import FailureArtifactWriter
@@ -374,14 +375,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"ERROR: invalid model configuration: {error}", file=sys.stderr)
         return 2
 
-    try:
-        relay_env = {**os.environ, **load_relay_secrets()}
-    except RelayConfigurationError as error:
-        relay_env = os.environ
+    relay_env, relay_detail = ensure_relay_environment(
+        os.environ, interactive=interactive
+    )
+    if relay_detail:
         print(
             logtags.prefix(
                 logtags.EMAIL,
-                f"AppPilot relay configuration unavailable: {error}",
+                f"AppPilot relay configuration unavailable: {relay_detail}",
             ),
             file=sys.stderr,
         )

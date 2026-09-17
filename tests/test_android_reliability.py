@@ -19,6 +19,7 @@ from apppilot.android import (
     AndroidOperationalError,
     MaestroExecutor,
     MaestroHierarchyObserver,
+    _MAESTRO_COLD_START_TIMEOUT,
 )
 from apppilot.agent import AppPilotAgent
 
@@ -335,6 +336,42 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         )
 
     @patch("apppilot.android.subprocess.run")
+    def test_uiautomator_falls_back_to_device_file_when_stream_empty(
+        self,
+        run,
+    ) -> None:
+        hierarchy_xml = (
+            '<hierarchy rotation="0">'
+            '<node text="Continue with Microsoft" '
+            'resource-id="com.example:id/ms" '
+            'class="android.widget.Button" package="com.example.app" '
+            'content-desc="" clickable="true" enabled="true" '
+            'bounds="[0,0][100,100]" />'
+            "</hierarchy>"
+        )
+        run.side_effect = [
+            subprocess.CompletedProcess(
+                [], 0, "UI hierchary dumped to: /dev/tty", ""
+            ),
+            subprocess.CompletedProcess(
+                [], 0, "UI hierchary dumped to: /sdcard/apppilot_window_dump.xml", ""
+            ),
+            subprocess.CompletedProcess([], 0, hierarchy_xml, ""),
+        ]
+
+        observation = MaestroHierarchyObserver(
+            "emulator-5554"
+        )._capture_uiautomator()
+
+        self.assertEqual(run.call_count, 3)
+        cat_command = run.call_args_list[2].args[0]
+        self.assertIn("cat", cat_command)
+        self.assertIn("/sdcard/apppilot_window_dump.xml", cat_command)
+        self.assertEqual(
+            observation.elements[0].label, "Continue with Microsoft"
+        )
+
+    @patch("apppilot.android.subprocess.run")
     def test_uiautomator_password_attribute_redacts_generic_input(
         self,
         run,
@@ -553,6 +590,22 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         reset_adb.assert_called_once()
         self.assertGreater(reset_adb.call_args.args[0], 0)
+
+    @patch("apppilot.android.subprocess.run")
+    def test_first_maestro_action_tolerates_driver_cold_start(
+        self,
+        run,
+    ) -> None:
+        run.return_value = subprocess.CompletedProcess([], 0, "", "")
+
+        self.executor._run_flow("- tapOn: Open\n", timeout=30)
+        first_timeout = run.call_args.kwargs["timeout"]
+
+        self.executor._run_flow("- tapOn: Next\n", timeout=30)
+        second_timeout = run.call_args.kwargs["timeout"]
+
+        self.assertGreaterEqual(first_timeout, _MAESTRO_COLD_START_TIMEOUT - 5)
+        self.assertLessEqual(second_timeout, 30)
 
     @patch("apppilot.android.time.sleep")
     @patch.object(MaestroExecutor, "_reset_adb_connection")

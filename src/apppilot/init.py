@@ -23,13 +23,17 @@ from . import (
     email_delivery,
     environment,
 )
-from .work_defaults import RelayConfigurationError, load_relay_secrets
-
 from .agent import _load_dotenv
 try:
-    from ..shared.entra_auth import ensure_entra_model_readiness
+    from ..shared.entra_auth import (
+        ensure_entra_model_readiness,
+        ensure_relay_environment,
+    )
 except ImportError:
-    from shared.entra_auth import ensure_entra_model_readiness  # type: ignore[no-redef]
+    from shared.entra_auth import (  # type: ignore[no-redef]
+        ensure_entra_model_readiness,
+        ensure_relay_environment,
+    )
 
 try:
     from ..shared.model_client import (
@@ -496,7 +500,12 @@ def _setup_emulator(
             input_fn=input_fn, output=output,
         )
 
-    running = device.find_running_avd(selected, runner=runner, timeout=timeout)
+    running = device.find_running_avd(
+        selected,
+        runner=runner,
+        timeout=timeout,
+        allow_unique_fallback=len(avds) == 1,
+    )
     if running is not None:
         if device.is_boot_completed(running.serial, runner=runner, timeout=timeout):
             return [_device_result(
@@ -933,16 +942,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             interactive=interactive,
         )
         apk_result = check_apk(interactive=interactive)
-        try:
-            relay_env = {**os.environ, **load_relay_secrets()}
-        except RelayConfigurationError as error:
+        relay_env, relay_detail = ensure_relay_environment(
+            os.environ, interactive=interactive
+        )
+        if relay_detail:
             email_result = CheckResult(
                 "email",
                 _EMAIL,
                 Importance.OPTIONAL,
                 Status.WARNING,
                 "AppPilot email relay configuration unavailable",
-                str(error),
+                relay_detail,
             )
         else:
             email_result = check_email(

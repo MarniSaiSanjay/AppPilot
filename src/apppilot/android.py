@@ -43,6 +43,9 @@ _DRIVER_STARTUP_MAX_ATTEMPTS = 3
 _DRIVER_STARTUP_RETRY_DELAY = 3.0
 _DRIVER_STARTUP_TIMEOUT_ENV = "MAESTRO_DRIVER_STARTUP_TIMEOUT"
 _DRIVER_STARTUP_TIMEOUT_MS = "120000"
+# First Maestro action pays a cold start that exceeds the budget on Windows.
+_MAESTRO_COLD_START_TIMEOUT = float(_DRIVER_STARTUP_TIMEOUT_MS) / 1000 + 30.0
+_UIAUTOMATOR_DUMP_PATH = "/sdcard/apppilot_window_dump.xml"
 _MAESTRO_RUNTIME_ENV_KEYS = (
     "PATH",
     "HOME",
@@ -268,40 +271,7 @@ class MaestroHierarchyObserver:
                 raise maestro_error from recovery_error
 
     def _capture_uiautomator(self, timeout: float = 15) -> UIObservation:
-        command = [
-            "adb",
-            "-s",
-            self._device_id,
-            "exec-out",
-            "uiautomator",
-            "dump",
-            "/dev/tty",
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
-            raise AndroidOperationalError(
-                f"Android hierarchy observation failed: {error}"
-            ) from error
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            raise AndroidOperationalError(
-                "Android hierarchy observation failed"
-                + (f": {detail}" if detail else "")
-            )
-
-        end = result.stdout.rfind("</hierarchy>")
-        if end < 0:
-            raise AndroidOperationalError(
-                "Android returned an invalid UI hierarchy"
-            )
-        xml = result.stdout[: end + len("</hierarchy>")]
+        xml = self._dump_uiautomator_xml(timeout=timeout)
         try:
             root = ElementTree.fromstring(xml)
         except ElementTree.ParseError as error:
@@ -319,6 +289,65 @@ class MaestroHierarchyObserver:
             elements,
         )
         return self._observation(elements)
+
+    def _dump_uiautomator_xml(self, timeout: float) -> str:
+        """Return the raw uiautomator hierarchy XML for the device."""
+        # /dev/tty streaming yields no XML on some Windows adb combos.
+        streamed = self._run_uiautomator_adb(
+            ["exec-out", "uiautomator", "dump", "/dev/tty"], timeout
+        )
+        xml = self._extract_hierarchy_xml(streamed)
+        if xml is not None:
+            return xml
+
+        self._run_uiautomator_adb(
+            ["shell", "uiautomator", "dump", _UIAUTOMATOR_DUMP_PATH], timeout
+        )
+        dumped = self._run_uiautomator_adb(
+            ["exec-out", "cat", _UIAUTOMATOR_DUMP_PATH], timeout
+        )
+        xml = self._extract_hierarchy_xml(dumped)
+        if xml is not None:
+            return xml
+        raise AndroidOperationalError(
+            "Android returned an invalid UI hierarchy"
+        )
+
+    def _run_uiautomator_adb(self, args: "list[str]", timeout: float) -> str:
+        command = ["adb", "-s", self._device_id, *args]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise AndroidOperationalError(
+                f"Android hierarchy observation failed: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise AndroidOperationalError(
+                "Android hierarchy observation failed"
+                + (f": {detail}" if detail else "")
+            )
+        return result.stdout or ""
+
+    @staticmethod
+    def _extract_hierarchy_xml(raw: str) -> "str | None":
+        end = raw.rfind("</hierarchy>")
+        if end < 0:
+            return None
+        start = raw.find("<?xml")
+        if start < 0:
+            start = raw.find("<hierarchy")
+        if start < 0:
+            start = 0
+        return raw[start : end + len("</hierarchy>")]
 
     @classmethod
     def _xml_as_maestro_node(cls, element: ElementTree.Element) -> dict:
@@ -679,6 +708,7 @@ class MaestroExecutor:
         self._credential_release_check = credential_release_check
         self._credential_observer = credential_observer
         self._last_deeplink_component: ForegroundComponent | None = None
+        self._maestro_driver_warmed = False
 
     def bind_credential_observer(
         self, observer: MaestroHierarchyObserver
@@ -1343,6 +1373,8 @@ class MaestroExecutor:
             raise AndroidOperationalError(
                 "Maestro action execution timeout budget exhausted"
             )
+        if not self._maestro_driver_warmed:
+            timeout = max(timeout, _MAESTRO_COLD_START_TIMEOUT)
         deadline = time.monotonic() + timeout
         flow = f"appId: {self._app_id}\n---\n{commands}"
         run_env = _maestro_environment(secret)
@@ -1408,6 +1440,7 @@ class MaestroExecutor:
                     raise AndroidOperationalError(
                         f"Maestro action execution failed: {error}"
                     )
+                self._maestro_driver_warmed = True
                 return
         finally:
             primary_error = sys.exception()

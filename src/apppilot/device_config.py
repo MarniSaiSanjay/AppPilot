@@ -150,16 +150,16 @@ def resolve_device(
     saved = saved_loader()
     if saved and saved in usable:
         expected_identity = saved_identity_loader()
+        if expected_identity is None:
+            # /init captured no identity (empty on Windows); trust the serial.
+            return saved
         resolve_identity = identity_resolver or (
             lambda selected: _stable_device_identity(
                 selected, runner=runner, timeout=timeout
             )
         )
         current_identity = resolve_identity(saved)
-        if (
-            expected_identity is not None
-            and current_identity == expected_identity
-        ):
+        if current_identity == expected_identity:
             return saved
         output(
             f"Saved Android device {saved!r} could not be verified as the "

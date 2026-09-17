@@ -13,8 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import apppilot_run
 from apppilot import init as apppilot_init
 from shared.login import builder as login_builder
-from shared.entra_auth import ensure_entra_model_readiness
+from shared.entra_auth import (
+    ensure_entra_model_readiness,
+    ensure_relay_environment,
+    perform_interactive_azure_login,
+    reset_azure_login_state,
+)
 from shared.model_client import ModelTransportError
+from apppilot.work_defaults import RelayConfigurationError
 
 
 _ENTRA_ENV = {
@@ -24,6 +30,10 @@ _ENTRA_ENV = {
 
 
 class EntraReadinessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_azure_login_state()
+        self.addCleanup(reset_azure_login_state)
+
     def test_ready_credential_does_not_prompt_or_run_azure_cli(self) -> None:
         prompt = Mock()
         runner = Mock()
@@ -149,6 +159,139 @@ class EntraReadinessTests(unittest.TestCase):
 
         self.assertFalse(result.ready)
         runner.assert_not_called()
+
+
+class SharedAzureLoginTests(unittest.TestCase):
+    def setUp(self) -> None:
+        reset_azure_login_state()
+        self.addCleanup(reset_azure_login_state)
+
+    def _successful_runner(self) -> Mock:
+        return Mock(
+            side_effect=[
+                subprocess.CompletedProcess(
+                    [], 0, stdout="previous-subscription\n", stderr=""
+                ),
+                subprocess.CompletedProcess([], 0),
+                subprocess.CompletedProcess([], 0),
+            ]
+        )
+
+    def test_relay_prompts_and_retries_after_shared_login(self) -> None:
+        loader = Mock(
+            side_effect=[
+                RelayConfigurationError("Key Vault unavailable"),
+                {"APPPILOT_EMAIL_API_KEY": "secret"},
+            ]
+        )
+
+        env, detail = ensure_relay_environment(
+            {"EXISTING": "value"},
+            interactive=True,
+            input_fn=lambda _prompt: "y",
+            output=lambda _message: None,
+            which=lambda name: "/usr/local/bin/az" if name == "az" else None,
+            runner=self._successful_runner(),
+            loader=loader,
+        )
+
+        self.assertIsNone(detail)
+        self.assertEqual(env["APPPILOT_EMAIL_API_KEY"], "secret")
+        self.assertEqual(env["EXISTING"], "value")
+        self.assertEqual(loader.call_count, 2)
+
+    def test_relay_success_never_prompts(self) -> None:
+        prompt = Mock()
+        runner = Mock()
+
+        env, detail = ensure_relay_environment(
+            {},
+            interactive=True,
+            input_fn=prompt,
+            runner=runner,
+            loader=lambda: {"APPPILOT_EMAIL_API_KEY": "secret"},
+        )
+
+        self.assertIsNone(detail)
+        self.assertEqual(env, {"APPPILOT_EMAIL_API_KEY": "secret"})
+        prompt.assert_not_called()
+        runner.assert_not_called()
+
+    def test_relay_degrades_when_login_declined(self) -> None:
+        runner = Mock()
+
+        env, detail = ensure_relay_environment(
+            {"KEEP": "1"},
+            interactive=True,
+            input_fn=lambda _prompt: "n",
+            runner=runner,
+            loader=Mock(side_effect=RelayConfigurationError("Key Vault unavailable")),
+        )
+
+        self.assertEqual(env, {"KEEP": "1"})
+        self.assertIn("Key Vault unavailable", detail)
+        runner.assert_not_called()
+
+    def test_relay_noninteractive_does_not_launch_login(self) -> None:
+        runner = Mock()
+
+        env, detail = ensure_relay_environment(
+            {},
+            interactive=False,
+            runner=runner,
+            loader=Mock(side_effect=RelayConfigurationError("Key Vault unavailable")),
+        )
+
+        self.assertIn("Key Vault unavailable", detail)
+        runner.assert_not_called()
+
+    def test_single_login_satisfies_model_and_relay(self) -> None:
+        runner = self._successful_runner()
+        loader = Mock(
+            side_effect=[
+                RelayConfigurationError("Key Vault unavailable"),
+                {"APPPILOT_EMAIL_API_KEY": "secret"},
+            ]
+        )
+
+        _, relay_detail = ensure_relay_environment(
+            {},
+            interactive=True,
+            input_fn=lambda _prompt: "y",
+            output=lambda _message: None,
+            which=lambda name: "/usr/local/bin/az" if name == "az" else None,
+            runner=runner,
+            loader=loader,
+        )
+        self.assertIsNone(relay_detail)
+
+        # A subsequent model readiness check reuses the same sign-in without
+        # prompting or invoking the Azure CLI again.
+        second_prompt = Mock()
+        second_runner = Mock()
+        readiness = ensure_entra_model_readiness(
+            env=_ENTRA_ENV,
+            interactive=True,
+            input_fn=second_prompt,
+            runner=second_runner,
+            verifier=Mock(side_effect=[ModelTransportError("not signed in"), None]),
+        )
+
+        self.assertTrue(readiness.ready)
+        second_prompt.assert_not_called()
+        second_runner.assert_not_called()
+
+    def test_login_outcome_reports_missing_azure_cli(self) -> None:
+        outcome = perform_interactive_azure_login(
+            "the model",
+            interactive=True,
+            input_fn=lambda _prompt: "y",
+            which=lambda _name: None,
+            runner=Mock(),
+        )
+
+        self.assertFalse(outcome.ok)
+        self.assertIn("not installed", outcome.detail)
 
 
 class EntraCommandIntegrationTests(unittest.TestCase):
