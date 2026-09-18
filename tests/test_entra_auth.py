@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import apppilot_run
 from apppilot import init as apppilot_init
 from shared.login import builder as login_builder
+from shared import entra_auth
 from shared.entra_auth import (
     ensure_entra_model_readiness,
     ensure_relay_environment,
@@ -20,7 +21,7 @@ from shared.entra_auth import (
     reset_azure_login_state,
 )
 from shared.model_client import ModelTransportError
-from apppilot.work_defaults import RelayConfigurationError
+from apppilot.work_defaults import AZURE_LOGIN_TENANT_ID, RelayConfigurationError
 
 
 _ENTRA_ENV = {
@@ -90,7 +91,18 @@ class EntraReadinessTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 ),
-                call(["az", "login"], check=False),
+                call(
+                    [
+                        "az",
+                        "login",
+                        "--output",
+                        "none",
+                        "--only-show-errors",
+                        "--tenant",
+                        AZURE_LOGIN_TENANT_ID,
+                    ],
+                    check=False,
+                ),
                 call(
                     [
                         "az",
@@ -280,6 +292,54 @@ class SharedAzureLoginTests(unittest.TestCase):
         self.assertTrue(readiness.ready)
         second_prompt.assert_not_called()
         second_runner.assert_not_called()
+
+    def test_login_targets_the_work_tenant(self) -> None:
+        runner = self._successful_runner()
+
+        outcome = perform_interactive_azure_login(
+            "the model",
+            interactive=True,
+            input_fn=lambda _prompt: "y",
+            output=lambda _message: None,
+            which=lambda name: "/usr/local/bin/az" if name == "az" else None,
+            runner=runner,
+        )
+
+        self.assertTrue(outcome.ok)
+        login_call = next(
+            call for call in runner.call_args_list
+            if call.args[0][:2] == ["az", "login"]
+        )
+        self.assertEqual(
+            login_call.args[0],
+            [
+                "az",
+                "login",
+                "--output",
+                "none",
+                "--only-show-errors",
+                "--tenant",
+                AZURE_LOGIN_TENANT_ID,
+            ],
+        )
+
+    def test_login_uses_a_shell_on_windows(self) -> None:
+        runner = self._successful_runner()
+
+        with patch.object(entra_auth.os, "name", "nt"):
+            outcome = perform_interactive_azure_login(
+                "the model",
+                interactive=True,
+                input_fn=lambda _prompt: "y",
+                output=lambda _message: None,
+                which=lambda name: r"C:\\az.cmd" if name == "az" else None,
+                runner=runner,
+            )
+
+        self.assertTrue(outcome.ok)
+        self.assertTrue(
+            all(call.kwargs.get("shell") is True for call in runner.call_args_list)
+        )
 
     def test_login_outcome_reports_missing_azure_cli(self) -> None:
         outcome = perform_interactive_azure_login(

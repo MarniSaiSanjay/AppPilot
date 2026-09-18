@@ -459,7 +459,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 email_recipient = None
 
             print(f"Running {len(cases)} Deeplink test(s) on {device_id}...")
-            report = DeeplinkSuiteOrchestrator(runner).run(cases)
+            report = DeeplinkSuiteOrchestrator(
+                runner,
+                progress=lambda line: print(line, flush=True),
+            ).run(cases)
     except device_lock.DeviceLockError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 2

@@ -35,6 +35,7 @@ DEFAULT_MAX_STUCK_ACTIONS = 5
 DEFAULT_NONACTIONABLE_WAIT_SECONDS = 2.0
 DEFAULT_MAX_NONACTIONABLE_WAITS = 10
 DEFAULT_MAX_POST_SUBMIT_EMPTY_OBSERVATIONS = 5
+DEFAULT_MAX_CREDENTIAL_REPEAT_SETTLES = 2
 _T = TypeVar("_T")
 
 
@@ -154,6 +155,7 @@ class AppPilotAgent:
         post_submit_empty_observations = 0
         pending_credential_verification: CredentialKind | None = None
         recovered_credential_kinds: set[CredentialKind] = set()
+        credential_repeat_settles = 0
         for step in range(self._max_actions + 1):
             observation = self._timed_call("observe", self._observer.observe)
             self._emit(f"OBSERVE:\n{observation.describe()}\n")
@@ -483,6 +485,20 @@ class AppPilotAgent:
                     credential_key == last_credential_key
                     and fingerprint == last_credential_fingerprint
                 ):
+                    if (
+                        credential_repeat_settles
+                        < DEFAULT_MAX_CREDENTIAL_REPEAT_SETTLES
+                    ):
+                        credential_repeat_settles += 1
+                        self._emit(
+                            "CREDENTIAL:\n"
+                            f"{action.credential_kind.value} already entered on "
+                            "this screen; settling before re-observing "
+                            f"({credential_repeat_settles}/"
+                            f"{DEFAULT_MAX_CREDENTIAL_REPEAT_SETTLES})\n"
+                        )
+                        self._sleep(self._nonactionable_wait_seconds)
+                        continue
                     self._emit(
                         "CREDENTIAL:\n"
                         f"{action.credential_kind.value} already entered on this "
@@ -496,6 +512,7 @@ class AppPilotAgent:
                 secret = self._runtime_context.resolve(action.credential_kind)
                 last_credential_key = credential_key
                 last_credential_fingerprint = fingerprint
+                credential_repeat_settles = 0
 
             self._emit(f"ACTION:\n{action.describe(observation)}\n")
             execute = self._executor.execute

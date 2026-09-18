@@ -1775,6 +1775,9 @@ class MaestroExecutor:
                     f"sleep {_ADB_USERNAME_CHARACTER_DELAY_SECONDS}",
                 )
             )
+        # Terminate sh explicitly so it never blocks awaiting stdin EOF, which
+        # adb.exe delivers unreliably on Windows and otherwise hangs the pipe.
+        commands.append("exit")
         script = "\n".join(commands) + "\n"
         if credential_kind is not None:
             self._revalidate_credential_target(

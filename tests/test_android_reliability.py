@@ -38,7 +38,7 @@ from apppilot.models import (
 )
 from apppilot.safety import SafetyValidator
 from shared.login.flow import SharedLoginFlow
-from shared.account.session import AndroidAccountSession
+from shared.account.session import AndroidAccountSession, _NavigationError
 from shared.account.safety import AccountActionPurpose
 from shared.login.goal import (
     AuthoritativeLoginGoalEvaluator,
@@ -176,6 +176,11 @@ class MaestroExecutorReliabilityTests(unittest.TestCase):
         )
         self.assertIn(
             "input text p", run.call_args_list[1].kwargs["input"]
+        )
+        self.assertTrue(
+            run.call_args_list[1].kwargs["input"].rstrip().endswith("exit"),
+            "username script must end with an explicit 'exit' so sh never "
+            "blocks awaiting stdin EOF (Windows adb hang guard)",
         )
         run_flow.assert_not_called()
 
@@ -1074,6 +1079,107 @@ class AccountSessionNavigationTests(unittest.TestCase):
 
         executor.execute_fast.assert_called_once()
 
+    def test_account_sheet_reobserves_once_when_add_control_missing(self) -> None:
+        add_account = self._element(
+            "add", "Add an account", bounds=(0, 700, 1000, 800)
+        )
+        empty_sheet = UIObservation(())
+        rendered_sheet = UIObservation((add_account,))
+        observer = Mock()
+        observer.observe.return_value = rendered_sheet
+        sleep = Mock()
+        session = AndroidAccountSession(observer, Mock(), Mock(), sleep=sleep)
+
+        sheet, existing, resolved = session._resolve_account_action(
+            empty_sheet, "person@example.com"
+        )
+
+        self.assertIsNone(existing)
+        self.assertIs(resolved, add_account)
+        self.assertIs(sheet, rendered_sheet)
+        observer.observe.assert_called_once()
+        sleep.assert_called_once()
+
+    def test_account_sheet_does_not_reobserve_when_control_present(self) -> None:
+        add_account = self._element("add", "Add account")
+        sheet = UIObservation((add_account,))
+        observer = Mock()
+        session = AndroidAccountSession(observer, Mock(), Mock(), sleep=Mock())
+
+        _, existing, resolved = session._resolve_account_action(
+            sheet, "person@example.com"
+        )
+
+        self.assertIsNone(existing)
+        self.assertIs(resolved, add_account)
+        observer.observe.assert_not_called()
+
+    def test_account_sheet_reobserves_once_when_account_card_missing(
+        self,
+    ) -> None:
+        account_card = self._element(
+            "account", "person@example.com", bounds=(0, 200, 1000, 300)
+        )
+        empty_settings = UIObservation(())
+        rendered_settings = UIObservation((account_card,))
+        observer = Mock()
+        observer.observe.return_value = rendered_settings
+        executor = Mock()
+        sleep = Mock()
+        session = AndroidAccountSession(observer, executor, Mock(), sleep=sleep)
+
+        result = session._open_account_sheet(empty_settings)
+
+        self.assertIs(result, rendered_settings)
+        self.assertEqual(
+            executor.execute_fast.call_args_list[0].args[0].target_id,
+            account_card.element_id,
+        )
+
+    def test_settings_account_card_miss_still_fails_when_never_renders(
+        self,
+    ) -> None:
+        empty_settings = UIObservation(())
+        observer = Mock()
+        observer.observe.return_value = UIObservation(())
+        session = AndroidAccountSession(observer, Mock(), Mock(), sleep=Mock())
+
+        with self.assertRaisesRegex(
+            _NavigationError, "settings account entry is unavailable"
+        ):
+            session._open_account_sheet(empty_settings)
+
+        observer.observe.assert_called_once()
+
+    def test_open_settings_reobserves_once_when_drawer_account_missing(
+        self,
+    ) -> None:
+        more = self._element("more", "More", bounds=(0, 900, 200, 1000))
+        profile = self._element(
+            "profile", "Profile", bounds=(0, 100, 1000, 200)
+        )
+        settings = UIObservation(
+            (self._element("account", "person@example.com"),)
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            UIObservation((more,)),
+            UIObservation(()),
+            UIObservation((profile,)),
+            settings,
+        ]
+        executor = Mock()
+        sleep = Mock()
+        session = AndroidAccountSession(observer, executor, Mock(), sleep=sleep)
+
+        self.assertIs(session._open_settings(), settings)
+
+        self.assertEqual(executor.execute_fast.call_count, 2)
+        self.assertEqual(
+            executor.execute_fast.call_args_list[1].args[0].target_id,
+            profile.element_id,
+        )
+
 
 class LoginCompletionTests(unittest.TestCase):
     @staticmethod
@@ -1626,6 +1732,156 @@ class LoginCompletionTests(unittest.TestCase):
             "action/step limit reached (1)",
         )
         executor.execute_credential_fallback.assert_not_called()
+
+    def test_repeated_credential_settles_before_declaring_a_loop(self) -> None:
+        username = UIElement(
+            element_id="username",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+        )
+        screen = UIObservation((username,))
+        observer = Mock()
+        observer.observe.return_value = screen
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.return_value = False
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.return_value = ModelDecision(
+            Action(
+                ActionKind.INPUT_TEXT,
+                target_id=username.element_id,
+                credential_kind=CredentialKind.USERNAME,
+            ),
+            "username",
+            reobserve_required=False,
+        )
+        executor = Mock()
+        sleep = Mock()
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=10,
+            runtime_context=RuntimeContext(
+                {CredentialKind.USERNAME: "person@example.com"}
+            ),
+            sleep=sleep,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertFalse(agent.run("login"))
+
+        self.assertEqual(
+            agent.last_failure_reason,
+            "repeated credential entry with no UI change (possible loop)",
+        )
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(executor.execute_fast.call_count, 1)
+
+    def test_repeated_credential_recovers_when_screen_advances_after_settle(
+        self,
+    ) -> None:
+        username = UIElement(
+            element_id="username",
+            parent_id=None,
+            text="",
+            accessibility_text="username",
+            hint_text="Email",
+            resource_id="emailTextInput",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="username",
+        )
+        password = UIElement(
+            element_id="password",
+            parent_id=None,
+            text="",
+            accessibility_text="password",
+            hint_text="Enter password",
+            resource_id="i0118",
+            class_name="android.widget.EditText",
+            clickable=True,
+            enabled=True,
+            is_input=True,
+            label="password | Enter password",
+        )
+        username_screen = UIObservation((username,))
+        password_screen = UIObservation((password,))
+        observer = Mock()
+        observer.observe.side_effect = [
+            username_screen,
+            username_screen,
+            password_screen,
+            UIObservation(()),
+        ]
+        goal_evaluator = Mock()
+        goal_evaluator.is_reached.side_effect = [False, False, False, True]
+        goal_evaluator.failure_reason.return_value = None
+        decision_provider = Mock()
+        decision_provider.decide.side_effect = [
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=username.element_id,
+                    credential_kind=CredentialKind.USERNAME,
+                ),
+                "username",
+                reobserve_required=False,
+            ),
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=username.element_id,
+                    credential_kind=CredentialKind.USERNAME,
+                ),
+                "username",
+                reobserve_required=False,
+            ),
+            ModelDecision(
+                Action(
+                    ActionKind.INPUT_TEXT,
+                    target_id=password.element_id,
+                    credential_kind=CredentialKind.PASSWORD,
+                ),
+                "password",
+                reobserve_required=False,
+            ),
+        ]
+        executor = Mock()
+        sleep = Mock()
+        agent = AppPilotAgent(
+            observer=observer,
+            goal_evaluator=goal_evaluator,
+            decision_provider=decision_provider,
+            safety_validator=SafetyValidator(),
+            executor=executor,
+            max_actions=10,
+            runtime_context=RuntimeContext(
+                {
+                    CredentialKind.USERNAME: "person@example.com",
+                    CredentialKind.PASSWORD: "P@ssw0rd!",
+                }
+            ),
+            sleep=sleep,
+        )
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(agent.run("login"))
+
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(executor.execute_fast.call_count, 2)
 
     def test_fast_submit_does_not_wait_after_credential_screen_changes(
         self,

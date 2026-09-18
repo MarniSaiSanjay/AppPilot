@@ -63,7 +63,14 @@ from usecases.deeplink import cli as deeplink_cli
 from usecases.deeplink.artifacts import FailureArtifactWriter
 from usecases.deeplink.runner import DeeplinkTestRunner
 from usecases.deeplink.orchestrator import DeeplinkSuiteOrchestrator
-from usecases.deeplink.results import AttemptResult, SuiteReport, TestCaseResult
+from usecases.deeplink.results import (
+    AttemptResult,
+    SuiteReport,
+    TestCaseResult,
+    _batch_setup_failed_result,
+    _login_failed_result,
+    _startup_failed_result,
+)
 from usecases.deeplink.supported_links import SUPPORTED_LINK_DOMAINS
 from usecases.deeplink.verification import (
     ExpectationJudgeOperationalError,
@@ -2956,6 +2963,74 @@ class FinalBlockerRegressionTests(unittest.TestCase):
                     runner=lambda *_args, **_kwargs: completed(stderr=version),
                 )
                 self.assertEqual(result.status, expected)
+
+
+class LiveProgressTests(unittest.TestCase):
+    """Live one-line-per-testcase progress output during a suite run."""
+
+    @staticmethod
+    def _case(test_id: str) -> DeeplinkTestCase:
+        return DeeplinkTestCase(
+            test_id=test_id,
+            deep_link="https://example.test/chat",
+            user_type="Test",
+            expected_result="Chat screen",
+        )
+
+    def test_lines_have_counter_pass_fail_and_reason(self) -> None:
+        lines: list[str] = []
+        orchestrator = DeeplinkSuiteOrchestrator(runner=None, progress=lines.append)
+        orchestrator._total = 6
+        report = SuiteReport(suite_name="Deeplink")
+
+        passing = TestCaseResult(
+            case=self._case("TC005"),
+            attempts=[AttemptResult(1, True, "match")],
+        )
+        cleanup = TestCaseResult(
+            case=self._case("TC010"),
+            attempts=[AttemptResult(1, True, "match")],
+        )
+        cleanup.record_cleanup_failure("uninstall failed")
+
+        orchestrator._emit(report, passing)
+        orchestrator._emit(
+            report,
+            TestCaseResult(
+                case=self._case("TC006"),
+                attempts=[AttemptResult(1, False, "urls differ")],
+            ),
+        )
+        orchestrator._emit(report, _login_failed_result(self._case("TC007")))
+        orchestrator._emit(
+            report, _batch_setup_failed_result(self._case("TC008"), "apk missing")
+        )
+        orchestrator._emit(
+            report, _startup_failed_result(self._case("TC009"), "no device")
+        )
+        orchestrator._emit(report, cleanup)
+
+        self.assertEqual(
+            lines,
+            [
+                "[1/6] TC005  PASS",
+                "[2/6] TC006  FAIL   (deeplink mismatch)",
+                "[3/6] TC007  FAIL   (login failed)",
+                "[4/6] TC008  FAIL   (setup failed)",
+                "[5/6] TC009  FAIL   (startup failed)",
+                "[6/6] TC010  FAIL   (cleanup failed)",
+            ],
+        )
+
+    def test_no_progress_callback_is_silent_and_still_records(self) -> None:
+        orchestrator = DeeplinkSuiteOrchestrator(runner=None)
+        report = SuiteReport(suite_name="Deeplink")
+        result = TestCaseResult(
+            case=self._case("TC001"),
+            attempts=[AttemptResult(1, True, "match")],
+        )
+        orchestrator._emit(report, result)
+        self.assertEqual(report.results, [result])
 
 
 if __name__ == "__main__":

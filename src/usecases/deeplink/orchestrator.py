@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from typing import Sequence, TYPE_CHECKING
+from typing import Callable, Optional, Sequence, TYPE_CHECKING
 
 try:
     from ...apppilot import logtags
@@ -32,12 +32,44 @@ class DeeplinkSuiteOrchestrator:
 
     SUITE_NAME = "Deeplink"
 
-    def __init__(self, runner: "DeeplinkTestRunner") -> None:
+    def __init__(
+        self,
+        runner: "DeeplinkTestRunner",
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self._runner = runner
+        self._progress = progress
+        self._total = 0
+
+    def _emit(self, report: SuiteReport, result: TestCaseResult) -> None:
+        """Append a completed result and print a live one-line progress update."""
+        report.results.append(result)
+        if self._progress is None:
+            return
+        status = "PASS" if result.passed else "FAIL"
+        line = f"[{report.total}/{self._total}] {result.case.test_id}  {status}"
+        if not result.passed:
+            line += f"   ({self._progress_reason(result)})"
+        self._progress(line)
+
+    @staticmethod
+    def _progress_reason(result: TestCaseResult) -> str:
+        """Short, stable failure category for the live progress line."""
+        reason = result.attempts[-1].reason if result.attempts else ""
+        if "login preparation failed" in reason:
+            return "login failed"
+        if "installed batch setup failed" in reason:
+            return "setup failed"
+        if "startup clean-install precondition failed" in reason:
+            return "startup failed"
+        if result.cleanup_errors:
+            return "cleanup failed"
+        return "deeplink mismatch"
 
     def run(self, cases: Sequence[DeeplinkTestCase]) -> SuiteReport:
         installed = [case for case in cases if case.installed]
         uninstalled = [case for case in cases if not case.installed]
+        self._total = len(cases)
 
         logtags.trace("Starting deeplink test suite", logtags.SUITE)
         logtags.trace(f"Loaded {len(cases)} test cases", logtags.SUITE)
@@ -55,14 +87,14 @@ class DeeplinkSuiteOrchestrator:
                     logtags.SUITE,
                 )
                 for case in cases:
-                    report.results.append(_startup_failed_result(case, str(exc)))
+                    self._emit(report, _startup_failed_result(case, str(exc)))
                 logtags.trace("Aborted before test execution", logtags.SUITE)
                 return report
 
             if installed:
                 self.run_installed_batch(installed, report)
             for case in uninstalled:
-                report.results.append(self.run_uninstalled_case(case))
+                self._emit(report, self.run_uninstalled_case(case))
             self._restore_workbook_order(report, cases)
             logtags.trace("Completed", logtags.SUITE)
             return report
@@ -91,7 +123,7 @@ class DeeplinkSuiteOrchestrator:
                     f"{case.test_id} skipping deeplink verification",
                     logtags.INSTALLED,
                 )
-                report.results.append(_batch_setup_failed_result(case, str(exc)))
+                self._emit(report, _batch_setup_failed_result(case, str(exc)))
             return
         supported_links_prepared = False
         for index, group in enumerate(groups):
@@ -109,8 +141,9 @@ class DeeplinkSuiteOrchestrator:
                 )
                 for remaining_group in groups[index:]:
                     for case in remaining_group.cases:
-                        report.results.append(
-                            _batch_setup_failed_result(case, str(exc))
+                        self._emit(
+                            report,
+                            _batch_setup_failed_result(case, str(exc)),
                         )
                 return
 
@@ -132,7 +165,7 @@ class DeeplinkSuiteOrchestrator:
             logtags.trace("Ensuring login", logtags.INSTALLED_BATCH)
             if not self._ensure_installed_group_login(representative):
                 for case in group.cases:
-                    report.results.append(_login_failed_result(case))
+                    self._emit(report, _login_failed_result(case))
                 return False
             if prepare_supported_links:
                 try:
@@ -143,15 +176,16 @@ class DeeplinkSuiteOrchestrator:
             preparation = self._runner.prepare_account(representative)
             if not preparation.succeeded:
                 for case in group.cases:
-                    report.results.append(
-                        _batch_setup_failed_result(case, preparation.reason)
+                    self._emit(
+                        report,
+                        _batch_setup_failed_result(case, preparation.reason),
                     )
                 return prepared_supported_links
             self._runner.run_warm_up()
             self._runner.open_installed_app()
             if not self._ensure_installed_group_login(representative):
                 for case in group.cases:
-                    report.results.append(_login_failed_result(case))
+                    self._emit(report, _login_failed_result(case))
                 return prepared_supported_links
         except RuntimeError as exc:
             logtags.trace(
@@ -159,10 +193,10 @@ class DeeplinkSuiteOrchestrator:
                 logtags.INSTALLED_BATCH,
             )
             for case in group.cases:
-                report.results.append(_batch_setup_failed_result(case, str(exc)))
+                self._emit(report, _batch_setup_failed_result(case, str(exc)))
             return prepared_supported_links
         for case in group.cases:
-            report.results.append(self._runner.run_installed_case(case))
+            self._emit(report, self._runner.run_installed_case(case))
         return prepared_supported_links
 
     def _ensure_installed_group_login(self, case: DeeplinkTestCase) -> bool:

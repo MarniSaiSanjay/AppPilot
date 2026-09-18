@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import MutableMapping
 
 from azure.core.exceptions import AzureError
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
+
+
+_AZURE_IDENTITY_CHAIN_LOGGER = logging.getLogger(
+    "azure.identity._credentials.chained"
+)
 
 
 WORK_DEFAULTS = {
@@ -26,6 +32,8 @@ WORK_DEFAULTS = {
 }
 
 RELAY_KEY_VAULT_URL = "https://kvapppilotplg9b1.vault.azure.net/"
+
+AZURE_LOGIN_TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47"
 
 _RELAY_SECRET_NAMES = {
     "APPPILOT_EMAIL_API_KEY": "apppilot-email-relay-key",  # allow-secret
@@ -52,6 +60,8 @@ def load_relay_secrets(
     client_factory=SecretClient,
 ) -> dict[str, str]:
     """Load relay credentials from the AppPilot work Key Vault."""
+    logger_was_disabled = _AZURE_IDENTITY_CHAIN_LOGGER.disabled
+    _AZURE_IDENTITY_CHAIN_LOGGER.disabled = True
     try:
         client = client_factory(
             vault_url=RELAY_KEY_VAULT_URL,
@@ -65,6 +75,8 @@ def load_relay_secrets(
         raise RelayConfigurationError(
             "AppPilot relay credentials could not be loaded from Key Vault"
         ) from error
+    finally:
+        _AZURE_IDENTITY_CHAIN_LOGGER.disabled = logger_was_disabled
     missing = [name for name, value in values.items() if not value]
     if missing:
         raise RelayConfigurationError(

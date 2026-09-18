@@ -53,6 +53,14 @@ class _NavigationError(RuntimeError):
     pass
 
 
+_ADD_ACCOUNT_LABELS = (
+    "add an account",
+    "add account",
+    "sign in with another account",
+    "use another account",
+)
+
+
 class AndroidAccountSession:
     """Add, switch, and verify app accounts without exposing identifiers."""
 
@@ -93,7 +101,9 @@ class AndroidAccountSession:
                 )
 
             sheet = self._open_account_sheet(settings)
-            existing = self._find_matching_control(sheet, target)
+            sheet, existing, add_account = self._resolve_account_action(
+                sheet, target
+            )
             if existing is not None:
                 self._tap(
                     sheet,
@@ -104,15 +114,6 @@ class AndroidAccountSession:
                 self._sleep(self._account_load_seconds)
                 kind = AccountPreparationKind.SWITCHED
             else:
-                add_account = self._find_text_control(
-                    sheet,
-                    (
-                        "add an account",
-                        "add account",
-                        "sign in with another account",
-                        "use another account",
-                    ),
-                )
                 if add_account is None:
                     raise _NavigationError("account sheet has no add action")
                 self._tap(
@@ -141,6 +142,24 @@ class AndroidAccountSession:
                 f"account navigation failed: {error}"
             )
 
+    def _resolve_account_action(
+        self, sheet: UIObservation, target: str
+    ) -> "tuple[UIObservation, UIElement | None, UIElement | None]":
+        """Locate the switch or add-account control, re-observing once on a miss."""
+        existing = self._find_matching_control(sheet, target)
+        add_account = (
+            None
+            if existing is not None
+            else self._find_text_control(sheet, _ADD_ACCOUNT_LABELS)
+        )
+        if existing is None and add_account is None:
+            self._sleep(self._settle_seconds)
+            sheet = self._observer.observe()
+            existing = self._find_matching_control(sheet, target)
+            if existing is None:
+                add_account = self._find_text_control(sheet, _ADD_ACCOUNT_LABELS)
+        return sheet, existing, add_account
+
     def _open_settings(self) -> UIObservation:
         home = self._observer.observe()
         menu = self._find_exact_text_control(
@@ -156,6 +175,10 @@ class AndroidAccountSession:
         drawer = self._observer.observe()
         account_row = self._find_drawer_account_row(drawer)
         if account_row is None:
+            self._sleep(self._settle_seconds)
+            drawer = self._observer.observe()
+            account_row = self._find_drawer_account_row(drawer)
+        if account_row is None:
             raise _NavigationError("drawer account entry is unavailable")
         self._tap(
             drawer,
@@ -167,6 +190,10 @@ class AndroidAccountSession:
 
     def _open_account_sheet(self, settings: UIObservation) -> UIObservation:
         account_card = self._find_settings_account_card(settings)
+        if account_card is None:
+            self._sleep(self._settle_seconds)
+            settings = self._observer.observe()
+            account_card = self._find_settings_account_card(settings)
         if account_card is None:
             raise _NavigationError("settings account entry is unavailable")
         self._tap(

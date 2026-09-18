@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import unittest
 
+from azure.core.exceptions import AzureError
+
+from apppilot import work_defaults
 from apppilot.work_defaults import (
     RELAY_KEY_VAULT_URL,
     RelayConfigurationError,
@@ -68,3 +71,35 @@ class WorkVaultTests(unittest.TestCase):
                 credential=object(),
                 client_factory=lambda **_kwargs: client,
             )
+
+    def test_identity_chain_noise_is_silenced_during_load(self) -> None:
+        logger = work_defaults._AZURE_IDENTITY_CHAIN_LOGGER
+        client = _Client(
+            {
+                "apppilot-email-relay-key": "email-key",
+                "apppilot-telemetry-relay-key": "telemetry-key",
+            }
+        )
+        seen: list[bool] = []
+
+        def factory(**_kwargs: object) -> _Client:
+            seen.append(logger.disabled)
+            return client
+
+        self.assertFalse(logger.disabled)
+        load_relay_secrets(credential=object(), client_factory=factory)
+
+        self.assertEqual(seen, [True])
+        self.assertFalse(logger.disabled)
+
+    def test_identity_chain_noise_is_restored_after_failure(self) -> None:
+        logger = work_defaults._AZURE_IDENTITY_CHAIN_LOGGER
+
+        def factory(**_kwargs: object) -> _Client:
+            raise AzureError("no credential")
+
+        self.assertFalse(logger.disabled)
+        with self.assertRaises(RelayConfigurationError):
+            load_relay_secrets(credential=object(), client_factory=factory)
+
+        self.assertFalse(logger.disabled)

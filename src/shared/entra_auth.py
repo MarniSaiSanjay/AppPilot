@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
@@ -15,11 +16,13 @@ from .model_client import (
 
 try:  # pragma: no cover - import shim for package vs. flat execution
     from ..apppilot.work_defaults import (
+        AZURE_LOGIN_TENANT_ID,
         RelayConfigurationError,
         load_relay_secrets,
     )
 except ImportError:  # pragma: no cover - flat execution fallback
     from apppilot.work_defaults import (  # type: ignore[no-redef]
+        AZURE_LOGIN_TENANT_ID,
         RelayConfigurationError,
         load_relay_secrets,
     )
@@ -38,6 +41,17 @@ def reset_azure_login_state() -> None:
     """Reset the process-level sign-in memo (tests)."""
     global _azure_login_completed
     _azure_login_completed = False
+
+
+def _run_az(
+    runner: Callable[..., subprocess.CompletedProcess],
+    args: list[str],
+    **kwargs: object,
+) -> subprocess.CompletedProcess:
+    """Invoke the Azure CLI; on Windows `az` is a batch file needing a shell."""
+    if os.name == "nt":
+        kwargs.setdefault("shell", True)
+    return runner(args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -84,6 +98,7 @@ def perform_interactive_azure_login(
     purpose: str,
     *,
     interactive: bool,
+    tenant: str | None = AZURE_LOGIN_TENANT_ID,
     input_fn: Callable[[str], str] = input,
     output: Callable[[str], None] = print,
     which: Callable[[str], str | None] = shutil.which,
@@ -105,8 +120,11 @@ def perform_interactive_azure_login(
 
     previous_subscription = _current_subscription(runner)
     output("Opening the Azure CLI sign-in flow in your browser...")
+    login_command = ["az", "login", "--output", "none", "--only-show-errors"]
+    if tenant:
+        login_command += ["--tenant", tenant]
     try:
-        result = runner(["az", "login"], check=False)
+        result = _run_az(runner, login_command, check=False)
     except OSError:
         return AzureLoginOutcome(
             ok=False,
@@ -130,7 +148,8 @@ def _current_subscription(
 ) -> str | None:
     """Read the current Azure CLI subscription without changing it."""
     try:
-        result = runner(
+        result = _run_az(
+            runner,
             ["az", "account", "show", "--query", "id", "--output", "tsv"],
             check=False,
             capture_output=True,
@@ -152,7 +171,8 @@ def _restore_subscription(
     if subscription is None:
         return None
     try:
-        result = runner(
+        result = _run_az(
+            runner,
             ["az", "account", "set", "--subscription", subscription],
             check=False,
         )
