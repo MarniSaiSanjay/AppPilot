@@ -99,3 +99,21 @@ parameters: `image` and `senderAddress`. `defaultRecipient` is optional. The
 template derives its ACS connection string from the existing `acs-apppilot`
 Communication Service in the same resource group and references the existing
 AppPilot Key Vault for the email and telemetry relay secrets.
+
+## Storage Safe Secrets remediation
+
+Apply the Storage shared-key remediation in two separate deployments:
+
+1. Deploy `storage-table-reader.bicep` with the signed-in developer's Microsoft
+   Entra object ID as `readerPrincipalId`. This grants read-only access only to
+   the `SuiteRuns` table.
+2. Verify telemetry can be queried using Microsoft Entra authentication and
+   that the relay continues to write telemetry using managed identity.
+3. Only after both checks succeed, deploy
+   `storage-disable-shared-key.bicep`.
+
+The second template changes only `allowSharedKeyAccess` from `true` to `false`
+and explicitly preserves the Storage account's current SKU, encryption, TLS,
+anonymous-blob, public-network, and firewall settings. Public network access
+remains enabled because network isolation requires a separate Container Apps
+VNet/private-endpoint or approved NSP design.
