@@ -70,22 +70,6 @@ _APP_LINK_DOMAIN = re.compile(
     r"(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
 )
-_APP_LINK_APPROVED_STATES = {
-    "approved",
-    "migrated",
-    "pre_verified",
-    "restored",
-    "system_configured",
-    "verified",
-    "1",
-    "2",
-    "4",
-    "5",
-    "7",
-    "8",
-}
-
-
 def _nonnegative_env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     try:
@@ -170,7 +154,6 @@ class SupportedLinkState:
     domains: tuple[str, ...]
     handling_allowed: bool
     enabled_domains: tuple[str, ...]
-    verification_states: tuple[tuple[str, str], ...]
 
 
 class MaestroHierarchyObserver:
@@ -1005,14 +988,6 @@ class MaestroExecutor:
             "true",
         )
         run_pm(
-            "approve supported-link domains",
-            "set-app-links",
-            "--package",
-            self._app_id,
-            "2",
-            *normalized,
-        )
-        run_pm(
             "select supported-link domains",
             "set-app-links-user-selection",
             "--user",
@@ -1060,13 +1035,6 @@ class MaestroExecutor:
         handling_allowed, enabled = self._supported_link_selection(
             status.stdout or ""
         )
-        verification_states = self._supported_link_verification_states(
-            status.stdout or ""
-        )
-        verification_states = {
-            domain: verification_states.get(domain, "none")
-            for domain in normalized
-        }
         return SupportedLinkState(
             user_id=user_id,
             domains=normalized,
@@ -1074,7 +1042,6 @@ class MaestroExecutor:
             enabled_domains=tuple(
                 domain for domain in normalized if domain in enabled
             ),
-            verification_states=tuple(sorted(verification_states.items())),
         )
 
     def restore_supported_link_state(
@@ -1120,55 +1087,6 @@ class MaestroExecutor:
                 "true",
                 *state.enabled_domains,
             )
-        status = run_pm(
-            "query restored supported-link state",
-            "get-app-links",
-            "--user",
-            state.user_id,
-            self._app_id,
-        )
-        restored_states = self._supported_link_verification_states(
-            status.stdout or ""
-        )
-        expected_states = {
-            domain: verification_state
-            for domain, verification_state in dict(state.verification_states).items()
-            if verification_state
-            in {"none", "0", "approved", "2", "denied", "3"}
-        }
-        verification_domains = tuple(expected_states)
-        reset_domains = [
-            domain
-            for domain in verification_domains
-            if expected_states.get(domain, "none") in {"none", "0"}
-            and restored_states.get(domain, "none") not in {"none", "0"}
-        ]
-        approved_domains = [
-            domain
-            for domain in verification_domains
-            if expected_states.get(domain) in {"approved", "2"}
-            and restored_states.get(domain) not in {"approved", "2"}
-        ]
-        denied_domains = [
-            domain
-            for domain in verification_domains
-            if expected_states.get(domain) in {"denied", "3"}
-            and restored_states.get(domain) not in {"denied", "3"}
-        ]
-        for code, domains in (
-            ("0", reset_domains),
-            ("2", approved_domains),
-            ("3", denied_domains),
-        ):
-            if domains:
-                run_pm(
-                    "restore supported-link verification state",
-                    "set-app-links",
-                    "--package",
-                    self._app_id,
-                    code,
-                    *domains,
-                )
         expected_enabled = set(state.enabled_domains)
         status = run_pm(
             "verify restored supported-link state",
@@ -1177,24 +1095,15 @@ class MaestroExecutor:
             state.user_id,
             self._app_id,
         )
-        restored_states = self._supported_link_verification_states(
-            status.stdout or ""
-        )
         handling_allowed, enabled = self._supported_link_selection(
             status.stdout or ""
         )
-        changed = [
-            domain
-            for domain in verification_domains
-            if restored_states.get(domain, "none")
-            != expected_states.get(domain, "none")
-        ]
         selection_changed = {
             domain for domain in state.domains if domain in enabled
         } != expected_enabled
         handling_changed = handling_allowed != state.handling_allowed
-        if changed or selection_changed or handling_changed:
-            problems = changed
+        if selection_changed or handling_changed:
+            problems = []
             if selection_changed:
                 problems.append("user selection")
             if handling_changed:
@@ -1236,61 +1145,17 @@ class MaestroExecutor:
                 enabled.add(line)
         return handling_allowed, enabled
 
-    @staticmethod
-    def _supported_link_verification_states(status: str) -> dict[str, str]:
-        states: dict[str, str] = {}
-        section = ""
-        for raw_line in status.splitlines():
-            line = raw_line.strip().casefold()
-            if line == "domain verification state:":
-                section = "verification"
-            elif line == "selection state:":
-                section = "selection"
-            elif line.startswith("verification link handling allowed:"):
-                section = ""
-            elif section == "verification" and ":" in line:
-                domain, state = (part.strip() for part in line.rsplit(":", 1))
-                states[domain] = state
-        return states
-
     @classmethod
     def _verify_supported_links(
         cls, status: str, domains: Sequence[str]
     ) -> None:
-        approved: set[str] = set()
-        enabled: set[str] = set()
-        section = ""
-        handling_allowed = False
-        for raw_line in status.splitlines():
-            line = raw_line.strip().casefold()
-            if line == "domain verification state:":
-                section = "verification"
-            elif line == "selection state:":
-                section = "selection"
-            elif line == "enabled:" and section == "selection":
-                section = "enabled"
-            elif line == "disabled:":
-                section = "disabled"
-            elif line == "verification link handling allowed: true":
-                handling_allowed = True
-            elif section == "verification" and ":" in line:
-                domain, state = (part.strip() for part in line.rsplit(":", 1))
-                if state in _APP_LINK_APPROVED_STATES:
-                    approved.add(domain)
-            elif section == "enabled" and line:
-                enabled.add(line)
-
-        missing_approval = set(domains) - approved
+        handling_allowed, enabled = cls._supported_link_selection(status)
         missing_selection = set(domains) - enabled
-        if handling_allowed and not missing_approval and not missing_selection:
+        if handling_allowed and not missing_selection:
             return
         problems = []
         if not handling_allowed:
             problems.append("link handling is not allowed")
-        if missing_approval:
-            problems.append(
-                "not approved: " + ", ".join(sorted(missing_approval))
-            )
         if missing_selection:
             problems.append(
                 "not enabled: " + ", ".join(sorted(missing_selection))

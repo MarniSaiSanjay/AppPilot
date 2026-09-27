@@ -2512,7 +2512,7 @@ class SupportedLinkVerificationTests(unittest.TestCase):
             "  Disabled:\n"
         )
 
-    def test_approved_domains_are_configured_without_verify_app_links(
+    def test_domains_are_selected_without_changing_verification_state(
         self,
     ) -> None:
         executor = MaestroExecutor(PACKAGE, "device-1")
@@ -2531,14 +2531,20 @@ class SupportedLinkVerificationTests(unittest.TestCase):
 
         executor.enable_supported_links(self.DOMAINS)
 
-        self.assertTrue(
+        self.assertFalse(
             any(command[2] == "set-app-links" for command in calls)
         )
         self.assertFalse(
             any(command[2] == "verify-app-links" for command in calls)
         )
+        self.assertTrue(
+            any(
+                command[2] == "set-app-links-user-selection"
+                for command in calls
+            )
+        )
 
-    def test_force_approved_domains_do_not_block_setup(self) -> None:
+    def test_existing_approved_domains_do_not_block_setup(self) -> None:
         executor = MaestroExecutor(PACKAGE, "device-1")
         executor._current_user_id = Mock(return_value="0")
         executor._run_adb_checked = Mock(
@@ -2553,7 +2559,7 @@ class SupportedLinkVerificationTests(unittest.TestCase):
         self.assertFalse(
             any(command[2] == "verify-app-links" for command in commands)
         )
-        self.assertTrue(
+        self.assertFalse(
             any(command[2] == "set-app-links" for command in commands)
         )
         self.assertTrue(
@@ -2571,7 +2577,7 @@ class SupportedLinkVerificationTests(unittest.TestCase):
         executor._run_adb_checked = Mock(
             return_value=completed(
                 stdout=self.status(
-                    state="approved", allowed=True, enabled=True
+                    state="1024", allowed=True, enabled=True
                 )
             )
         )
@@ -2590,11 +2596,11 @@ class SupportedLinkVerificationTests(unittest.TestCase):
                 for command in commands
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             any(command[2] == "set-app-links" for command in commands)
         )
 
-    def test_capture_and_restore_preserve_domain_verification_state(
+    def test_capture_and_restore_preserve_user_link_settings(
         self,
     ) -> None:
         executor = MaestroExecutor(PACKAGE, "device-1")
@@ -2610,10 +2616,8 @@ class SupportedLinkVerificationTests(unittest.TestCase):
         state = executor.capture_supported_link_state(self.DOMAINS)
         executor.restore_supported_link_state(state)
 
-        self.assertEqual(
-            dict(state.verification_states),
-            {domain: "verified" for domain in self.DOMAINS},
-        )
+        self.assertFalse(state.handling_allowed)
+        self.assertEqual(state.enabled_domains, ())
         commands = [
             call.args[0] for call in executor._run_adb_checked.call_args_list
         ]
@@ -2647,9 +2651,7 @@ class SupportedLinkVerificationTests(unittest.TestCase):
         configured = with_unrelated(
             "approved", "verified", allowed=True, enabled=True
         )
-        statuses = iter(
-            (original, configured, configured, original)
-        )
+        statuses = iter((original, configured, original))
         executor = MaestroExecutor(PACKAGE, "device-1")
         executor._current_user_id = Mock(return_value="10")
 
@@ -2664,7 +2666,6 @@ class SupportedLinkVerificationTests(unittest.TestCase):
         executor.enable_supported_links(self.DOMAINS)
         executor.restore_supported_link_state(state)
 
-        self.assertNotIn(unrelated, dict(state.verification_states))
         commands = [
             call.args[0] for call in executor._run_adb_checked.call_args_list
         ]
@@ -2708,29 +2709,26 @@ class SupportedLinkVerificationTests(unittest.TestCase):
             )
         )
 
-    @patch("apppilot.android.time.sleep")
-    def test_restore_ignores_unrestorable_verification_state(
-        self, sleep
-    ) -> None:
+    def test_restore_ignores_domain_verification_state_changes(self) -> None:
         executor = MaestroExecutor(PACKAGE, "device-1")
         state = SupportedLinkState(
             user_id="10",
             domains=self.DOMAINS,
             handling_allowed=False,
             enabled_domains=(),
-            verification_states=tuple(
-                (domain, "verified") for domain in self.DOMAINS
-            ),
         )
         executor._run_adb_checked = Mock(
             return_value=completed(
-                stdout=self.status(state="none", allowed=False, enabled=False)
+                stdout=self.status(
+                    state="approved",
+                    allowed=False,
+                    enabled=False,
+                )
             )
         )
 
         executor.restore_supported_link_state(state, timeout=30)
 
-        sleep.assert_not_called()
         commands = [
             call.args[0] for call in executor._run_adb_checked.call_args_list
         ]
@@ -2745,9 +2743,6 @@ class SupportedLinkVerificationTests(unittest.TestCase):
             domains=self.DOMAINS,
             handling_allowed=True,
             enabled_domains=self.DOMAINS,
-            verification_states=tuple(
-                (domain, "verified") for domain in self.DOMAINS
-            ),
         )
         executor._run_adb_checked = Mock(
             return_value=completed(
@@ -2761,48 +2756,6 @@ class SupportedLinkVerificationTests(unittest.TestCase):
             AndroidOperationalError, "state changed unexpectedly"
         ):
             executor.restore_supported_link_state(state)
-
-    def test_restore_ignores_unsupported_verification_state(self) -> None:
-        executor = MaestroExecutor(PACKAGE, "device-1")
-        state = SupportedLinkState(
-            user_id="10",
-            domains=self.DOMAINS,
-            handling_allowed=False,
-            enabled_domains=(),
-            verification_states=(
-                (self.DOMAINS[0], "1024"),
-                (self.DOMAINS[1], "none"),
-            ),
-        )
-        executor._run_adb_checked = Mock(
-            side_effect=[
-                completed(),
-                completed(),
-                completed(stdout=self.status(state="verified")),
-                completed(),
-                completed(stdout=self.status(
-                    state="none",
-                    allowed=False,
-                    enabled=False,
-                )),
-            ]
-        )
-
-        executor.restore_supported_link_state(state)
-
-        commands = [
-            call.args[0] for call in executor._run_adb_checked.call_args_list
-        ]
-        self.assertTrue(
-            any(
-                command[2] == "set-app-links"
-                and command[5] == "0"
-                and self.DOMAINS[1] in command[6:]
-                and self.DOMAINS[0] not in command[6:]
-                for command in commands
-            )
-        )
-
 
 class FinalBlockerRegressionTests(unittest.TestCase):
     def test_exported_no_argument_builder_resolves_device_before_android_setup(
