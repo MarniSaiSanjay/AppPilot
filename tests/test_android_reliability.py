@@ -38,8 +38,10 @@ from apppilot.models import (
 )
 from apppilot.safety import SafetyValidator
 from shared.login.flow import SharedLoginFlow
+from shared.account import AccountPreparationKind
 from shared.account.session import AndroidAccountSession, _NavigationError
 from shared.account.safety import AccountActionPurpose
+from shared.credentials import CredentialProfile
 from shared.login.goal import (
     AuthoritativeLoginGoalEvaluator,
     LLMLoginGoalEvaluator,
@@ -965,6 +967,7 @@ class AccountSessionNavigationTests(unittest.TestCase):
         parent_id: str | None = None,
         clickable: bool = True,
         bounds: tuple[int, int, int, int] | None = None,
+        resource_id: str = "",
     ) -> UIElement:
         return UIElement(
             element_id=element_id,
@@ -972,7 +975,7 @@ class AccountSessionNavigationTests(unittest.TestCase):
             text=label,
             accessibility_text="",
             hint_text="",
-            resource_id="",
+            resource_id=resource_id,
             class_name="android.view.View",
             clickable=clickable,
             enabled=True,
@@ -1028,6 +1031,46 @@ class AccountSessionNavigationTests(unittest.TestCase):
             profile.element_id,
         )
         self.assertEqual(sleep.call_count, 2)
+
+    def test_hamburger_is_preferred_over_bottom_more_navigation(self) -> None:
+        hamburger = self._element(
+            "hamburger",
+            "Open navigation menu",
+            bounds=(0, 0, 100, 100),
+        )
+        more = self._element(
+            "more",
+            "More",
+            bounds=(800, 900, 1000, 1000),
+        )
+        profile = self._element(
+            "profile",
+            "Profile",
+            bounds=(0, 800, 1000, 900),
+        )
+        settings = UIObservation(
+            (self._element("account", "person@example.com"),)
+        )
+        observer = Mock()
+        observer.observe.side_effect = [
+            UIObservation((more, hamburger)),
+            UIObservation((profile,)),
+            settings,
+        ]
+        executor = Mock()
+        session = AndroidAccountSession(
+            observer,
+            executor,
+            Mock(),
+            sleep=Mock(),
+        )
+
+        self.assertIs(session._open_settings(), settings)
+
+        self.assertEqual(
+            executor.execute_fast.call_args_list[0].args[0].target_id,
+            hamburger.element_id,
+        )
 
     def test_account_menu_matching_does_not_confuse_add_menu(self) -> None:
         add_menu = self._element("add-menu", "Add menu")
@@ -1114,6 +1157,87 @@ class AccountSessionNavigationTests(unittest.TestCase):
         self.assertIs(resolved, add_account)
         observer.observe.assert_not_called()
 
+    def test_existing_account_wins_over_separate_authentication_action(
+        self,
+    ) -> None:
+        target = "person@example.com"
+        existing = self._element("existing", target)
+        continue_button = self._element("continue", "")
+        continue_text = self._element(
+            "continue-text",
+            "Continue with Microsoft",
+            parent_id=continue_button.element_id,
+            clickable=False,
+        )
+        sheet = UIObservation((existing, continue_button, continue_text))
+        session = AndroidAccountSession(Mock(), Mock(), Mock(), sleep=Mock())
+
+        _, resolved_existing, add_account = (
+            session._resolve_account_action(sheet, target)
+        )
+
+        self.assertIs(resolved_existing, existing)
+        self.assertIsNone(add_account)
+
+    def test_continue_with_microsoft_runs_login_flow(self) -> None:
+        target = "person@example.com"
+        other_account = self._element("other", "other@example.com")
+        target_account = self._element("target-settings", target)
+        continue_button = self._element(
+            "continue",
+            "",
+            resource_id=(
+                "com.microsoft.office.officehubrow:id/"
+                "account_chooser_microsoft_button"
+            ),
+        )
+        continue_text = self._element(
+            "continue-text",
+            "Continue with Microsoft",
+            parent_id=continue_button.element_id,
+            clickable=False,
+        )
+        target_text = self._element(
+            "target-sheet",
+            target,
+            parent_id=continue_button.element_id,
+            clickable=False,
+        )
+        initial_settings = UIObservation((other_account,))
+        sheet = UIObservation(
+            (continue_button, continue_text, target_text)
+        )
+        executor = Mock()
+        login_flow = Mock()
+        login_flow.ensure_ready.return_value = True
+        session = AndroidAccountSession(
+            Mock(),
+            executor,
+            Mock(return_value=login_flow),
+            account_load_seconds=0,
+            settle_seconds=0,
+            sleep=Mock(),
+        )
+        session._open_settings = Mock(
+            return_value=initial_settings
+        )
+        session._open_account_sheet = Mock(return_value=sheet)
+        profile = CredentialProfile(
+            license_name="MSA Premium",
+            key="MSA_PREMIUM",
+            runtime_context=RuntimeContext(
+                {CredentialKind.USERNAME: target}
+            ),
+        )
+
+        result = session.ensure_active(profile)
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.kind, AccountPreparationKind.ADDED)
+        login_flow.ensure_ready.assert_called_once_with()
+        executor.execute_fast.assert_called_once()
+        session._open_settings.assert_called_once_with()
+
     def test_account_sheet_reobserves_once_when_account_card_missing(
         self,
     ) -> None:
@@ -1179,7 +1303,6 @@ class AccountSessionNavigationTests(unittest.TestCase):
             executor.execute_fast.call_args_list[1].args[0].target_id,
             profile.element_id,
         )
-
 
 class LoginCompletionTests(unittest.TestCase):
     @staticmethod
@@ -2399,6 +2522,71 @@ class LoginCompletionTests(unittest.TestCase):
                 )
 
                 self.assertEqual(decision.action.target_id, "button")
+                fallback.decide.assert_not_called()
+
+    def test_overlapping_account_type_selection_is_deterministic(
+        self,
+    ) -> None:
+        work = UIElement(
+            element_id="work",
+            parent_id=None,
+            text="Work or school account",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.TextView",
+            clickable=False,
+            enabled=True,
+            is_input=False,
+            label="Work or school account",
+            bounds=(72, 600, 1200, 800),
+        )
+        personal = UIElement(
+            element_id="personal",
+            parent_id=None,
+            text="Personal account",
+            accessibility_text="",
+            hint_text="",
+            resource_id="",
+            class_name="android.widget.TextView",
+            clickable=False,
+            enabled=True,
+            is_input=False,
+            label="Personal account",
+            bounds=(72, 900, 1200, 1100),
+        )
+        observation = UIObservation((work, personal))
+        validator = SafetyValidator()
+        actions = validator.available_actions(observation)
+
+        for username, expected in (
+            ("person@tenant.onmicrosoft.com", work),
+            ("person@outlook.com", personal),
+        ):
+            with self.subTest(username=username):
+                fallback = Mock()
+                cache = LoginDecisionCache(
+                    fallback,
+                    runtime_context=RuntimeContext(
+                        {CredentialKind.USERNAME: username}
+                    ),
+                )
+                decision = cache.decide(
+                    DecisionRequest(
+                        goal="login",
+                        guidance=None,
+                        observation=observation,
+                        available_actions=actions,
+                        context=ExecutionContext(step=0, max_steps=5),
+                    )
+                )
+
+                self.assertEqual(
+                    decision.action,
+                    Action(ActionKind.TAP, target_id=expected.element_id),
+                )
+                self.assertFalse(decision.reobserve_required)
+                validator.validate(decision.action, observation)
                 fallback.decide.assert_not_called()
 
 

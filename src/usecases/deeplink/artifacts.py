@@ -6,29 +6,38 @@ import json
 import os
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_ARTIFACT_ROOT = Path(".apppilot_artifacts")
 DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024
 _SENSITIVE_NAME = re.compile(
-    r"(authorization|api[_-]?key|password|secret|token|credential)",
+    r"(authorization|api[_-]?key|password|secret|token|credential|username)",
     re.IGNORECASE,
 )
-_SENSITIVE_TEXT = (
-    re.compile(
-        r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?)"
-        r"(?:bearer\s+)?[^\"'\s,;}\]]+"
-    ),
-    re.compile(
-        r"(?i)(x-api-key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}\]]+"
-    ),
-    re.compile(
-        r"(?i)((?:password|api[_-]?key|secret|token)"
-        r"[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}\]]+"
-    ),
+_SENSITIVE_TEXT = re.compile(
+    r"(?i)((?:authorization|x-api-key|password|api[_-]?key|secret|token)"
+    r"[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|(?:bearer\s+)?[^\"'\s,;}\]]+)"
 )
+_EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
+
+
+def sensitive_values(environment: Mapping[str, str]) -> tuple[str, ...]:
+    return tuple(
+        value
+        for name, value in environment.items()
+        if _SENSITIVE_NAME.search(name) and value
+    )
+
+
+def redact_text(text: str, secrets: Iterable[str] = ()) -> str:
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = _SENSITIVE_TEXT.sub(r"\1[REDACTED]", text)
+    return _EMAIL.sub("[REDACTED EMAIL]", text)
 
 
 class FailureArtifactWriter:
@@ -50,11 +59,7 @@ class FailureArtifactWriter:
         self._directory = Path(root) / self._safe_name(run_id)
         self._max_bytes = max_bytes
         source = os.environ if environment is None else environment
-        self._secret_values = tuple(
-            value
-            for name, value in source.items()
-            if _SENSITIVE_NAME.search(name) and len(value) >= 3
-        )
+        self._secret_values = sensitive_values(source)
 
     @property
     def directory(self) -> Path:
@@ -153,12 +158,7 @@ class FailureArtifactWriter:
         if isinstance(value, (list, tuple)):
             return [self._sanitize(item) for item in value]
         if isinstance(value, str):
-            text = value
-            for secret in self._secret_values:
-                text = text.replace(secret, "[REDACTED]")
-            for pattern in _SENSITIVE_TEXT:
-                text = pattern.sub(r"\1[REDACTED]", text)
-            return self._truncate(text, 8192)
+            return self._truncate(redact_text(value, self._secret_values), 8192)
         if value is None or isinstance(value, (bool, int, float)):
             return value
         return self._sanitize(str(value))

@@ -173,7 +173,8 @@ def build_login_agent(
         observer=observer,
         goal_evaluator=goal_evaluator,
         decision_provider=LoginDecisionCache(
-            resolve_decision_provider(provider)
+            resolve_decision_provider(provider),
+            runtime_context=runtime_context,
         ),
         safety_validator=SafetyValidator(),
         executor=executor,

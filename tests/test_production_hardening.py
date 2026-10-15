@@ -60,7 +60,7 @@ from usecases.deeplink.deeplink_testcase_loader import (
     load_deeplink_cases,
 )
 from usecases.deeplink import cli as deeplink_cli
-from usecases.deeplink.artifacts import FailureArtifactWriter
+from usecases.deeplink.artifacts import FailureArtifactWriter, redact_text
 from usecases.deeplink.runner import DeeplinkTestRunner
 from usecases.deeplink.orchestrator import DeeplinkSuiteOrchestrator
 from usecases.deeplink.results import (
@@ -2131,6 +2131,18 @@ class FailureArtifactTests(unittest.TestCase):
             root=self.root,
             **kwargs,
         )
+
+    def test_redaction_masks_quoted_values_and_overlapping_secrets(self) -> None:
+        text = redact_text(
+            "password='multi word'; X-API-Key: unknown-key; "
+            "value=long-test-phrase",
+            ["test-phrase", "long-test-phrase"],
+        )
+
+        self.assertNotIn("multi word", text)
+        self.assertNotIn("unknown-key", text)
+        self.assertNotIn("long-", text)
+        self.assertEqual(text.count("[REDACTED]"), 3)
 
     def test_failure_artifact_contains_metadata_and_redacts_secrets(
         self,

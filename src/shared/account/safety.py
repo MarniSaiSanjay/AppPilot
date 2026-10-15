@@ -125,7 +125,10 @@ class AccountSafetyValidator:
 
     @classmethod
     def _is_menu(cls, element: UIElement) -> bool:
-        allowed = ("menu", "navigation menu", "open navigation", "more")
+        allowed = (
+            "menu", "navigation menu", "open navigation",
+            "open navigation menu", "more",
+        )
         return any(
             value.strip().casefold() in allowed
             for value in (
@@ -177,6 +180,8 @@ class AccountSafetyValidator:
             for phrase in (
                 "add an account",
                 "add account",
+                "continue with microsoft",
+                "account_chooser_microsoft_button",
                 "sign in with another account",
                 "use another account",
             )

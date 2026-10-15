@@ -71,7 +71,7 @@ class SafetyValidator:
                 or not (element.resource_id or element.selector_text)
             ):
                 continue
-            if element.clickable:
+            if element.clickable or self._is_account_type_option(element):
                 actions.append(Action(ActionKind.TAP, target_id=element.element_id))
             if element.is_input:
                 actions.append(
@@ -100,7 +100,11 @@ class SafetyValidator:
         if not (target.resource_id or target.selector_text):
             raise ValueError("Action target has no safe Maestro selector")
 
-        if action.kind == ActionKind.TAP and not target.clickable:
+        if (
+            action.kind == ActionKind.TAP
+            and not target.clickable
+            and not self._is_account_type_option(target)
+        ):
             raise ValueError("Tap target is not clickable")
         if action.kind == ActionKind.INPUT_TEXT:
             if not target.is_input:
@@ -123,6 +127,13 @@ class SafetyValidator:
             element.hint_text,
             element.class_name,
             f"{element.accessibility_text} {element.label}",
+        )
+
+    @staticmethod
+    def _is_account_type_option(element: UIElement) -> bool:
+        return (element.own_text or element.label).strip().casefold() in (
+            "work or school account",
+            "personal account",
         )
 
     def _is_prohibited(self, element: UIElement) -> bool:

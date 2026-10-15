@@ -24,3 +24,4 @@ testcases/regressions/*.xlsx
 .apppilot_artifacts/
 .apppilot_reports/
 .apppilot_cache/
+.apppilot_logs/

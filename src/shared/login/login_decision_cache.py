@@ -12,13 +12,25 @@ try:
         DecisionRequest,
         ModelDecisionProvider,
     )
-    from ...apppilot.models import Action, ActionKind, CredentialKind, UIElement
+    from ...apppilot.models import (
+        Action,
+        ActionKind,
+        CredentialKind,
+        RuntimeContext,
+        UIElement,
+    )
     from ...apppilot.safety import infer_credential_kind
 except ImportError:
     from apppilot.adaptive_decision_cache import AdaptiveDecisionCache
     from apppilot import logtags
     from apppilot.brain import DecisionRequest, ModelDecisionProvider
-    from apppilot.models import Action, ActionKind, CredentialKind, UIElement
+    from apppilot.models import (
+        Action,
+        ActionKind,
+        CredentialKind,
+        RuntimeContext,
+        UIElement,
+    )
     from apppilot.safety import infer_credential_kind
 
 
@@ -33,6 +45,7 @@ class LoginDecisionCache(AdaptiveDecisionCache):
         fallback: ModelDecisionProvider,
         *,
         cache_path: Path | None = None,
+        runtime_context: RuntimeContext | None = None,
     ) -> None:
         super().__init__(
             fallback,
@@ -45,6 +58,9 @@ class LoginDecisionCache(AdaptiveDecisionCache):
             ),
         )
         self._last_credential: CredentialKind | None = None
+        self._account_type_label = self._preferred_account_type(
+            runtime_context
+        )
 
     def begin_run(self) -> None:
         super().begin_run()
@@ -61,6 +77,14 @@ class LoginDecisionCache(AdaptiveDecisionCache):
 
     def _seeded_decision(self, request: DecisionRequest) -> Action | None:
         actions = request.available_actions
+
+        if self._account_type_label is not None:
+            match = self._unique_matching_tap(
+                request,
+                (self._account_type_label,),
+            )
+            if match is not None:
+                return match
 
         for kind in (CredentialKind.USERNAME, CredentialKind.PASSWORD):
             match = self._unique(
@@ -212,6 +236,31 @@ class LoginDecisionCache(AdaptiveDecisionCache):
                 target.label,
             )
         ).casefold()
+
+    @staticmethod
+    def _preferred_account_type(
+        runtime_context: RuntimeContext | None,
+    ) -> str | None:
+        if runtime_context is None:
+            return None
+        try:
+            username = runtime_context.resolve(
+                CredentialKind.USERNAME
+            ).strip().casefold()
+        except KeyError:
+            return None
+        domain = username.rpartition("@")[2]
+        if domain.endswith(".onmicrosoft.com"):
+            return "work or school account"
+        if domain in {
+            "gmail.com",
+            "hotmail.com",
+            "live.com",
+            "outlook.com",
+            "yahoo.com",
+        }:
+            return "personal account"
+        return None
 
     @staticmethod
     def _has_passwordless_prompt(request: DecisionRequest) -> bool:

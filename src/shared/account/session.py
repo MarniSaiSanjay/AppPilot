@@ -56,6 +56,7 @@ class _NavigationError(RuntimeError):
 _ADD_ACCOUNT_LABELS = (
     "add an account",
     "add account",
+    "continue with microsoft",
     "sign in with another account",
     "use another account",
 )
@@ -129,6 +130,9 @@ class AndroidAccountSession:
                 self._sleep(self._account_load_seconds)
                 kind = AccountPreparationKind.ADDED
 
+            if kind == AccountPreparationKind.ADDED:
+                return AccountPreparationResult.ready(kind)
+
             verified = self._open_settings()
             if not self._contains(verified, target):
                 return AccountPreparationResult.failed(
@@ -146,24 +150,41 @@ class AndroidAccountSession:
         self, sheet: UIObservation, target: str
     ) -> "tuple[UIObservation, UIElement | None, UIElement | None]":
         """Locate the switch or add-account control, re-observing once on a miss."""
-        existing = self._find_matching_control(sheet, target)
-        add_account = (
-            None
-            if existing is not None
-            else self._find_text_control(sheet, _ADD_ACCOUNT_LABELS)
-        )
+        existing, add_account = self._find_account_actions(sheet, target)
         if existing is None and add_account is None:
             self._sleep(self._settle_seconds)
             sheet = self._observer.observe()
-            existing = self._find_matching_control(sheet, target)
-            if existing is None:
-                add_account = self._find_text_control(sheet, _ADD_ACCOUNT_LABELS)
+            existing, add_account = self._find_account_actions(
+                sheet, target
+            )
         return sheet, existing, add_account
+
+    def _find_account_actions(
+        self,
+        sheet: UIObservation,
+        target: str,
+    ) -> "tuple[UIElement | None, UIElement | None]":
+        existing = self._find_matching_control(sheet, target)
+        add_account = self._find_text_control(sheet, _ADD_ACCOUNT_LABELS)
+        if existing is None:
+            return None, add_account
+        if (
+            add_account is not None
+            and existing.element_id == add_account.element_id
+        ):
+            return None, add_account
+        return existing, None
 
     def _open_settings(self) -> UIObservation:
         home = self._observer.observe()
         menu = self._find_exact_text_control(
-            home, ("menu", "navigation menu", "open navigation")
+            home,
+            (
+                "menu",
+                "navigation menu",
+                "open navigation",
+                "open navigation menu",
+            ),
         )
         if menu is None:
             menu = self._find_exact_text_control(home, ("more",))
