@@ -1182,7 +1182,6 @@ class AccountSessionNavigationTests(unittest.TestCase):
     def test_continue_with_microsoft_runs_login_flow(self) -> None:
         target = "person@example.com"
         other_account = self._element("other", "other@example.com")
-        target_account = self._element("target-settings", target)
         continue_button = self._element(
             "continue",
             "",
@@ -1236,6 +1235,38 @@ class AccountSessionNavigationTests(unittest.TestCase):
         self.assertEqual(result.kind, AccountPreparationKind.ADDED)
         login_flow.ensure_ready.assert_called_once_with()
         executor.execute_fast.assert_called_once()
+        session._open_settings.assert_called_once_with()
+
+    def test_add_account_does_not_succeed_when_login_fails(self) -> None:
+        target = "person@example.com"
+        settings = UIObservation(
+            (self._element("other", "other@example.com"),)
+        )
+        sheet = UIObservation(
+            (self._element("continue", "Continue with Microsoft"),)
+        )
+        profile = CredentialProfile(
+            license_name="MSA Premium",
+            key="MSA_PREMIUM",
+            runtime_context=RuntimeContext(
+                {CredentialKind.USERNAME: target}
+            ),
+        )
+        login_flow = Mock()
+        login_flow.ensure_ready.return_value = False
+        session = AndroidAccountSession(
+            Mock(),
+            Mock(),
+            Mock(return_value=login_flow),
+            sleep=Mock(),
+        )
+        session._open_settings = Mock(return_value=settings)
+        session._open_account_sheet = Mock(return_value=sheet)
+
+        result = session.ensure_active(profile)
+
+        self.assertFalse(result.succeeded)
+        login_flow.ensure_ready.assert_called_once_with()
         session._open_settings.assert_called_once_with()
 
     def test_account_sheet_reobserves_once_when_account_card_missing(
